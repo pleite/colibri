@@ -1,7 +1,15 @@
 #include "backend_vulkan.h"
 
+#include <stdbool.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "parallelism.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 struct ColiCudaTensor {
     int fmt;
@@ -21,6 +29,17 @@ static size_t g_tensor_count = 0;
 static size_t g_tensor_bytes = 0;
 static ColiCudaTensor **g_tensors = NULL;
 static size_t g_tensor_capacity = 0;
+static _Atomic bool g_parallelism_configured = false;
+
+static void configure_parallelism(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_parallelism_configured, &expected, true)) return;
+#ifdef _OPENMP
+    int threads = coli_detect_thread_count();
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
+#endif
+}
 
 static void register_tensor(ColiCudaTensor *tensor) {
     if (!tensor) return;
@@ -82,6 +101,9 @@ static void matmul_host(float *y, const float *x, const ColiCudaTensor *tensor, 
     const uint8_t *weights_packed = (const uint8_t *)tensor->weights;
     const float *scales = tensor->scales;
 
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int o = 0; o < O; ++o) {
         const float scale = (scales && tensor->fmt != 0) ? scales[o] : 1.0f;
         for (int s = 0; s < S; ++s) {
@@ -115,6 +137,7 @@ int coli_cuda_init(const int *devices, int count) {
         g_device_count = count > COLI_CUDA_MAX_DEVICES ? COLI_CUDA_MAX_DEVICES : count;
         for (int i = 0; i < g_device_count; ++i) g_devices[i] = devices[i];
     }
+    configure_parallelism();
     g_initialized = 1;
     return 1;
 }
