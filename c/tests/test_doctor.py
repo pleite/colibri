@@ -86,6 +86,21 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["model.shards"]["details"]["shards"], 1)
         self.assertEqual(exit_code(report), 0)
 
+    def test_vulkan_devices_are_reported(self):
+        accelerators = {"cuda": [], "rocm": [], "vulkan": [{"index": 0, "name": "RADV", "total_bytes": 0, "free_bytes": 0}], "npu": []}
+        report = self.report(accelerators=accelerators)
+        checks = self.checks_by_id(report)
+
+        self.assertEqual(checks["accelerator.vulkan"]["status"], "pass")
+        self.assertEqual(checks["accelerator.vulkan"]["details"]["devices"], [0])
+
+    def test_vulkan_devices_reported_with_ok_status(self):
+        report = self.report(accelerators={"cuda": [], "rocm": [], "vulkan": [{"index": 0, "name": "RADV", "total_bytes": 0, "free_bytes": 0}], "npu": []})
+        checks = self.checks_by_id(report)
+
+        self.assertEqual(checks["accelerator.vulkan"]["status"], "pass")
+        self.assertEqual(report["status"], "ok")
+
     def test_missing_model_collects_failures_instead_of_stopping_early(self):
         report = self.report(model=self.root / "missing")
         checks = self.checks_by_id(report)
