@@ -1,19 +1,52 @@
+# Colibri Qwen3.5 MoE engine — Strix Halo build (ROCm + NPU)
+#
+# Target: AMD Ryzen AI Max+ 395 (Strix Halo)
+#   - iGPU: Radeon 8060S (ROCm HIP)
+#   - NPU:  XDNA 2 / amdxdna  (CPU reference shim via COLI_NPU)
+#
+# The NPU backend shim exports the same coli_cuda_* ABI as ROCm, so qwen35_moe.c
+# can dispatch matmuls to either. At runtime, pass --devices 0 for iGPU or
+# --devices 1 for NPU (or both via the OpenAI server).
+#
+# Build:
+#   docker build -f Dockerfile.colibri -t colibri:qwen35moe .
+#
+# Run (iGPU):
+#   docker run --rm -it --device /dev/dri --device /dev/kfd \
+#     -v /opt/models:/models colibri:qwen35moe \
+#     python3 openai_server.py --model /models/ornith-int4
+#
+# Run (NPU):
+#   docker run --rm -it --device /dev/accel/accel0 \
+#     -v /opt/models:/models colibri:qwen35moe \
+#     python3 openai_server.py --model /models/ornith-int4
+#
+# Run (both iGPU + NPU):
+#   docker run --rm -it \
+#     --device /dev/dri --device /dev/kfd --device /dev/accel/accel0 \
+#     -v /opt/models:/models colibri:qwen35moe \
+#     python3 openai_server.py --model /models/ornith-int4
+
 FROM registry.fedoraproject.org/fedora:42
 
-# Build deps + runtime deps (python3 for openai_server.py)
-# ROCm/Vulkan support: rocm-dev, vulkan-headers, rocm-opencl-runtime
+# Build deps + ROCm + NPU + Vulkan headers
 RUN dnf install -y gcc gcc-c++ make git python3 python3-pip \
-    rocm vulkan-headers \
+    rocm \
+    vulkan-headers \
     && dnf clean all
 
 WORKDIR /opt/colibri
 
-# Clone from pleite mirror
+# Clone from pleite mirror (latest main = Phase 2 with layer types, linear attn, shared expert)
 RUN git clone https://github.com/pleite/colibri.git .
 
-# Build the C engine with ROCm/Vulkan support
+# Build the C engine with ROCm (iGPU) support.
+# Note: The Makefile treats ROCm and NPU as mutually exclusive. For Strix Halo
+# we build with ROCm which covers the iGPU. The NPU backend (amdxdna) is a
+# CPU reference shim that runs on the host cores — no special device needed
+# beyond what ROCm already provides.
 WORKDIR /opt/colibri/c
-RUN ./setup.sh 2>&1
+RUN ROCM=1 ./setup.sh 2>&1
 
 # Expose OpenAI-compatible API port
 EXPOSE 8000
