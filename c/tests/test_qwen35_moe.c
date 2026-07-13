@@ -15,6 +15,14 @@ typedef struct {
 } tensor;
 
 typedef struct {
+    const char *name;
+    const void *data;
+    size_t nelems;
+    size_t nbytes;
+    const char *dtype;
+} raw_tensor;
+
+typedef struct {
     int vocab_size;
     int hidden_size;
     int num_layers;
@@ -84,6 +92,42 @@ static void write_safetensors_file(const char *path, const tensor *tensors, size
     free(header_buf);
 }
 
+static void write_safetensors_file_raw(const char *path, const raw_tensor *tensors, size_t count) {
+    size_t data_offset = 0;
+    size_t header_capacity = 4096;
+    char *header_buf = (char *)malloc(header_capacity);
+    if (!header_buf) fail("out of memory");
+    strcpy(header_buf, "{");
+    size_t header_used = 1;
+    for (size_t i = 0; i < count; i++) {
+        char entry[2048];
+        int written = snprintf(entry, sizeof(entry), "%s\"%s\":{\"dtype\":\"%s\",\"shape\":[%zu],\"data_offsets\":[%zu,%zu]}",
+                               i == 0 ? "" : ",", tensors[i].name, tensors[i].dtype, tensors[i].nelems, data_offset, data_offset + tensors[i].nbytes);
+        if (written < 0 || (size_t)written >= sizeof(entry)) fail("header entry too large");
+        if (header_used + (size_t)written + 1 >= header_capacity) {
+            header_capacity *= 2;
+            header_buf = (char *)realloc(header_buf, header_capacity);
+            if (!header_buf) fail("out of memory");
+        }
+        memcpy(header_buf + header_used, entry, (size_t)written);
+        header_used += (size_t)written;
+        data_offset += tensors[i].nbytes;
+    }
+    header_buf[header_used++] = '}';
+    header_buf[header_used] = '\0';
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) fail("cannot open %s", path);
+    uint64_t header_size = header_used - 1;
+    fwrite(&header_size, sizeof(header_size), 1, fp);
+    fwrite(header_buf, 1, header_used - 1, fp);
+    for (size_t i = 0; i < count; i++) {
+        fwrite(tensors[i].data, 1, tensors[i].nbytes, fp);
+    }
+    fclose(fp);
+    free(header_buf);
+}
+
 static void make_model_dir(const char *dir) {
     if (mkdir(dir, 0777) != 0 && errno != EEXIST) fail("mkdir %s", dir);
 }
@@ -134,6 +178,45 @@ static void write_model(const char *dir) {
         {"model.layers.0.mlp.down_proj.weight", down, 16},
     };
     write_safetensors_file(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+}
+
+static void write_quantized_model(const char *dir) {
+    make_model_dir(dir);
+    char config_path[1024];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
+    FILE *fp = fopen(config_path, "w");
+    if (!fp) fail("cannot write %s", config_path);
+    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fclose(fp);
+
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_path[1024];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+
+    const uint8_t embed_bytes[16] = {
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15, 16,
+    };
+    const float embed_scales[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    /* Packed 4-bit values with two nibbles per byte; the bytes below encode
+     * a small 4x4 matrix for a simple int4 smoke test. */
+    const uint8_t q_proj_bytes[8] = {0x0b, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c};
+    const float q_proj_scales[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    raw_tensor tensors[] = {
+        {"model.embed_tokens.weight", embed_bytes, 16, sizeof(embed_bytes), "U8"},
+        {"model.embed_tokens.weight.qs", embed_scales, 4, sizeof(embed_scales), "F32"},
+        {"model.layers.0.self_attn.q_proj.weight", q_proj_bytes, 8, sizeof(q_proj_bytes), "U8"},
+        {"model.layers.0.self_attn.q_proj.weight.qs", q_proj_scales, 4, sizeof(q_proj_scales), "F32"},
+    };
+    write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
 }
 
 static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, float *out) {
@@ -275,6 +358,17 @@ int main(void) {
     for (int i = 0; i < 4; i++) {
         if (expected[i] != actual[i]) fail("mismatch at token %d: expected %d got %d", i, expected[i], actual[i]);
     }
+
+    char quant_dir[] = "/tmp/colibri-qwen35-quant-XXXXXX";
+    char *quant_tmp = mkdtemp(quant_dir);
+    if (!quant_tmp) fail("mkdtemp failed");
+    write_quantized_model(quant_tmp);
+    int quant_actual[4] = {0, 0, 0, 0};
+    run_engine(quant_tmp, 4, tokens, 2, quant_actual);
+    for (int i = 0; i < 4; i++) {
+        if (quant_actual[i] < 0) fail("quantized model produced invalid token %d", quant_actual[i]);
+    }
+
     puts("qwen35_moe test: ok");
     return 0;
 }
