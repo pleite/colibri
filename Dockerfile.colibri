@@ -1,0 +1,20 @@
+FROM registry.fedoraproject.org/fedora:42
+
+# Build deps + runtime deps (python3 for openai_server.py)
+RUN dnf install -y gcc gcc-c++ make git python3 python3-pip openmp && \
+    dnf clean all
+
+WORKDIR /opt/colibri
+
+# Clone from pleite mirror (HTTPS — uses gh token or will be set up)
+RUN git clone https://github.com/pleite/colibri.git .
+
+# Build the C engine
+WORKDIR /opt/colibri/c
+RUN ./setup.sh 2>&1
+
+# Expose OpenAI-compatible API port
+EXPOSE 8000
+
+# Default: run the OpenAI server
+CMD ["python3", "openai_server.py", "--host", "0.0.0.0", "--port", "8000"]
