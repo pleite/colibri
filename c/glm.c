@@ -37,7 +37,9 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #ifdef COLI_CUDA
 #include <omp.h>
-#ifdef COLI_ROCM
+#if defined(COLI_VULKAN)
+#include "backend_vulkan.h"
+#elif defined(COLI_ROCM)
 #include "backend_rocm.h"
 #else
 #include "backend_cuda.h"
@@ -156,6 +158,10 @@ static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+static const char *backend_name(void){
+    const char *accel = getenv("COLI_ACCEL");
+    return accel && !strcmp(accel, "vulkan") ? "VULKAN" : "CUDA";
+}
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -167,10 +173,10 @@ static int qt_cuda_upload(QT *t){
 }
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
-    fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
+    fprintf(stderr,"[%s] resident set: %zu tensors, %.2f GB VRAM\n",backend_name(),n,b/1e9);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
-        fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+        fprintf(stderr,"[%s]   device %d: %zu tensors, %.2f GB\n",backend_name(),g_cuda_devices[i],n,b/1e9);
     }
 }
 static int parse_cuda_devices(const char *list, int *out){
@@ -487,7 +493,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
         w->cuda_failed=1;
-        fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
+        fprintf(stderr,"[%s] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",backend_name(),
             w->O,w->I,w->cuda_device);
     }
 #endif
@@ -2491,9 +2497,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 break;
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
+        fprintf(stderr,"[%s] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",backend_name(),
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
-        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
+        for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[%s]   device %d: %d experts, %.2f GB\n",backend_name(),
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
@@ -2671,22 +2677,34 @@ int main(int argc, char **argv){
         fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
     }
 #ifdef COLI_CUDA
-    if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){
+    {
+        const char *accel = getenv("COLI_ACCEL");
         const char *one=getenv("COLI_GPU"), *many=getenv("COLI_GPUS");
-        if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
-        if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
-        else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
-        else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
-        if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
-        g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
-        if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        const char *accel_devices=getenv("COLI_ACCEL_DEVICES");
+        int requested_vulkan = accel && !strcmp(accel, "vulkan");
+        int requested_backend = (getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) || requested_vulkan;
+        if(requested_backend){
+            if(one&&many){ fprintf(stderr,"use COLI_GPU or COLI_GPUS, not both\n"); return 2; }
+            if(accel_devices) g_cuda_ndev=parse_cuda_devices(accel_devices,g_cuda_devices);
+            else if(many) g_cuda_ndev=parse_cuda_devices(many,g_cuda_devices);
+            else if(one) g_cuda_ndev=parse_cuda_devices(one,g_cuda_devices);
+            else { g_cuda_ndev=1; g_cuda_devices[0]=0; }
+            if(g_cuda_ndev<1){
+                fprintf(stderr,"invalid %s: use a list such as 0,1,2\n",
+                        requested_vulkan ? "COLI_ACCEL_DEVICES" : "COLI_GPUS");
+                return 2;
+            }
+            g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
+            if(!g_cuda_enabled){ fprintf(stderr,"[%s] requested backend is unavailable\n", requested_vulkan ? "VULKAN" : "CUDA"); return 2; }
+        }
+        g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+        g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+        if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires a GPU backend\n"); return 2; }
+        if(accel_devices&&!g_cuda_enabled){ fprintf(stderr,"COLI_ACCEL_DEVICES requires COLI_ACCEL=vulkan\n"); return 2; }
+        if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires an enabled accelerator backend\n"); return 2; }
+        if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires an enabled accelerator backend\n"); return 2; }
+        if(g_cuda_enabled) fprintf(stderr,"[%s] mode: routed experts%s\n",backend_name(),g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
     }
-    g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
-    g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
-    if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
-    if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s\n",g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||

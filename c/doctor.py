@@ -109,6 +109,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                              devices=[gpu["index"] for gpu in selected_gpus]))
     else:
         checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+    vulkan_devices = detected.get("vulkan", [])
+    if vulkan_devices:
+        checks.append(_check("accelerator.vulkan", "pass", "Vulkan devices detected",
+                             devices=[device["index"] for device in vulkan_devices]))
+    else:
+        checks.append(_check("accelerator.vulkan", "skip", "no Vulkan device detected"))
     npus = detected.get("npu", [])
     if npus:
         checks.append(_check("accelerator.npu", "pass", "NPU devices detected",

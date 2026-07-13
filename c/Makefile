@@ -108,6 +108,27 @@ LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
 CUDA_OBJ  = backend_rocm.o
 endif
 
+# VULKAN=1 builds the Vulkan backend shim, which exposes the same coli_cuda_*
+# ABI while using a CPU reference path when no Vulkan runtime is present.
+VULKAN ?= 0
+ifeq ($(VULKAN),1)
+ifeq ($(CUDA),1)
+$(error CUDA=1 and VULKAN=1 are mutually exclusive)
+endif
+ifeq ($(ROCM),1)
+$(error ROCM=1 and VULKAN=1 are mutually exclusive)
+endif
+ifeq ($(UNAME_S),Darwin)
+$(error VULKAN=1 is supported only on Linux)
+endif
+ifneq ($(IS_WIN),)
+$(error VULKAN=1 is not supported on Windows)
+endif
+CFLAGS   += -DCOLI_CUDA -DCOLI_VULKAN
+LDFLAGS  += -ldl
+CUDA_OBJ  = backend_vulkan.o
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
@@ -133,6 +154,13 @@ rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
 	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
 	$(HIPCC) $(HIPCCFLAGS) backend_rocm.hip tests/test_backend_rocm.hip -o backend_rocm_test$(EXE)
 	./backend_rocm_test$(EXE)
+
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+
+vulkan-test: backend_vulkan.c backend_vulkan.h tests/test_backend_vulkan.c
+	$(CC) $(CFLAGS) backend_vulkan.c tests/test_backend_vulkan.c -o backend_vulkan_test$(EXE) $(LDFLAGS)
+	./backend_vulkan_test$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -171,7 +199,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test rocm-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test rocm-test vulkan-test portable test-c test-python test check clean
