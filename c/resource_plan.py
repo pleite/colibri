@@ -308,7 +308,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
 
     vram = plan["tiers"]["vram"]
     devices = [device["index"] for device in vram["devices"]]
-    backend = vram.get("backend", "cuda")
+    backend = vram.get("backend") or plan.get("accelerator", {}).get("selected_backend", "cpu")
     if not devices or vram["budget_bytes"] <= 0:
         return result
     if backend == "cuda" and (not cuda_enabled or result.get("COLI_CUDA", "1") == "0"):
