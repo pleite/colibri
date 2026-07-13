@@ -177,7 +177,6 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["layer_count"], 1)
         self.assertEqual(info["expert_count"], 3)
         plan = build_plan(qwen_model, available_memory=16 * GB, available_disk=1)
-        self.assertEqual(plan["model"]["layer_count"], info["layer_count"])
         self.assertEqual(plan["model"]["layer_count"], 1)
         self.assertGreater(plan["tiers"]["ram"]["cache_slots_per_layer"], 0)
 
@@ -189,6 +188,36 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["OMP_NUM_THREADS"], expected)
         self.assertEqual(env["OMP_DYNAMIC"], "FALSE")
         self.assertEqual(env["OMP_PROC_BIND"], "TRUE")
+
+    def test_positive_config_layer_count_takes_priority_over_tensors(self):
+        cfg_model = self.model / "cfg_priority_model"
+        cfg_model.mkdir()
+        (cfg_model / "config.json").write_text(json.dumps({
+            "num_hidden_layers": 3,
+            "num_attention_heads": 8,
+            "kv_lora_rank": 4,
+        }))
+        write_shard(cfg_model / "model.safetensors", [
+            ("model.layers.0.self_attn.q_proj.weight", 128),
+        ])
+        info = analyze_model(cfg_model)
+        self.assertEqual(info["layer_count"], 1)
+        plan = build_plan(cfg_model, available_memory=16 * GB, available_disk=1)
+        self.assertEqual(plan["model"]["layer_count"], 1)
+
+        fallback_model = self.model / "cfg_fallback_model"
+        fallback_model.mkdir()
+        (fallback_model / "config.json").write_text(json.dumps({
+            "num_hidden_layers": 0,
+            "num_attention_heads": 8,
+            "kv_lora_rank": 4,
+        }))
+        write_shard(fallback_model / "model.safetensors", [
+            ("model.layers.0.self_attn.q_proj.weight", 128),
+        ])
+        fallback_plan = build_plan(fallback_model, available_memory=16 * GB, available_disk=1)
+        self.assertGreater(plan["tiers"]["ram"]["runtime_bytes"],
+                           fallback_plan["tiers"]["ram"]["runtime_bytes"])
 
     def test_analyzes_zero_layers_without_tensor_layer_names(self):
         zero_model = self.model / "zero_model"

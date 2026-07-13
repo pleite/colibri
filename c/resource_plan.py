@@ -36,7 +36,7 @@ def _cfg_value(cfg, *keys, default=0):
 
 def _first_present_value(*values):
     for value in values:
-        if value is None:
+        if value is None or value == "":
             continue
         return value
     return None
@@ -46,7 +46,7 @@ def apply_runtime_environment(env=None):
     result = dict(env or {})
     threads = _first_present_value(result.get("COLI_CPU_THREADS"), result.get("OMP_NUM_THREADS"),
                                   os.environ.get("COLI_CPU_THREADS"), os.environ.get("OMP_NUM_THREADS"))
-    if threads is None or threads == "":
+    if threads is None:
         threads = str(os.cpu_count() or 1)
     result.setdefault("COLI_CPU_THREADS", threads)
     result.setdefault("OMP_NUM_THREADS", threads)
@@ -294,6 +294,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
+    # Prefer config-defined layer counts when present, but fall back to tensor
+    # inference and finally to a conservative default so planning remains stable
+    # even for models without traditional layer metadata.
     layers = int(_cfg_value(cfg, "num_hidden_layers", "n_layers", "num_layers", default=0))
     if layers <= 0:
         layers = info["layer_count"]
