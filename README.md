@@ -166,7 +166,7 @@ python coli chat --model D:\glm52_i4            # interactive chat
 python coli serve --model D:\glm52_i4            # OpenAI-compatible API
 ```
 
-**Status:** Phase 1 complete (compiles, correct, static-linked). O_DIRECT (Phase 2),
+**Status:** Phase 1 complete (compiles, correct, static-linked). Phase 2 complete (O_DIRECT via `FILE_FLAG_NO_BUFFERING` — `DIRECT=1` now bypasses the Windows page cache).
 GPU via `LoadLibrary` on `coli_cuda.dll` (Phases G0–G2), and full-model validation
 are separate workstreams. See `PORT_WINDOWS_PLAN.md` for the full plan.
 
