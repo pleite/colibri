@@ -185,9 +185,17 @@ class ResourcePlanTest(unittest.TestCase):
                                               available_disk=1), {})
         expected = str(os.cpu_count() or 1)
         self.assertEqual(env["COLI_CPU_THREADS"], expected)
+        self.assertEqual(env["COLI_THREADS"], expected)
         self.assertEqual(env["OMP_NUM_THREADS"], expected)
         self.assertEqual(env["OMP_DYNAMIC"], "FALSE")
         self.assertEqual(env["OMP_PROC_BIND"], "TRUE")
+
+    def test_runtime_environment_preserves_explicit_cpu_thread_aliases(self):
+        env = environment_for_plan(build_plan(self.model, available_memory=16 * GB,
+                                              available_disk=1), {"COLI_CPU_THREADS": "7"})
+        self.assertEqual(env["COLI_CPU_THREADS"], "7")
+        self.assertEqual(env["COLI_THREADS"], "7")
+        self.assertEqual(env["OMP_NUM_THREADS"], "7")
 
     def test_configured_layer_count_affects_runtime_estimate_over_tensor_fallback(self):
         cfg_model = self.model / "cfg_priority_model"

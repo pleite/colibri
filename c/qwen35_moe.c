@@ -362,23 +362,32 @@ static void softmax(float *values, int n) {
     for (int i = 0; i < n; i++) values[i] /= sum;
 }
 
+static const char *find_thread_env(void) {
+    static const char *const keys[] = {"COLI_CPU_THREADS", "COLI_THREADS", "OMP_NUM_THREADS", NULL};
+    for (int i = 0; keys[i]; i++) {
+        const char *value = getenv(keys[i]);
+        if (value && *value) return value;
+    }
+    return NULL;
+}
+
 static void configure_parallelism(void) {
 #ifdef _OPENMP
-    const char *threads_env = getenv("COLI_THREADS");
+    const char *threads_env = find_thread_env();
     if (!threads_env || !*threads_env) return;
     char *end = NULL;
     errno = 0;
     long requested = strtol(threads_env, &end, 10);
     if (errno != 0) {
-        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (invalid number or out of range)\n", threads_env);
+        fprintf(stderr, "warning: ignoring invalid thread setting %s (invalid number or out of range)\n", threads_env);
         return;
     }
     if (end == threads_env || *end != '\0') {
-        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (not a whole number)\n", threads_env);
+        fprintf(stderr, "warning: ignoring invalid thread setting %s (not a whole number)\n", threads_env);
         return;
     }
     if (requested <= 0 || requested > INT_MAX) {
-        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (invalid number or out of range)\n", threads_env);
+        fprintf(stderr, "warning: ignoring invalid thread setting %s (invalid number or out of range)\n", threads_env);
         return;
     }
     omp_set_num_threads((int)requested);

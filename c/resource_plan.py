@@ -76,6 +76,7 @@ def apply_runtime_environment(env=None):
     if threads is None:
         threads = str(os.cpu_count() or 1)
     result.setdefault("COLI_CPU_THREADS", threads)
+    result.setdefault("COLI_THREADS", threads)
     result.setdefault("OMP_NUM_THREADS", threads)
     result.setdefault("OMP_DYNAMIC", result.get("OMP_DYNAMIC") or os.environ.get("COLI_OMP_DYNAMIC", "FALSE"))
     result.setdefault("OMP_PROC_BIND", result.get("OMP_PROC_BIND") or os.environ.get("COLI_OMP_PROC_BIND", "TRUE"))
