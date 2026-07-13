@@ -14,6 +14,10 @@ from pathlib import Path
 GB = 1_000_000_000
 SUPPORTED_BACKENDS = ("cuda", "rocm", "vulkan", "npu")
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+# ROCm APU heuristic: integrated GPUs (e.g. Strix Halo Radeon 890M) report
+# only the small BIOS VRAM carve-out via rocm-smi, typically < 4 GB.
+# Discrete GPUs always have ≥ 4 GB of dedicated VRAM.
+APU_VRAM_THRESHOLD_BYTES = 4 * GB
 
 
 def _tensor_sizes(path):
@@ -141,7 +145,7 @@ def discover_rocm_gpus():
         # (Strix Halo Radeon 890M, Phoenix, etc.).  Users can override via
         # COLI_ROCM_UNIFIED=1/0 at runtime; the plan exposes this field for
         # informational purposes and to set environment variables.
-        unified_memory = total > 0 and total < 4 * GB
+        unified_memory = total > 0 and total < APU_VRAM_THRESHOLD_BYTES
         devices.append({"index": index, "name": name,
                         "total_bytes": total, "free_bytes": free,
                         "unified_memory": unified_memory})
@@ -271,15 +275,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         if unified:
             # APU/iGPU: GPU and CPU share the same physical DRAM.  The "free
             # VRAM" reported by rocm-smi is the small hardware carve-out; the
-            # true budget is bounded by the remaining RAM cache pool.
+            # true usable budget is bounded by the remaining RAM cache pool.
+            # No headroom reserve is deducted (there is no separate VRAM pool
+            # to protect); the final budget is capped by vram_budget below.
+            gpu_reserve = 0
             usable = cache_bytes
             has_unified = True
         else:
-            usable = max(0, gpu["free_bytes"] - reserve)
+            gpu_reserve = reserve
+            usable = max(0, gpu["free_bytes"] - gpu_reserve)
         safe_vram += usable
-        entry = dict(gpu, reserve_bytes=0 if unified else reserve,
-                     usable_bytes=usable)
-        gpu_plan.append(entry)
+        gpu_plan.append(dict(gpu, reserve_bytes=gpu_reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
     vram_budget = min(requested_vram, safe_vram, cache_bytes)
     vram_experts = int(vram_budget // typical) if typical else 0
