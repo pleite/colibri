@@ -42,6 +42,24 @@ def _cfg_int(cfg, *keys, default=0):
     return int(value)
 
 
+def detect_model_family(config):
+    if not isinstance(config, dict):
+        return "generic"
+    architecture_candidates = []
+    architectures = config.get("architectures")
+    if isinstance(architectures, str):
+        architecture_candidates.append(architectures)
+    elif isinstance(architectures, (list, tuple, set)):
+        architecture_candidates.extend(str(item) for item in architectures if item is not None)
+    model_type = str(config.get("model_type") or config.get("architecture") or "")
+    architecture_text = " ".join([model_type] + architecture_candidates).lower()
+    if "qwen3.5" in architecture_text or "qwen3" in architecture_text or "qwen" in architecture_text:
+        return "qwen35"
+    if "glm" in architecture_text:
+        return "glm"
+    return "generic"
+
+
 def _first_present_value(*values):
     """Return the first non-empty value, preserving 0/False as valid values."""
     for value in values:
@@ -127,6 +145,7 @@ def analyze_model(model):
         "typical_expert_bytes": typical_expert_bytes,
         "per_cap_bytes": per_cap_bytes,
         "layer_count": len(layer_indices),
+        "model_family": detect_model_family(config),
         "config": config,
     }
 

@@ -66,7 +66,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -129,13 +129,17 @@ LDFLAGS  += -ldl
 CUDA_OBJ  = backend_vulkan.o
 endif
 
-all: glm$(EXE)
+all: glm$(EXE) qwen35_moe$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
+qwen35_moe_build: qwen35_moe$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
+
+qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h
+	$(CC) $(CFLAGS) qwen35_moe.c -o qwen35_moe$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -184,7 +188,10 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-test-c: $(TEST_BINS)
+tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+test-c: qwen35_moe$(EXE) $(TEST_BINS)
 	@for test in $(TEST_BINS); do ./$$test || exit 1; done
 
 test-python:
@@ -199,7 +206,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test rocm-test vulkan-test portable test-c test-python test check clean
+.PHONY: all glm qwen35_moe_build cuda-test rocm-test vulkan-test portable test-c test-python test check clean

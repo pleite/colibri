@@ -19,11 +19,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from resource_plan import detect_model_family
+
 
 HERE = Path(__file__).resolve().parent
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+
+
+def detect_engine_for_model(model_path, requested_engine=None):
+    if requested_engine not in (None, ""):
+        return Path(requested_engine)
+    config_path = Path(model_path) / "config.json"
+    if not config_path.is_file():
+        return HERE / "glm"
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return HERE / "glm"
+    if not isinstance(payload, dict):
+        return HERE / "glm"
+    if detect_model_family(payload) == "qwen35":
+        return HERE / "qwen35_moe"
+    return HERE / "glm"
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:5173",
     "http://localhost:5173",
@@ -748,7 +767,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
+          cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
@@ -762,7 +781,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
-    runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+    engine_path = detect_engine_for_model(model, engine)
+    runtime = Engine(engine_path,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots)
@@ -781,7 +801,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
