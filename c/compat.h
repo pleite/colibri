@@ -222,6 +222,30 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- compat_open_direct: FILE_FLAG_NO_BUFFERING (equivalente di O_DIRECT su Linux).
+ * Bypassa la page cache di Windows; le pread devono avere offset, buffer e
+ * lunghezza allineati al settore fisico (tipicamente 4096 byte su NVMe moderno —
+ * tutti i siti del motore gia' soddisfano questo vincolo: slab allocato con
+ * posix_memalign(4096), offset arrotondati a ~4095LL, lunghezze multiple di 4096).
+ * Il fd restituito e' un fd CRT che avvolge un Win32 HANDLE; compat_pread usa
+ * _get_osfhandle(fd) -> ReadFile+OVERLAPPED, che funziona correttamente su handle
+ * NO_BUFFERING.  close(fd) rilascia il HANDLE sottostante. */
+static inline int compat_open_direct(const char *path){
+    HANDLE h = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_NO_BUFFERING,
+        NULL
+    );
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+    if(fd < 0){ CloseHandle(h); return -1; }
+    return fd;
+}
+
 #endif /* _WIN32 */
 
 /* --- compat_aligned_free su piattaforme diverse da Windows ---

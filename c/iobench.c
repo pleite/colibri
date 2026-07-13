@@ -27,13 +27,15 @@ int main(int argc,char**argv){
     int fd=open(argv[1],O_RDONLY|(direct?O_DIRECT:0));
     if(fd<0 && direct){ fprintf(stderr,"O_DIRECT is unavailable (%s); using buffered I/O\n",strerror(errno));
         direct=0; fd=open(argv[1],O_RDONLY); }
+#elif defined(__APPLE__) || defined(_WIN32)
+    int fd;
+    if(direct){
+        fd=compat_open_direct(argv[1]);
+        if(fd<0){ fprintf(stderr,"direct open failed (%s); using buffered I/O\n",strerror(errno)); direct=0; fd=open(argv[1],COMPAT_O_RDONLY); }
+    } else fd=open(argv[1],COMPAT_O_RDONLY);
 #else
-    int fd=open(argv[1],O_RDONLY);                 /* macOS: F_NOCACHE ~ O_DIRECT */
-#ifdef __APPLE__
-    if(direct && fd>=0) fcntl(fd,F_NOCACHE,1);
-#else
+    int fd=open(argv[1],O_RDONLY);
     if(direct){ fprintf(stderr,"O_DIRECT is unavailable; using buffered I/O\n"); direct=0; }
-#endif
 #endif
     if(fd<0){perror("open");return 1;}
     off_t sz=lseek(fd,0,SEEK_END);
