@@ -43,7 +43,8 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt: 0=f32, 1=int8, 2=int4, 3=int2, 4=fp8, 5=packed6, 6=packed4.
+ * fmt: 0=f32, 1=int8, 2=int4, 3=int2,
+ * 4=fp8, 5=packed6, 6=packed4.
  */
 int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,

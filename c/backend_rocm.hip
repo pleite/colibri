@@ -134,27 +134,31 @@ static int reserve_scratch(float **dev, float **host, size_t *cap,
 /* ---- GPU kernel --------------------------------------------------------- */
 
 __device__ static float decode_fp8_e4m3fnuz(uint8_t raw) {
-    const int sign = (raw & 0x80) ? -1 : 1;
+    constexpr float subnormal_scale = 0.015625f;  /* 2^-6 */
+    constexpr int exponent_bias = 7;
+    const int sign_multiplier = (raw & 0x80) ? -1 : 1;
     const int exp = (raw >> 3) & 0x0f;
     const int mant = raw & 0x07;
     if (exp == 0) {
-        if (mant == 0) return sign < 0 ? -0.0f : 0.0f;
-        return sign * (1.0f + mant / 8.0f) * powf(2.0f, -6.0f);
+        if (mant == 0) return sign_multiplier < 0 ? -0.0f : 0.0f;
+        return sign_multiplier * (mant / 8.0f) * subnormal_scale;
     }
-    if (exp == 0x0f) return sign * (mant ? 1.0f / 0.0f : 1.0f / 0.0f);
-    return sign * (1.0f + mant / 8.0f) * powf(2.0f, exp - 7);
+    if (exp == 0x0f) return sign_multiplier * INFINITY;
+    return sign_multiplier * (1.0f + mant / 8.0f) * exp2f(exp - exponent_bias);
+}
+
+__device__ static float decode_packed4(const uint8_t *q, int i) {
+    uint8_t v = q[i >> 1];
+    return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
 }
 
 __device__ static float weight_at(const void *weights, int fmt,
-                                   size_t row, int i, int I) {
+                                   size_t row, int i, int I, size_t row_bytes) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
     const uint8_t *q = base;
-    if (fmt == 2) {
-        uint8_t v = q[i >> 1];
-        return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
-    }
+    if (fmt == 2) return decode_packed4(q, i);
     if (fmt == 3) {
         uint8_t v = q[i >> 2];
         return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
@@ -164,17 +168,14 @@ __device__ static float weight_at(const void *weights, int fmt,
         size_t bit = (size_t)i * 6u;
         size_t byte = bit / 8u;
         size_t shift = bit % 8u;
-        size_t row_bytes = (size_t)((I * 6 + 7) / 8);
         uint16_t word = static_cast<uint16_t>(q[byte]);
-        if (byte + 1 < row_bytes) word |= (static_cast<uint16_t>(q[byte + 1]) << 8);
+        /* Only read the next byte when it still exists in the packed row. */
+        if (byte < row_bytes - 1) word |= (static_cast<uint16_t>(q[byte + 1]) << 8);
         int value = static_cast<int>((word >> shift) & 0x3f);
         if (value & 0x20) value -= 0x40;
         return static_cast<float>(value);
     }
-    if (fmt == 6) {
-        uint8_t v = q[i >> 1];
-        return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
-    }
+    if (fmt == 6) return decode_packed4(q, i);
     return 0.0f;
 }
 
@@ -187,7 +188,7 @@ __global__ static void quant_matmul(float *y, const float *x,
     size_t row = (size_t)o * rb;
     const float *xs = x + (size_t)s * I;
     for (int i = threadIdx.x; i < I; i += blockDim.x)
-        sum += xs[i] * weight_at(weights, fmt, row, i, I);
+        sum += xs[i] * weight_at(weights, fmt, row, i, I, rb);
 
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;

@@ -29,8 +29,8 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=fp8, 5=packed6,
- * 6=packed4.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2,
+ * 4=fp8, 5=packed6, 6=packed4.
  * The first successful call uploads W and its row scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
