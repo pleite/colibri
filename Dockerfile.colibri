@@ -1,7 +1,7 @@
 FROM registry.fedoraproject.org/fedora:42
 
 # Build deps + runtime deps (python3 for openai_server.py)
-RUN dnf install -y gcc gcc-c++ make git python3 python3-pip openmp && \
+RUN dnf install -y gcc gcc-c++ make git python3 python3-pip && \
     dnf clean all
 
 WORKDIR /opt/colibri
