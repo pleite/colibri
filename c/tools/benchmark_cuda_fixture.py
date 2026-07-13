@@ -86,7 +86,7 @@ def main() -> None:
             "PIN": str(stats), "PIN_GB": args.pin_gb,
             "COLI_ACCEL_EXPERT_GB": args.accel_expert_gb,
         }
-        accel_pin_dense = dict(accel_pin, COLI_ACCEL_DENSE="1")
+        accel_pin_dense = {**accel_pin, "COLI_ACCEL_DENSE": "1"}
     modes = {
         "cpu_stream": {},
         f"dense_{args.backend}": accel_dense,

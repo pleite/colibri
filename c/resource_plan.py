@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 GB = 1_000_000_000
+SUPPORTED_BACKENDS = ("cuda", "rocm", "vulkan", "npu")
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 
 
@@ -113,7 +114,7 @@ def _extract_number(value):
         return int(value)
     if isinstance(value, str):
         match = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
-        return int(float(match.group(0))) if match else 0
+        return int(round(float(match.group(0)))) if match else 0
     return 0
 
 
@@ -125,7 +126,7 @@ def discover_rocm_gpus():
         return []
     try:
         payload = json.loads(result.stdout)
-    except ValueError:
+    except json.JSONDecodeError:
         return []
     devices = []
     for _, card in sorted(payload.items()):
@@ -201,7 +202,7 @@ def discover_accelerators():
 
 
 def _select_backend(backend, accelerators):
-    choices = ("cuda", "rocm", "vulkan", "npu")
+    choices = SUPPORTED_BACKENDS
     if backend and backend not in (*choices, "auto", "cpu"):
         raise ValueError(f"unsupported accelerator backend: {backend}")
     if backend in choices:

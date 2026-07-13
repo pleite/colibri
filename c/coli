@@ -120,15 +120,14 @@ def env_float(env, keys, default=0.0):
         if value in (None,""): continue
         try: return float(value)
         except ValueError: continue
-    return float(default)
+    return default
 
 def resource_request(a, env):
     ctx = a.ctx or int(env.get("CTX", 4096))
     ram = a.ram or env_float(env, ["RAM_GB"], 0)
     vram = a.vram or env_float(env, ["CUDA_EXPERT_GB", "COLI_ACCEL_EXPERT_GB"], 0)
     accel = a.accel if a.accel is not None else env.get("COLI_ACCEL", "auto")
-    accel_text = accel.strip().lower() if isinstance(accel, str) else ""
-    backend = accel_text if accel_text else "auto"
+    backend = accel.strip().lower() if isinstance(accel, str) and accel.strip() else "auto"
     gpu = a.gpu
     if gpu is None:
         gpu = env.get("COLI_GPUS", env.get("COLI_GPU", "auto"))
