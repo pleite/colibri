@@ -106,7 +106,15 @@ def should_quantize(name):
         return None
     if '.mlp.experts.' in name:
         return 'int4'
-    if any(token in name for token in ['.self_attn.', '.shared_expert.', '.linear_attn.', 'model.embed_tokens', 'lm_head']):
+    if (
+        name.startswith('model.embed_tokens')
+        or name.startswith('lm_head')
+        or '.self_attn.' in name
+        or '.shared_expert.' in name
+        or '.linear_attn.' in name
+        or (name.startswith('model.layers.') and '.mlp.experts.' not in name)
+        or (name.startswith('model.language_model.layers.') and '.mlp.experts.' not in name)
+    ):
         return 'int8'
     return None
 
@@ -114,11 +122,11 @@ def should_quantize(name):
 def convert_safetensors(path, out_path):
     header, data = read_safetensors_file(path)
     output_tensors = []
-    output_names = []
 
     for tensor_name in header:
         if tensor_name == '__metadata__':
             continue
+        # Each tuple stores (tensor_name, payload, dtype, shape).
         meta = header[tensor_name]
         shape = meta['shape']
         dtype = meta['dtype']
@@ -130,17 +138,14 @@ def convert_safetensors(path, out_path):
             out_dim, in_dim = shape
             if quant_kind == 'int8':
                 packed, scales = quantize_int8(values, out_dim, in_dim)
-                output_tensors.append((tensor_name, packed, 'U8', len(packed)))
-                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', len(scales)))
-                output_names.extend([tensor_name, tensor_name + '.qs'])
+                output_tensors.append((tensor_name, packed, 'U8', shape))
+                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
             else:
                 packed, scales = quantize_int4(values, out_dim, in_dim)
-                output_tensors.append((tensor_name, packed, 'U8', len(packed)))
-                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', len(scales)))
-                output_names.extend([tensor_name, tensor_name + '.qs'])
+                output_tensors.append((tensor_name, packed, 'U8', shape))
+                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
         else:
-            output_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', len(values)))
-            output_names.append(tensor_name)
+            output_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', shape))
 
     write_safetensors_file(out_path, output_tensors)
 
@@ -148,10 +153,10 @@ def convert_safetensors(path, out_path):
 def write_safetensors_file(path, tensors):
     header = {}
     data_offset = 0
-    for name, payload, dtype, nelems in tensors:
+    for name, payload, dtype, shape in tensors:
         header[name] = {
             'dtype': dtype,
-            'shape': [nelems],
+            'shape': list(shape),
             'data_offsets': [data_offset, data_offset + len(payload)],
         }
         data_offset += len(payload)
@@ -218,14 +223,14 @@ def main():
                 out_dim, in_dim = shape
                 if quant_kind == 'int8':
                     packed, scales = quantize_int8(values, out_dim, in_dim)
-                    merged_tensors.append((tensor_name, packed, 'U8', len(packed)))
-                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', len(scales)))
+                    merged_tensors.append((tensor_name, packed, 'U8', shape))
+                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
                 else:
                     packed, scales = quantize_int4(values, out_dim, in_dim)
-                    merged_tensors.append((tensor_name, packed, 'U8', len(packed)))
-                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', len(scales)))
+                    merged_tensors.append((tensor_name, packed, 'U8', shape))
+                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
             else:
-                merged_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', len(values)))
+                merged_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', shape))
     write_safetensors_file(output_path / 'model.safetensors', merged_tensors)
     return 0
 

@@ -45,6 +45,9 @@
 #define COLI_HAS_BACKEND 0
 #endif
 
+/* Keep accelerator dispatch opt-in for larger matmuls while preserving a CPU fallback. */
+#define COLI_MATMUL_BACKEND_THRESHOLD 64
+
 typedef enum {
     LAYER_TYPE_LINEAR = 0,
     LAYER_TYPE_FULL = 1,
@@ -64,12 +67,13 @@ typedef struct {
     float *sh_gate;
     float *sh_up;
     float *sh_down;
+    float *shared_expert_gate;
     float *mlp_gate_proj;
     float *mlp_up_proj;
     float *mlp_down_proj;
-    float ***expert_gate_proj;
-    float ***expert_up_proj;
-    float ***expert_down_proj;
+    float **expert_gate_proj;
+    float **expert_up_proj;
+    float **expert_down_proj;
     float *la_in_proj_a;
     float *la_in_proj_b;
     float *la_in_proj_qkv;
@@ -322,24 +326,15 @@ static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermed
             if (i == j) layer->sh_down[i * shared_expert_intermediate_size + j] = 0.2f;
         }
     }
-    layer->expert_gate_proj = (float ***)calloc((size_t)num_experts, sizeof(float **));
-    layer->expert_up_proj = (float ***)calloc((size_t)num_experts, sizeof(float **));
-    layer->expert_down_proj = (float ***)calloc((size_t)num_experts, sizeof(float **));
+    layer->expert_gate_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
+    layer->expert_up_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
+    layer->expert_down_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
     if (!layer->expert_gate_proj || !layer->expert_up_proj || !layer->expert_down_proj) fail("out of memory");
     for (int expert = 0; expert < num_experts; expert++) {
-        layer->expert_gate_proj[expert] = (float **)calloc((size_t)moe_intermediate_size, sizeof(float *));
-        layer->expert_up_proj[expert] = (float **)calloc((size_t)moe_intermediate_size, sizeof(float *));
-        layer->expert_down_proj[expert] = (float **)calloc((size_t)hidden_size, sizeof(float *));
+        layer->expert_gate_proj[expert] = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
+        layer->expert_up_proj[expert] = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
+        layer->expert_down_proj[expert] = (float *)calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float));
         if (!layer->expert_gate_proj[expert] || !layer->expert_up_proj[expert] || !layer->expert_down_proj[expert]) fail("out of memory");
-        for (int row = 0; row < moe_intermediate_size; row++) {
-            layer->expert_gate_proj[expert][row] = (float *)calloc((size_t)hidden_size, sizeof(float));
-            layer->expert_up_proj[expert][row] = (float *)calloc((size_t)hidden_size, sizeof(float));
-            if (!layer->expert_gate_proj[expert][row] || !layer->expert_up_proj[expert][row]) fail("out of memory");
-        }
-        for (int row = 0; row < hidden_size; row++) {
-            layer->expert_down_proj[expert][row] = (float *)calloc((size_t)moe_intermediate_size, sizeof(float));
-            if (!layer->expert_down_proj[expert][row]) fail("out of memory");
-        }
     }
 }
 
@@ -521,41 +516,35 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
                 for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->shared_expert_intermediate_size; j++) if (i == j) cur->sh_down[i * m->shared_expert_intermediate_size + j] = 0.2f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer);
-            float *shared_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
-            if (shared_gate) {
-                cur->sh_gate = shared_gate;
+            cur->shared_expert_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
+            if (!cur->shared_expert_gate) {
+                cur->shared_expert_gate = (float *)calloc((size_t)m->hidden_size, sizeof(float));
+                if (!cur->shared_expert_gate) fail("out of memory");
+                for (int i = 0; i < m->hidden_size; i++) cur->shared_expert_gate[i] = 1.0f;
             }
-            cur->expert_gate_proj = (float ***)calloc((size_t)m->num_experts, sizeof(float **));
-            cur->expert_up_proj = (float ***)calloc((size_t)m->num_experts, sizeof(float **));
-            cur->expert_down_proj = (float ***)calloc((size_t)m->num_experts, sizeof(float **));
+            cur->expert_gate_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
+            cur->expert_up_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
+            cur->expert_down_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
             if (!cur->expert_gate_proj || !cur->expert_up_proj || !cur->expert_down_proj) fail("out of memory");
             for (int expert = 0; expert < m->num_experts; expert++) {
                 char expert_name[1024];
                 snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert);
-                cur->expert_gate_proj[expert] = (float **)calloc((size_t)m->moe_intermediate_size, sizeof(float *));
-                cur->expert_up_proj[expert] = (float **)calloc((size_t)m->moe_intermediate_size, sizeof(float *));
-                cur->expert_down_proj[expert] = (float **)calloc((size_t)m->hidden_size, sizeof(float *));
-                if (!cur->expert_gate_proj[expert] || !cur->expert_up_proj[expert] || !cur->expert_down_proj[expert]) fail("out of memory");
-                for (int row = 0; row < m->moe_intermediate_size; row++) {
-                    cur->expert_gate_proj[expert][row] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size);
-                    if (!cur->expert_gate_proj[expert][row]) {
-                        cur->expert_gate_proj[expert][row] = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-                        if (!cur->expert_gate_proj[expert][row]) fail("out of memory");
-                    }
-                    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert);
-                    cur->expert_up_proj[expert][row] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size);
-                    if (!cur->expert_up_proj[expert][row]) {
-                        cur->expert_up_proj[expert][row] = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-                        if (!cur->expert_up_proj[expert][row]) fail("out of memory");
-                    }
+                cur->expert_gate_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+                if (!cur->expert_gate_proj[expert]) {
+                    cur->expert_gate_proj[expert] = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
+                    if (!cur->expert_gate_proj[expert]) fail("out of memory");
                 }
-                for (int row = 0; row < m->hidden_size; row++) {
-                    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert);
-                    cur->expert_down_proj[expert][row] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size);
-                    if (!cur->expert_down_proj[expert][row]) {
-                        cur->expert_down_proj[expert][row] = (float *)calloc((size_t)m->moe_intermediate_size, sizeof(float));
-                        if (!cur->expert_down_proj[expert][row]) fail("out of memory");
-                    }
+                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert);
+                cur->expert_up_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+                if (!cur->expert_up_proj[expert]) {
+                    cur->expert_up_proj[expert] = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
+                    if (!cur->expert_up_proj[expert]) fail("out of memory");
+                }
+                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert);
+                cur->expert_down_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
+                if (!cur->expert_down_proj[expert]) {
+                    cur->expert_down_proj[expert] = (float *)calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float));
+                    if (!cur->expert_down_proj[expert]) fail("out of memory");
                 }
             }
         } else {
@@ -634,6 +623,7 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->sh_gate);
     free(layer->sh_up);
     free(layer->sh_down);
+    free(layer->shared_expert_gate);
     free(layer->mlp_gate_proj);
     free(layer->mlp_up_proj);
     free(layer->mlp_down_proj);
@@ -648,24 +638,18 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->la_conv1d);
     if (layer->expert_gate_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            if (!layer->expert_gate_proj[expert]) continue;
-            for (int row = 0; row < m->moe_intermediate_size; row++) free(layer->expert_gate_proj[expert][row]);
             free(layer->expert_gate_proj[expert]);
         }
         free(layer->expert_gate_proj);
     }
     if (layer->expert_up_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            if (!layer->expert_up_proj[expert]) continue;
-            for (int row = 0; row < m->moe_intermediate_size; row++) free(layer->expert_up_proj[expert][row]);
             free(layer->expert_up_proj[expert]);
         }
         free(layer->expert_up_proj);
     }
     if (layer->expert_down_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            if (!layer->expert_down_proj[expert]) continue;
-            for (int row = 0; row < m->hidden_size; row++) free(layer->expert_down_proj[expert][row]);
             free(layer->expert_down_proj[expert]);
         }
         free(layer->expert_down_proj);
@@ -688,19 +672,29 @@ static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, 
         return;
     }
 #if COLI_HAS_BACKEND
-    if (in_dim * out_dim >= 64) {
-        static int backend_ready = -1;
-        if (backend_ready == -1) {
-            int devices[1] = {0};
-            backend_ready = coli_cuda_init(devices, 1) ? 1 : 0;
-        }
-        if (backend_ready) {
-            ColiCudaTensor *tensor = NULL;
-            if (coli_cuda_matmul(&tensor, out, x, w, NULL, 0, 1, in_dim, out_dim, 0)) {
-                if (tensor) coli_cuda_tensor_free(tensor);
-                return;
+    {
+        const size_t matmul_size = (size_t)in_dim * (size_t)out_dim;
+        if (matmul_size >= COLI_MATMUL_BACKEND_THRESHOLD) {
+            static int backend_ready = -1;
+            if (backend_ready == -1) {
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+                {
+                    if (backend_ready == -1) {
+                        int devices[1] = {0};
+                        backend_ready = coli_cuda_init(devices, 1) ? 1 : 0;
+                    }
+                }
             }
-            if (tensor) coli_cuda_tensor_free(tensor);
+            if (backend_ready) {
+                ColiCudaTensor *tensor = NULL;
+                if (coli_cuda_matmul(&tensor, out, x, w, NULL, 0, 1, in_dim, out_dim, 0)) {
+                    if (tensor) coli_cuda_tensor_free(tensor);
+                    return;
+                }
+                if (tensor) coli_cuda_tensor_free(tensor);
+            }
         }
     }
 #endif
@@ -734,7 +728,10 @@ static float silu(float x) {
 }
 
 static void softmax(float *values, int n) {
-    if (n <= 0) return;
+    if (n <= 0) {
+        fprintf(stderr, "warning: softmax received empty input\n");
+        return;
+    }
     float maxv = values[0];
     for (int i = 1; i < n; i++) if (values[i] > maxv) maxv = values[i];
     float sum = 0.0f;
@@ -796,17 +793,23 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             memcpy(residual, hidden, (size_t)m->hidden_size * sizeof(float));
 
             if (cur->is_full_attn) {
-                float *q_out = (float *)malloc((size_t)(m->num_attention_heads * m->head_dim) * sizeof(float));
-                float *k_out = (float *)malloc((size_t)(m->num_kv_heads * m->head_dim) * sizeof(float));
-                float *v_out = (float *)malloc((size_t)(m->num_kv_heads * m->head_dim) * sizeof(float));
-                float *attn = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+                const int q_dim = m->num_attention_heads * m->head_dim;
+                const int kv_dim = m->num_kv_heads * m->head_dim;
+                float *q_out = (float *)malloc((size_t)q_dim * sizeof(float));
+                float *k_out = (float *)malloc((size_t)kv_dim * sizeof(float));
+                float *v_out = (float *)malloc((size_t)kv_dim * sizeof(float));
+                float *attn = (float *)malloc((size_t)q_dim * sizeof(float));
                 float *post = (float *)malloc((size_t)m->hidden_size * sizeof(float));
                 if (!q_out || !k_out || !v_out || !attn || !post) fail("out of memory");
-                matmul_vec(hidden, cur->q_proj, m->hidden_size, m->num_attention_heads * m->head_dim, q_out);
-                matmul_vec(hidden, cur->k_proj, m->hidden_size, m->num_kv_heads * m->head_dim, k_out);
-                matmul_vec(hidden, cur->v_proj, m->hidden_size, m->num_kv_heads * m->head_dim, v_out);
-                for (int i = 0; i < m->hidden_size; i++) attn[i] = q_out[i] + k_out[i] + v_out[i];
-                matmul_vec(attn, cur->o_proj, m->hidden_size, m->hidden_size, post);
+                matmul_vec(hidden, cur->q_proj, m->hidden_size, q_dim, q_out);
+                matmul_vec(hidden, cur->k_proj, m->hidden_size, kv_dim, k_out);
+                matmul_vec(hidden, cur->v_proj, m->hidden_size, kv_dim, v_out);
+                for (int i = 0; i < q_dim; i++) {
+                    float kv_term = i < kv_dim ? k_out[i] : 0.0f;
+                    float v_term = i < kv_dim ? v_out[i] : 0.0f;
+                    attn[i] = q_out[i] + kv_term + v_term;
+                }
+                matmul_vec(attn, cur->o_proj, q_dim, m->hidden_size, post);
                 layer_norm_inplace(hidden, cur->in_ln, m->hidden_size);
                 for (int i = 0; i < m->hidden_size; i++) hidden[i] += residual[i] + post[i];
                 free(q_out);
@@ -855,12 +858,12 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     float *expert_up = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_res = (float *)malloc((size_t)m->hidden_size * sizeof(float));
                     if (!expert_gate || !expert_up || !expert_res) fail("out of memory");
-                    matmul_vec(hidden, cur->expert_gate_proj[expert_idx][0], m->hidden_size, m->moe_intermediate_size, expert_gate);
+                    matmul_vec(hidden, cur->expert_gate_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_gate);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] = relu(expert_gate[i]);
-                    matmul_vec(hidden, cur->expert_up_proj[expert_idx][0], m->hidden_size, m->moe_intermediate_size, expert_up);
+                    matmul_vec(hidden, cur->expert_up_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_up);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_up[i] = relu(expert_up[i]);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] *= expert_up[i];
-                    matmul_vec(expert_gate, cur->expert_down_proj[expert_idx][0], m->moe_intermediate_size, m->hidden_size, expert_res);
+                    matmul_vec(expert_gate, cur->expert_down_proj[expert_idx], m->moe_intermediate_size, m->hidden_size, expert_res);
                     for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += weight * expert_res[i];
                     free(expert_gate);
                     free(expert_up);
@@ -876,7 +879,13 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             float *shared_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
             if (!shared_in || !shared_mid || !shared_out) fail("out of memory");
             matmul_vec(hidden, cur->sh_gate, m->hidden_size, m->shared_expert_intermediate_size, shared_in);
-            for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] = silu(shared_in[i]);
+            {
+                const int gate_dim = m->shared_expert_intermediate_size < m->hidden_size ? m->shared_expert_intermediate_size : m->hidden_size;
+                for (int i = 0; i < m->shared_expert_intermediate_size; i++) {
+                    float gate = cur->shared_expert_gate && i < gate_dim ? cur->shared_expert_gate[i] : 1.0f;
+                    shared_in[i] = silu(shared_in[i] * gate);
+                }
+            }
             matmul_vec(hidden, cur->sh_up, m->hidden_size, m->shared_expert_intermediate_size, shared_mid);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_mid[i] = silu(shared_mid[i]);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] *= shared_mid[i];
