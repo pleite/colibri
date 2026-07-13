@@ -22,31 +22,6 @@ static size_t g_tensor_bytes = 0;
 static ColiCudaTensor **g_tensors = NULL;
 static size_t g_tensor_capacity = 0;
 
-static void tensor_list_add(ColiCudaTensor *tensor) {
-    if (!tensor) return;
-    if (g_tensor_count == g_tensor_capacity) {
-        size_t new_capacity = g_tensor_capacity ? g_tensor_capacity * 2 : 8;
-        ColiCudaTensor **next = (ColiCudaTensor **)realloc(g_tensors, new_capacity * sizeof(*next));
-        if (!next) return;
-        g_tensors = next;
-        g_tensor_capacity = new_capacity;
-    }
-    g_tensors[g_tensor_count++] = tensor;
-}
-
-static void tensor_list_remove(ColiCudaTensor *tensor) {
-    if (!tensor) return;
-    for (size_t i = 0; i < g_tensor_count; ++i) {
-        if (g_tensors[i] == tensor) {
-            memmove(g_tensors + i, g_tensors + i + 1, (g_tensor_count - i - 1) * sizeof(*g_tensors));
-            g_tensor_count--;
-            break;
-        }
-    }
-}
-static ColiCudaTensor **g_tensors = NULL;
-static size_t g_tensor_capacity = 0;
-
 static void register_tensor(ColiCudaTensor *tensor) {
     if (!tensor) return;
     if (g_tensor_count == g_tensor_capacity) {
@@ -152,7 +127,6 @@ void coli_cuda_shutdown(void) {
     g_tensor_count = 0;
     g_tensor_bytes = 0;
 }
-
 int coli_cuda_device_count(void) {
     return g_initialized ? g_device_count : 0;
 }

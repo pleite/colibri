@@ -94,7 +94,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["accelerator.vulkan"]["status"], "pass")
         self.assertEqual(checks["accelerator.vulkan"]["details"]["devices"], [0])
 
-    def test_vulkan_devices_are_reported(self):
+    def test_vulkan_devices_reported_with_ok_status(self):
         report = self.report(accelerators={"cuda": [], "rocm": [], "vulkan": [{"index": 0, "name": "RADV", "total_bytes": 0, "free_bytes": 0}], "npu": []})
         checks = self.checks_by_id(report)
 
