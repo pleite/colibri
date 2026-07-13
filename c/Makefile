@@ -80,6 +80,34 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# ROCM=1 builds the ROCm/HIP backend instead of CUDA.
+# Requires ROCm ≥ 6.0 with hipcc at /opt/rocm/bin/hipcc (override via ROCM_HOME).
+# Targets AMD GPUs and AMD APUs (Strix Halo, Radeon 890M) with unified memory.
+# The ROCm backend exports the same coli_cuda_* API as the CUDA backend, so
+# glm.c is compiled with -DCOLI_CUDA -DCOLI_ROCM and uses the same code paths.
+ROCM      ?= 0
+ROCM_HOME ?= /opt/rocm
+HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+ROCM_ARCH ?= native
+HIPCCFLAGS ?= -O3 -std=c++17 -Xcompiler=-Wall,-Wextra
+ifeq ($(ROCM),1)
+ifeq ($(CUDA),1)
+$(error CUDA=1 and ROCM=1 are mutually exclusive)
+endif
+ifeq ($(UNAME_S),Darwin)
+$(error ROCM=1 is supported only on Linux)
+endif
+ifneq ($(IS_WIN),)
+$(error ROCM=1 is not supported on Windows)
+endif
+ifneq ($(ROCM_ARCH),native)
+HIPCCFLAGS += --offload-arch=$(ROCM_ARCH)
+endif
+CFLAGS   += -DCOLI_CUDA -DCOLI_ROCM
+LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+CUDA_OBJ  = backend_rocm.o
+endif
+
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
@@ -96,6 +124,15 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+
+backend_rocm.o: backend_rocm.hip backend_rocm.h
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
+	$(HIPCC) $(HIPCCFLAGS) -c backend_rocm.hip -o $@
+
+rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
+	$(HIPCC) $(HIPCCFLAGS) backend_rocm.hip tests/test_backend_rocm.hip -o backend_rocm_test$(EXE)
+	./backend_rocm_test$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -134,7 +171,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all glm cuda-test rocm-test portable test-c test-python test check clean

@@ -137,7 +137,14 @@ def discover_rocm_gpus():
         total = _extract_number(card.get("VRAM Total Memory (B)"))
         used = _extract_number(card.get("VRAM Total Used Memory (B)"))
         free = max(0, total - used) if total else 0
-        devices.append({"index": index, "name": name, "total_bytes": total, "free_bytes": free})
+        # APU/iGPU heuristic: VRAM carve-out is usually < 4 GB on integrated GPUs
+        # (Strix Halo Radeon 890M, Phoenix, etc.).  Users can override via
+        # COLI_ROCM_UNIFIED=1/0 at runtime; the plan exposes this field for
+        # informational purposes and to set environment variables.
+        unified_memory = total > 0 and total < 4 * GB
+        devices.append({"index": index, "name": name,
+                        "total_bytes": total, "free_bytes": free,
+                        "unified_memory": unified_memory})
     return devices
 
 
@@ -258,10 +265,21 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     reserve = 2 * GB
     gpu_plan = []
     safe_vram = 0
+    has_unified = False
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve)
+        unified = gpu.get("unified_memory", False)
+        if unified:
+            # APU/iGPU: GPU and CPU share the same physical DRAM.  The "free
+            # VRAM" reported by rocm-smi is the small hardware carve-out; the
+            # true budget is bounded by the remaining RAM cache pool.
+            usable = cache_bytes
+            has_unified = True
+        else:
+            usable = max(0, gpu["free_bytes"] - reserve)
         safe_vram += usable
-        gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
+        entry = dict(gpu, reserve_bytes=0 if unified else reserve,
+                     usable_bytes=usable)
+        gpu_plan.append(entry)
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
     vram_budget = min(requested_vram, safe_vram, cache_bytes)
     vram_experts = int(vram_budget // typical) if typical else 0
@@ -276,6 +294,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
         warnings.append("VRAM tier was clamped by free VRAM or its required RAM backing")
+    if has_unified:
+        warnings.append("unified memory APU detected: GPU and CPU share DRAM; "
+                        "VRAM budget and CPU expert cache compete for the same pool")
 
     return {
         "version": 1,
@@ -289,7 +310,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "backend": selected_backend,
-                     "budget_bytes": vram_budget, "expert_capacity": vram_experts},
+                     "budget_bytes": vram_budget, "expert_capacity": vram_experts,
+                     "unified_memory": has_unified},
         },
         "accelerator": {
             "requested_backend": backend or "auto",
@@ -329,6 +351,9 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         budget_key = "COLI_ACCEL_EXPERT_GB"
         result.setdefault(budget_key, expert_budget)
         expert_budget = result[budget_key]
+        # For ROCm on unified-memory APUs: signal zero-copy mode to the backend.
+        if backend == "rocm" and vram.get("unified_memory"):
+            result.setdefault("COLI_ROCM_UNIFIED", "1")
     if result.get("PIN"):
         result.setdefault("PIN_GB", expert_budget)
     return result
