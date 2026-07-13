@@ -102,22 +102,121 @@ static char *join_path(const char *dir, const char *name) {
     return out;
 }
 
+static st_tensor *find_tensor(qwen35_model *m, const char *name) {
+    st_tensor *t = st_find(&m->shards, name);
+    if (t) return t;
+    static const char *const old_prefix = "model.layers.";
+    static const char *const new_prefix = "model.language_model.layers.";
+    size_t old_len = strlen(old_prefix);
+    size_t new_len = strlen(new_prefix);
+    if (strncmp(name, old_prefix, old_len) == 0) {
+        size_t tail_len = strlen(name + old_len);
+        size_t total = new_len + tail_len + 1;
+        char *candidate = (char *)malloc(total);
+        if (!candidate) fail("out of memory");
+        snprintf(candidate, total, "%s%s", new_prefix, name + old_len);
+        t = st_find(&m->shards, candidate);
+        free(candidate);
+        return t;
+    }
+    if (strncmp(name, new_prefix, new_len) == 0) {
+        size_t tail_len = strlen(name + new_len);
+        size_t total = old_len + tail_len + 1;
+        char *candidate = (char *)malloc(total);
+        if (!candidate) fail("out of memory");
+        snprintf(candidate, total, "%s%s", old_prefix, name + new_len);
+        t = st_find(&m->shards, candidate);
+        free(candidate);
+        return t;
+    }
+    return NULL;
+}
+
+static int tensor_exists(qwen35_model *m, const char *name) {
+    return find_tensor(m, name) != NULL;
+}
+
 static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) {
     float *buf = (float *)calloc(nelems, sizeof(float));
     if (!buf) fail("out of memory");
-    st_tensor *t = st_find(&m->shards, name);
+    st_tensor *t = find_tensor(m, name);
     if (!t) {
         return buf;
+    }
+    if (t->dtype == 3) {
+        size_t scale_name_len = strlen(name) + 4;
+        char *scale_name = (char *)malloc(scale_name_len);
+        if (!scale_name) fail("out of memory");
+        snprintf(scale_name, scale_name_len, "%s.qs", name);
+        st_tensor *scale = find_tensor(m, scale_name);
+        free(scale_name);
+        if (!scale) {
+            fprintf(stderr, "warning: missing scale for quantized tensor %s; assuming unit scale\n", name);
+        }
+        size_t out_dim = scale ? (size_t)scale->numel : 1;
+        if (out_dim == 0 || nelems % out_dim != 0) {
+            fail("tensor %s has incompatible shape for quantized load", name);
+        }
+        size_t in_dim = nelems / out_dim;
+        size_t bytes_per_row = (in_dim + 1) / 2;
+        size_t packed_bytes = (size_t)t->nbytes;
+        if (packed_bytes == nelems) {
+            /* int8: one byte per scalar */
+            uint8_t *raw = (uint8_t *)malloc(packed_bytes);
+            if (!raw) fail("out of memory");
+            st_read_raw(&m->shards, t->name, raw, 0);
+            float *scale_vals = (float *)calloc(out_dim, sizeof(float));
+            if (!scale_vals) fail("out of memory");
+            if (scale) {
+                st_read_f32(&m->shards, scale->name, scale_vals, 0);
+            } else {
+                for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+            }
+            for (size_t row = 0; row < out_dim; row++) {
+                for (size_t col = 0; col < in_dim; col++) {
+                    int8_t value = (int8_t)raw[row * in_dim + col];
+                    buf[row * in_dim + col] = (float)value * scale_vals[row];
+                }
+            }
+            free(raw);
+            free(scale_vals);
+            return buf;
+        }
+        if (packed_bytes == out_dim * bytes_per_row) {
+            uint8_t *raw = (uint8_t *)malloc(packed_bytes);
+            if (!raw) fail("out of memory");
+            st_read_raw(&m->shards, t->name, raw, 0);
+            float *scale_vals = (float *)calloc(out_dim, sizeof(float));
+            if (!scale_vals) fail("out of memory");
+            if (scale) {
+                st_read_f32(&m->shards, scale->name, scale_vals, 0);
+            } else {
+                for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+            }
+            for (size_t row = 0; row < out_dim; row++) {
+                for (size_t col = 0; col < in_dim; col++) {
+                    size_t byte_index = row * bytes_per_row + col / 2;
+                    uint8_t byte = raw[byte_index];
+                    int nibble = (col & 1) ? (int)((byte >> 4) & 0x0f) : (int)(byte & 0x0f);
+                    int8_t value = (int8_t)nibble - 8;
+                    buf[row * in_dim + col] = (float)value * scale_vals[row];
+                }
+            }
+            free(raw);
+            free(scale_vals);
+            return buf;
+        }
+        fail("tensor %s has unsupported packed size %lld for %zu elements", name, (long long)t->nbytes, nelems);
     }
     if (t->numel != (int64_t)nelems) {
         fail("tensor %s has %lld elements (expected %zu)", name, (long long)t->numel, nelems);
     }
-    st_read_f32(&m->shards, name, buf, 0);
+    st_read_f32(&m->shards, t->name, buf, 0);
     return buf;
 }
 
 static float *load_optional_tensor_f32(qwen35_model *m, const char *name, size_t nelems) {
-    if (!st_has(&m->shards, name)) return NULL;
+    if (!tensor_exists(m, name)) return NULL;
     return load_tensor_f32(m, name, nelems);
 }
 
@@ -327,6 +426,17 @@ static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, 
         fprintf(stderr, "warning: overflow in matmul row offset for dimensions (%d, %d)\n", in_dim, out_dim);
         return;
     }
+#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_CUDA)
+    if (init_gpu_backend()) {
+        ColiCudaTensor *tensor = NULL;
+        int used_gpu = 0;
+        if (coli_cuda_matmul(&tensor, out, x, w, NULL, 0, 1, in_dim, out_dim, 0)) {
+            used_gpu = 1;
+        }
+        if (tensor) coli_cuda_tensor_free(tensor);
+        if (used_gpu) return;
+    }
+#endif
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -371,32 +481,44 @@ static const char *find_thread_env(void) {
     return NULL;
 }
 
-static void configure_parallelism(void) {
-#ifdef _OPENMP
-    const char *threads_env = find_thread_env();
-    if (!threads_env || !*threads_env) return;
+static int parse_thread_count(const char *value, int *out) {
     char *end = NULL;
     errno = 0;
-    long requested = strtol(threads_env, &end, 10);
-    if (errno != 0) {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s (invalid number or out of range)\n", threads_env);
+    long requested = strtol(value, &end, 10);
+    if (errno != 0) return 0;
+    if (end == value || *end != '\0') return 0;
+    if (requested <= 0 || requested > INT_MAX) return 0;
+    *out = (int)requested;
+    return 1;
+}
+
+static void configure_parallelism(int requested_threads) {
+#ifdef _OPENMP
+    if (requested_threads > 0) {
+        omp_set_num_threads(requested_threads);
         return;
     }
-    if (end == threads_env || *end != '\0') {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s (not a whole number)\n", threads_env);
+    const char *threads_env = find_thread_env();
+    if (!threads_env || !*threads_env) return;
+    int parsed = 0;
+    if (!parse_thread_count(threads_env, &parsed)) {
+        fprintf(stderr, "warning: ignoring invalid thread setting %s\n", threads_env);
         return;
     }
-    if (requested <= 0) {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s (must be a positive integer)\n", threads_env);
-        return;
-    }
-    if (requested > INT_MAX) {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s (exceeds the supported range)\n", threads_env);
-        return;
-    }
-    omp_set_num_threads((int)requested);
+    omp_set_num_threads(parsed);
 #endif
 }
+
+#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_CUDA)
+static int init_gpu_backend(void) {
+    static int initialized = -1;
+    if (initialized == -1) {
+        int devices[1] = {0};
+        initialized = coli_cuda_init(devices, 1) ? 1 : 0;
+    }
+    return initialized;
+}
+#endif
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps, int *out_tokens) {
     float *hidden = (float *)malloc((size_t)m->hidden_size * sizeof(float));
@@ -531,13 +653,14 @@ static int parse_token_ids(const char *text, int *out, int max_ids) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N]\n", prog);
+    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N]\n", prog);
 }
 
 int main(int argc, char **argv) {
     const char *snap_dir = NULL;
     const char *prompt = NULL;
     int steps = 4;
+    int threads = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             snap_dir = argv[++i];
@@ -545,6 +668,12 @@ int main(int argc, char **argv) {
             prompt = argv[++i];
         } else if (!strcmp(argv[i], "--steps") && i + 1 < argc) {
             steps = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
+            const char *threads_arg = argv[++i];
+            if (!parse_thread_count(threads_arg, &threads)) {
+                fprintf(stderr, "error: invalid thread count: %s\n", threads_arg);
+                return 1;
+            }
         } else {
             usage(argv[0]);
             return 1;
@@ -557,7 +686,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    configure_parallelism();
+    configure_parallelism(threads);
     qwen35_model model;
     init_model(&model, snap_dir);
     int *tokens = (int *)calloc((size_t)steps, sizeof(int));
