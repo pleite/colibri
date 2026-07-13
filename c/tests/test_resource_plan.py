@@ -177,6 +177,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["layer_count"], 1)
         self.assertEqual(info["expert_count"], 3)
         plan = build_plan(qwen_model, available_memory=16 * GB, available_disk=1)
+        self.assertEqual(plan["model"]["layer_count"], info["layer_count"])
         self.assertEqual(plan["model"]["layer_count"], 1)
         self.assertGreater(plan["tiers"]["ram"]["cache_slots_per_layer"], 0)
 

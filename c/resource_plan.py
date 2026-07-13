@@ -34,11 +34,19 @@ def _cfg_value(cfg, *keys, default=0):
     return default
 
 
+def _first_present_value(*values):
+    for value in values:
+        if value is None:
+            continue
+        return value
+    return None
+
+
 def apply_runtime_environment(env=None):
     result = dict(env or {})
-    threads = (result.get("COLI_CPU_THREADS") or result.get("OMP_NUM_THREADS") or
-               os.environ.get("COLI_CPU_THREADS") or os.environ.get("OMP_NUM_THREADS"))
-    if not threads:
+    threads = _first_present_value(result.get("COLI_CPU_THREADS"), result.get("OMP_NUM_THREADS"),
+                                  os.environ.get("COLI_CPU_THREADS"), os.environ.get("OMP_NUM_THREADS"))
+    if threads is None or threads == "":
         threads = str(os.cpu_count() or 1)
     result.setdefault("COLI_CPU_THREADS", threads)
     result.setdefault("OMP_NUM_THREADS", threads)
@@ -289,6 +297,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     layers = int(_cfg_value(cfg, "num_hidden_layers", "n_layers", "num_layers", default=0))
     if layers <= 0:
         layers = info["layer_count"]
+    if layers <= 0:
+        layers = 1
     kv_lora_rank = int(_cfg_value(cfg, "kv_lora_rank", default=0))
     qk_rope_head_dim = int(_cfg_value(cfg, "qk_rope_head_dim", "rope_head_dim", "rotary_dim", default=0))
     qk_nope_head_dim = int(_cfg_value(cfg, "qk_nope_head_dim", "nope_head_dim", default=0))
