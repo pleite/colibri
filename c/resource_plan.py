@@ -7,10 +7,12 @@ import re
 import shutil
 import statistics
 import subprocess
+from collections import OrderedDict
 from pathlib import Path
 
 
 GB = 1_000_000_000
+SUPPORTED_BACKENDS = ("cuda", "rocm", "vulkan", "npu")
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 
 
@@ -105,8 +107,117 @@ def discover_gpus():
     return devices
 
 
+def _extract_number(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
+        return int(round(float(match.group(0)))) if match else 0
+    return 0
+
+
+def discover_rocm_gpus():
+    command = ["rocm-smi", "--showid", "--showproductname", "--showmeminfo", "vram", "--json"]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    devices = []
+    for _, card in sorted(payload.items()):
+        if not isinstance(card, dict):
+            continue
+        index = _extract_number(card.get("GPU ID"))
+        name = str(card.get("Card series") or card.get("Card model") or "rocm-gpu")
+        total = _extract_number(card.get("VRAM Total Memory (B)"))
+        used = _extract_number(card.get("VRAM Total Used Memory (B)"))
+        free = max(0, total - used) if total else 0
+        devices.append({"index": index, "name": name, "total_bytes": total, "free_bytes": free})
+    return devices
+
+
+def discover_vulkan_gpus():
+    command = ["vulkaninfo", "--summary"]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    devices = []
+    # Minimal parser: "GPU0: ...", "GPU1: ...", or "GPU id = 0 (name)"
+    patterns = [
+        re.compile(r"GPU(\d+)\s*:\s*(.+)$"),
+        re.compile(r"GPU id\s*=\s*(\d+)\s*\((.+)\)"),
+    ]
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            devices.append({
+                "index": int(match.group(1)),
+                "name": match.group(2).strip(),
+                "total_bytes": 0,
+                "free_bytes": 0,
+            })
+            break
+    unique = OrderedDict()
+    for device in devices:
+        unique[device["index"]] = device
+    return list(unique.values())
+
+
+def discover_npus():
+    devices = []
+    accel_root = Path("/sys/class/accel")
+    if accel_root.is_dir():
+        for node in sorted(accel_root.glob("accel*")):
+            idx = _extract_number(node.name)
+            name = "npu"
+            for candidate in ("device/vendor_name", "device/name", "name"):
+                path = node / candidate
+                try:
+                    if path.is_file():
+                        value = path.read_text().strip()
+                        if value:
+                            name = value
+                            break
+                except OSError:
+                    continue
+            devices.append({"index": idx, "name": name, "total_bytes": 0, "free_bytes": 0})
+    return devices
+
+
+def discover_accelerators():
+    cuda = discover_gpus()
+    rocm = discover_rocm_gpus()
+    vulkan = discover_vulkan_gpus()
+    npu = discover_npus()
+    return {"cuda": cuda, "rocm": rocm, "vulkan": vulkan, "npu": npu}
+
+
+def _select_backend(backend, accelerators):
+    choices = SUPPORTED_BACKENDS
+    if backend and backend not in (*choices, "auto", "cpu"):
+        raise ValueError(f"unsupported accelerator backend: {backend}")
+    if backend in choices:
+        return backend
+    if backend == "cpu":
+        return "cpu"
+    for name in choices:
+        if accelerators.get(name):
+            return name
+    return "cpu"
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
-               available_memory=None, available_disk=None, gpus=None):
+               available_memory=None, available_disk=None, gpus=None,
+               backend="auto", accelerators=None):
     info = analyze_model(model)
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
@@ -116,7 +227,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             available_disk = usage.free
         except OSError:
             available_disk = 500 * GB
-    gpus = discover_gpus() if gpus is None else gpus
+    accelerators = discover_accelerators() if accelerators is None else dict(accelerators)
+    if gpus is not None:
+        accelerators["cuda"] = gpus
+    for key in ("cuda", "rocm", "vulkan", "npu"):
+        accelerators.setdefault(key, [])
+    selected_backend = _select_backend(backend, accelerators)
+    gpus = list(accelerators.get(selected_backend, []))
     if gpu_indices is not None:
         wanted = set(gpu_indices)
         gpus = [gpu for gpu in gpus if gpu["index"] in wanted]
@@ -150,8 +267,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
+    explicit_backend = backend not in (None, "", "auto", "cpu")
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
+    if explicit_backend and not accelerators.get(backend):
+        warnings.append(f"requested backend '{backend}' is not detected on this system")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
@@ -168,7 +288,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
                     "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
+                     "backend": selected_backend,
                      "budget_bytes": vram_budget, "expert_capacity": vram_experts},
+        },
+        "accelerator": {
+            "requested_backend": backend or "auto",
+            "selected_backend": selected_backend,
+            "detected": {name: len(devices) for name, devices in accelerators.items()},
         },
         "warnings": warnings,
     }
@@ -182,18 +308,29 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
 
     vram = plan["tiers"]["vram"]
     devices = [device["index"] for device in vram["devices"]]
-    if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
+    backend = vram.get("backend") or plan.get("accelerator", {}).get("selected_backend", "cpu")
+    if not devices or vram["budget_bytes"] <= 0:
         return result
-    if result.get("COLI_CUDA", "1") == "0":
+    if backend == "cuda" and (not cuda_enabled or result.get("COLI_CUDA", "1") == "0"):
         return result
 
-    result.setdefault("COLI_CUDA", "1")
-    if "COLI_GPU" not in result and "COLI_GPUS" not in result:
-        key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
-        result[key] = ",".join(map(str, devices))
-    result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+    expert_budget = f"{vram['budget_bytes'] / GB:.3f}"
+    if backend == "cuda":
+        result.setdefault("COLI_CUDA", "1")
+        if "COLI_GPU" not in result and "COLI_GPUS" not in result:
+            key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
+            result[key] = ",".join(map(str, devices))
+        budget_key = "CUDA_EXPERT_GB"
+        result.setdefault(budget_key, expert_budget)
+        expert_budget = result[budget_key]
+    else:
+        result.setdefault("COLI_ACCEL", backend)
+        result.setdefault("COLI_ACCEL_DEVICES", ",".join(map(str, devices)))
+        budget_key = "COLI_ACCEL_EXPERT_GB"
+        result.setdefault(budget_key, expert_budget)
+        expert_budget = result[budget_key]
     if result.get("PIN"):
-        result.setdefault("PIN_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        result.setdefault("PIN_GB", expert_budget)
     return result
 
 
@@ -203,6 +340,7 @@ def format_bytes(value):
 
 def format_plan(plan):
     model, tiers = plan["model"], plan["tiers"]
+    backend = tiers["vram"].get("backend", "cuda")
     lines = [f"model  {model['shards']} shards · {format_bytes(model['model_bytes'])}",
              f"disk   backing store · {format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
@@ -212,9 +350,9 @@ def format_plan(plan):
     vram = tiers["vram"]
     if vram["devices"]:
         names = ", ".join(f"{gpu['index']}:{gpu['name']}" for gpu in vram["devices"])
-        lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
+        lines.append(f"VRAM   [{backend}] {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
-        lines.append("VRAM   no NVIDIA device detected · CPU path")
+        lines.append(f"VRAM   [{backend}] no compatible device detected · CPU path")
     lines.extend(f"warn   {warning}" for warning in plan["warnings"])
     return "\n".join(lines)

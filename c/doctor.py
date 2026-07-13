@@ -6,7 +6,13 @@ import json
 import subprocess
 from pathlib import Path
 
-from resource_plan import GB, build_plan, discover_gpus, format_plan, memory_available
+from resource_plan import (
+    GB,
+    build_plan,
+    discover_accelerators,
+    format_plan,
+    memory_available,
+)
 
 
 def _check(identifier, status, summary, **details):
@@ -31,8 +37,9 @@ def cuda_linkage(engine_path):
 
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
+               backend="auto",
                engine_path, available_memory=None, available_disk=None, gpus=None,
-               linkage=None):
+               accelerators=None, linkage=None):
     """Collect a complete report. No model payload, engine, or CUDA context is loaded."""
     model = Path(model).expanduser().resolve()
     checks = []
@@ -71,8 +78,17 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
 
     available_memory = memory_available() if available_memory is None else available_memory
-    detected_gpus = discover_gpus() if gpus is None else list(gpus)
+    detected = discover_accelerators() if accelerators is None else dict(accelerators)
+    if gpus is not None:
+        detected["cuda"] = list(gpus)
+        detected_gpus = list(gpus)
+    else:
+        detected_gpus = list(detected.get("cuda", []))
     linkage = cuda_linkage(engine) if linkage is None else linkage
+    requested_backend = backend or "auto"
+    checks.append(_check("accelerator.backend", "pass",
+                         f"requested backend: {requested_backend}",
+                         requested=requested_backend))
     selected_gpus = detected_gpus
     if gpu_indices is not None:
         wanted = set(gpu_indices)
@@ -93,12 +109,24 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                              devices=[gpu["index"] for gpu in selected_gpus]))
     else:
         checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+    npus = detected.get("npu", [])
+    if npus:
+        checks.append(_check("accelerator.npu", "pass", "NPU devices detected",
+                             devices=[device["index"] for device in npus]))
+    else:
+        checks.append(_check("accelerator.npu", "skip", "no NPU device detected"))
 
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
+                          backend=backend,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus)
+                          gpus=detected_gpus, accelerators=detected)
         model_info = plan["model"]
+        accelerator = plan.get("accelerator", {})
+        selected_backend = accelerator.get("selected_backend", "cpu")
+        checks.append(_check("accelerator.selection", "pass",
+                             f"selected backend: {selected_backend}",
+                             detected=accelerator.get("detected", {})))
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
         disk = plan["tiers"]["disk"]

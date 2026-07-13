@@ -114,16 +114,27 @@ def cuda_binary():
                    for line in linked.stdout.splitlines())
     except (OSError,subprocess.SubprocessError): return False
 
+def env_float(env, keys, default=0.0):
+    for key in keys:
+        value=env.get(key)
+        if value in (None,""): continue
+        try: return float(value)
+        except ValueError: continue
+    return default
+
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("CUDA_EXPERT_GB",0))
-    gpu=a.gpu
+    ctx = a.ctx or int(env.get("CTX", 4096))
+    ram = a.ram or env_float(env, ["RAM_GB"], 0)
+    vram = a.vram or env_float(env, ["CUDA_EXPERT_GB", "COLI_ACCEL_EXPERT_GB"], 0)
+    accel = a.accel if a.accel is not None else env.get("COLI_ACCEL", "auto")
+    accel_clean = accel.strip().lower() if isinstance(accel, str) else ""
+    backend = accel_clean if accel_clean else "auto"
+    gpu = a.gpu
     if gpu is None:
-        gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
-    devices=None if gpu=="auto" else ([] if gpu=="none" else
+        gpu = env.get("COLI_GPUS", env.get("COLI_GPU", "auto"))
+    devices = None if gpu == "auto" else ([] if gpu == "none" else
         [int(value) for value in gpu.split(",")])
-    return ram,ctx,devices,vram
+    return ram, ctx, devices, vram, backend
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
@@ -146,14 +157,15 @@ def env_for(a):
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
-            ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram)
+            ram,ctx,devices,vram,backend=resource_request(a,e)
+            plan=build_plan(a.model,ram,ctx,devices,vram,backend=backend)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
         e=environment_for_plan(plan,e,has_cuda)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
-        gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
+        accel=plan.get("accelerator",{}).get("selected_backend","cpu")
+        gpu=f" · {accel.upper()} {format_bytes(vt['budget_bytes'])}" if vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     return e
 
@@ -322,10 +334,10 @@ def cmd_info(a):
 def cmd_plan(a):
     from resource_plan import build_plan, format_plan
     try:
-        ram,ctx,devices,vram=resource_request(a,os.environ)
+        ram,ctx,devices,vram,backend=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if a.vram<0: raise ValueError("--vram cannot be negative")
-        plan=build_plan(a.model,ram,ctx,devices,vram)
+        plan=build_plan(a.model,ram,ctx,devices,vram,backend=backend)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -338,7 +350,7 @@ def cmd_plan(a):
 def cmd_doctor(a):
     from doctor import exit_code, format_doctor, run_doctor
     try:
-        ram,ctx,devices,vram=resource_request(a,os.environ)
+        ram,ctx,devices,vram,backend=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
         if ram<0: raise ValueError("--ram cannot be negative")
         if vram<0: raise ValueError("--vram cannot be negative")
@@ -348,7 +360,7 @@ def cmd_doctor(a):
                 "plan":None}
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
-    report=run_doctor(a.model,ram,ctx,devices,vram,engine_path=GLM)
+    report=run_doctor(a.model,ram,ctx,devices,vram,backend=backend,engine_path=GLM)
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
@@ -514,6 +526,7 @@ def main():
     common.add_argument("--model", default=DEF_MODEL); common.add_argument("--ram", type=int, default=0)  # 0 = auto (il motore usa l'88% della RAM disponibile)
     common.add_argument("--auto-tier",action="store_true",help="automatically apply the RAM/VRAM plan")
     common.add_argument("--ctx",type=int,default=0)
+    common.add_argument("--accel",default=None,help="accelerator backend: auto, cpu, cuda, rocm, vulkan, npu")
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
