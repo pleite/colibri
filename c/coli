@@ -167,7 +167,8 @@ def env_for(a):
         accel=plan.get("accelerator",{}).get("selected_backend","cpu")
         gpu=f" · {accel.upper()} {format_bytes(vt['budget_bytes'])}" if vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
-    return e
+    from resource_plan import apply_runtime_environment
+    return apply_runtime_environment(e)
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
 class MDStream:

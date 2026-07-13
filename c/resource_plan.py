@@ -14,10 +14,55 @@ from pathlib import Path
 GB = 1_000_000_000
 SUPPORTED_BACKENDS = ("cuda", "rocm", "vulkan", "npu")
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+LAYER_RE = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
 # ROCm APU heuristic: integrated GPUs (e.g. Strix Halo Radeon 890M) report
 # only the small BIOS VRAM carve-out via rocm-smi, typically < 4 GB.
 # Discrete GPUs always have ≥ 4 GB of dedicated VRAM.
 APU_VRAM_THRESHOLD_BYTES = 4 * GB
+
+
+def _cfg_value(cfg, *keys, default=None):
+    """Return the first non-missing config value, preserving 0/False."""
+    for key in keys:
+        value = cfg.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, tuple, set, dict)):
+            if len(value) > 0:
+                return value
+            continue
+        return value
+    return default
+
+
+def _cfg_int(cfg, *keys, default=0):
+    value = _cfg_value(cfg, *keys, default=None)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _first_present_value(*values):
+    """Return the first non-empty value, preserving 0/False as valid values."""
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
+def apply_runtime_environment(env=None):
+    result = dict(env or {})
+    threads = _first_present_value(result.get("COLI_CPU_THREADS"), result.get("OMP_NUM_THREADS"),
+                                  os.environ.get("COLI_CPU_THREADS"), os.environ.get("OMP_NUM_THREADS"))
+    if threads is None:
+        threads = str(os.cpu_count() or 1)
+    result.setdefault("COLI_CPU_THREADS", threads)
+    result.setdefault("OMP_NUM_THREADS", threads)
+    result.setdefault("OMP_DYNAMIC", result.get("OMP_DYNAMIC") or os.environ.get("COLI_OMP_DYNAMIC", "FALSE"))
+    result.setdefault("OMP_PROC_BIND", result.get("OMP_PROC_BIND") or os.environ.get("COLI_OMP_PROC_BIND", "TRUE"))
+    result.setdefault("OMP_PLACES", result.get("OMP_PLACES") or os.environ.get("COLI_OMP_PLACES", "cores"))
+    return result
 
 
 def _tensor_sizes(path):
@@ -51,6 +96,7 @@ def analyze_model(model):
 
     dense_bytes = 0
     expert_groups = {}
+    layer_indices = set()
     for shard in shards:
         for name, size in _tensor_sizes(shard):
             match = EXPERT_RE.search(name)
@@ -59,6 +105,9 @@ def analyze_model(model):
                 expert_groups[key] = expert_groups.get(key, 0) + size
             else:
                 dense_bytes += size
+            layer_match = LAYER_RE.search(name)
+            if layer_match:
+                layer_indices.add(int(layer_match.group(1)))
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
@@ -77,6 +126,7 @@ def analyze_model(model):
         "expert_layers": len(per_layer),
         "typical_expert_bytes": typical_expert_bytes,
         "per_cap_bytes": per_cap_bytes,
+        "layer_count": len(layer_indices),
         "config": config,
     }
 
@@ -253,15 +303,29 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
-    layers = int(cfg.get("num_hidden_layers", 0)) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
-                                   int(cfg.get("qk_rope_head_dim", 0))) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
-        int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
+    # Prefer config-defined layer counts when present, but fall back to tensor
+    # inference and finally to a conservative default so planning remains stable
+    # even for models without traditional layer metadata.
+    layers = _cfg_int(cfg, "num_hidden_layers", "n_layers", "num_layers", default=0)
+    if layers <= 0:
+        layers = info["layer_count"]
+    if layers <= 0:
+        layers = 1
+        layer_warning = "model layer count unavailable; defaulting to 1 layer for planning"
+    else:
+        layer_warning = None
+    kv_lora_rank = _cfg_int(cfg, "kv_lora_rank", default=0)
+    qk_rope_head_dim = _cfg_int(cfg, "qk_rope_head_dim", "rope_head_dim", "rotary_dim", default=0)
+    qk_nope_head_dim = _cfg_int(cfg, "qk_nope_head_dim", "nope_head_dim", default=0)
+    v_head_dim = _cfg_int(cfg, "v_head_dim", "value_head_dim", default=0)
+    num_attention_heads = _cfg_int(cfg, "num_attention_heads", "n_head", "num_heads", default=0)
+    kv_bytes = layers * context * (kv_lora_rank + qk_rope_head_dim) * 4
+    kv_buffer = context * num_attention_heads * (qk_nope_head_dim + v_head_dim) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts", 0))
+    configured_experts = _cfg_int(cfg, "n_routed_experts", "num_experts_per_tok",
+                                  "num_experts", "num_local_experts", default=0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
@@ -291,6 +355,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
+    if layer_warning:
+        warnings.append(layer_warning)
     explicit_backend = backend not in (None, "", "auto", "cpu")
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
@@ -331,6 +397,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
 def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
+    result = apply_runtime_environment(result)
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 
