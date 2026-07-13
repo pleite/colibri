@@ -123,17 +123,18 @@ def env_float(env, keys, default=0.0):
     return float(default)
 
 def resource_request(a, env):
-    ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or env_float(env,["RAM_GB"],0)
-    vram=a.vram or env_float(env,["CUDA_EXPERT_GB","COLI_ACCEL_EXPERT_GB"],0)
-    accel=a.accel if a.accel is not None else env.get("COLI_ACCEL","auto")
-    backend=(accel.strip().lower() if isinstance(accel,str) and accel.strip() else "auto")
-    gpu=a.gpu
+    ctx = a.ctx or int(env.get("CTX", 4096))
+    ram = a.ram or env_float(env, ["RAM_GB"], 0)
+    vram = a.vram or env_float(env, ["CUDA_EXPERT_GB", "COLI_ACCEL_EXPERT_GB"], 0)
+    accel = a.accel if a.accel is not None else env.get("COLI_ACCEL", "auto")
+    accel_text = accel.strip().lower() if isinstance(accel, str) else ""
+    backend = accel_text if accel_text else "auto"
+    gpu = a.gpu
     if gpu is None:
-        gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))
-    devices=None if gpu=="auto" else ([] if gpu=="none" else
+        gpu = env.get("COLI_GPUS", env.get("COLI_GPU", "auto"))
+    devices = None if gpu == "auto" else ([] if gpu == "none" else
         [int(value) for value in gpu.split(",")])
-    return ram,ctx,devices,vram,backend
+    return ram, ctx, devices, vram, backend
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)

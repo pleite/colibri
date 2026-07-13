@@ -67,18 +67,19 @@ def main() -> None:
     )
 
     execute(args.engine, base | {"STATS": str(stats)})
-    accel_dense = {"COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1"}
-    accel_pin = {
-        "COLI_CUDA": "1", "COLI_GPU": args.gpu,
-        "PIN": str(stats), "PIN_GB": args.pin_gb,
-        "CUDA_EXPERT_GB": args.accel_expert_gb,
-    }
-    accel_pin_dense = {
-        "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
-        "PIN": str(stats), "PIN_GB": args.pin_gb,
-        "CUDA_EXPERT_GB": args.accel_expert_gb,
-    }
-    if args.backend != "cuda":
+    if args.backend == "cuda":
+        accel_dense = {"COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1"}
+        accel_pin = {
+            "COLI_CUDA": "1", "COLI_GPU": args.gpu,
+            "PIN": str(stats), "PIN_GB": args.pin_gb,
+            "CUDA_EXPERT_GB": args.accel_expert_gb,
+        }
+        accel_pin_dense = {
+            "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
+            "PIN": str(stats), "PIN_GB": args.pin_gb,
+            "CUDA_EXPERT_GB": args.accel_expert_gb,
+        }
+    else:
         accel_dense = {"COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu}
         accel_pin = {
             "COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu,

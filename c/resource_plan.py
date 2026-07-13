@@ -106,13 +106,13 @@ def discover_gpus():
     return devices
 
 
-def _extract_int(value):
+def _extract_number(value):
     if isinstance(value, int):
         return value
     if isinstance(value, float):
         return int(value)
     if isinstance(value, str):
-        match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+        match = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
         return int(float(match.group(0))) if match else 0
     return 0
 
@@ -131,10 +131,10 @@ def discover_rocm_gpus():
     for _, card in sorted(payload.items()):
         if not isinstance(card, dict):
             continue
-        index = _extract_int(card.get("GPU ID"))
+        index = _extract_number(card.get("GPU ID"))
         name = str(card.get("Card series") or card.get("Card model") or "rocm-gpu")
-        total = _extract_int(card.get("VRAM Total Memory (B)"))
-        used = _extract_int(card.get("VRAM Total Used Memory (B)"))
+        total = _extract_number(card.get("VRAM Total Memory (B)"))
+        used = _extract_number(card.get("VRAM Total Used Memory (B)"))
         free = max(0, total - used) if total else 0
         devices.append({"index": index, "name": name, "total_bytes": total, "free_bytes": free})
     return devices
@@ -158,8 +158,12 @@ def discover_vulkan_gpus():
             match = pattern.search(text)
             if not match:
                 continue
-            devices.append({"index": int(match.group(1)), "name": match.group(2).strip(),
-                            "total_bytes": 0, "free_bytes": 0})
+            devices.append({
+                "index": int(match.group(1)),
+                "name": match.group(2).strip(),
+                "total_bytes": 0,
+                "free_bytes": 0,
+            })
             break
     unique = OrderedDict()
     for device in devices:
@@ -172,7 +176,7 @@ def discover_npus():
     accel_root = Path("/sys/class/accel")
     if accel_root.is_dir():
         for node in sorted(accel_root.glob("accel*")):
-            idx = _extract_int(node.name)
+            idx = _extract_number(node.name)
             name = "npu"
             for candidate in ("device/vendor_name", "device/name", "name"):
                 path = node / candidate
@@ -315,11 +319,15 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         if "COLI_GPU" not in result and "COLI_GPUS" not in result:
             key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
             result[key] = ",".join(map(str, devices))
-        expert_budget = result.setdefault("CUDA_EXPERT_GB", expert_budget)
+        budget_key = "CUDA_EXPERT_GB"
+        result.setdefault(budget_key, expert_budget)
+        expert_budget = result[budget_key]
     else:
         result.setdefault("COLI_ACCEL", backend)
         result.setdefault("COLI_ACCEL_DEVICES", ",".join(map(str, devices)))
-        expert_budget = result.setdefault("COLI_ACCEL_EXPERT_GB", expert_budget)
+        budget_key = "COLI_ACCEL_EXPERT_GB"
+        result.setdefault(budget_key, expert_budget)
+        expert_budget = result[budget_key]
     if result.get("PIN"):
         result.setdefault("PIN_GB", expert_budget)
     return result
