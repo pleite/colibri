@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "parallelism.h"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -472,40 +474,17 @@ static void softmax(float *values, int n) {
     for (int i = 0; i < n; i++) values[i] /= sum;
 }
 
-static const char *find_thread_env(void) {
-    static const char *const keys[] = {"COLI_CPU_THREADS", "COLI_THREADS", "OMP_NUM_THREADS", NULL};
-    for (int i = 0; keys[i]; i++) {
-        const char *value = getenv(keys[i]);
-        if (value && *value) return value;
-    }
-    return NULL;
-}
-
-static int parse_thread_count(const char *value, int *out) {
-    char *end = NULL;
-    errno = 0;
-    long requested = strtol(value, &end, 10);
-    if (errno != 0) return 0;
-    if (end == value || *end != '\0') return 0;
-    if (requested <= 0 || requested > INT_MAX) return 0;
-    *out = (int)requested;
-    return 1;
-}
-
 static void configure_parallelism(int requested_threads) {
 #ifdef _OPENMP
     if (requested_threads > 0) {
+        /* Keep the requested thread count stable for the matrix-multiplication hot path. */
+        omp_set_dynamic(0);
         omp_set_num_threads(requested_threads);
         return;
     }
-    const char *threads_env = find_thread_env();
-    if (!threads_env || !*threads_env) return;
-    int parsed = 0;
-    if (!parse_thread_count(threads_env, &parsed)) {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s\n", threads_env);
-        return;
-    }
-    omp_set_num_threads(parsed);
+    /* Use a fixed thread pool for the remainder of execution so UMA/APU runs stay on the full CPU set consistently. */
+    omp_set_dynamic(0);
+    omp_set_num_threads(coli_detect_thread_count());
 #endif
 }
 
@@ -670,7 +649,7 @@ int main(int argc, char **argv) {
             steps = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *threads_arg = argv[++i];
-            if (!parse_thread_count(threads_arg, &threads)) {
+            if (!coli_parse_positive_int(threads_arg, &threads)) {
                 fprintf(stderr, "error: invalid thread count: %s\n", threads_arg);
                 return 1;
             }
