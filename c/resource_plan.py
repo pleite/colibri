@@ -262,9 +262,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
+    explicit_backend = backend not in (None, "", "auto", "cpu")
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
-    if backend not in (None, "", "auto", "cpu") and not accelerators.get(selected_backend):
+    if explicit_backend and not accelerators.get(backend):
         warnings.append(f"requested backend '{backend}' is not detected on this system")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
@@ -313,14 +314,13 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         if "COLI_GPU" not in result and "COLI_GPUS" not in result:
             key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
             result[key] = ",".join(map(str, devices))
-        result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        expert_budget = result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
     else:
         result.setdefault("COLI_ACCEL", backend)
         result.setdefault("COLI_ACCEL_DEVICES", ",".join(map(str, devices)))
-        result.setdefault("COLI_ACCEL_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        expert_budget = result.setdefault("COLI_ACCEL_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
     if result.get("PIN"):
-        pin_key = "CUDA_EXPERT_GB" if backend == "cuda" else "COLI_ACCEL_EXPERT_GB"
-        result.setdefault("PIN_GB", result.get(pin_key, f"{vram['budget_bytes'] / GB:.3f}"))
+        result.setdefault("PIN_GB", expert_budget)
     return result
 
 

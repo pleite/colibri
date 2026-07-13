@@ -44,7 +44,8 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=7)
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--pin-gb", default="1")
-    parser.add_argument("--cuda-expert-gb", default="2")
+    parser.add_argument("--accel-expert-gb", default="2")
+    parser.add_argument("--cuda-expert-gb", dest="accel_expert_gb", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     model = Path(args.model).resolve()
@@ -70,19 +71,19 @@ def main() -> None:
     accel_pin = {
         "COLI_CUDA": "1", "COLI_GPU": args.gpu,
         "PIN": str(stats), "PIN_GB": args.pin_gb,
-        "CUDA_EXPERT_GB": args.cuda_expert_gb,
+        "CUDA_EXPERT_GB": args.accel_expert_gb,
     }
     accel_pin_dense = {
         "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
         "PIN": str(stats), "PIN_GB": args.pin_gb,
-        "CUDA_EXPERT_GB": args.cuda_expert_gb,
+        "CUDA_EXPERT_GB": args.accel_expert_gb,
     }
     if args.backend != "cuda":
         accel_dense = {"COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu}
         accel_pin = {
             "COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu,
             "PIN": str(stats), "PIN_GB": args.pin_gb,
-            "COLI_ACCEL_EXPERT_GB": args.cuda_expert_gb,
+            "COLI_ACCEL_EXPERT_GB": args.accel_expert_gb,
         }
         accel_pin_dense = dict(accel_pin)
     modes = {

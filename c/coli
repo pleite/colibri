@@ -114,10 +114,18 @@ def cuda_binary():
                    for line in linked.stdout.splitlines())
     except (OSError,subprocess.SubprocessError): return False
 
+def env_float(env, keys, default=0.0):
+    for key in keys:
+        value=env.get(key)
+        if value in (None,""): continue
+        try: return float(value)
+        except ValueError: continue
+    return float(default)
+
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
-    ram=a.ram or float(env.get("RAM_GB",0))
-    vram=a.vram or float(env.get("CUDA_EXPERT_GB",env.get("COLI_ACCEL_EXPERT_GB",0)))
+    ram=a.ram or env_float(env,["RAM_GB"],0)
+    vram=a.vram or env_float(env,["CUDA_EXPERT_GB","COLI_ACCEL_EXPERT_GB"],0)
     backend=(a.accel or env.get("COLI_ACCEL","auto")).strip().lower()
     gpu=a.gpu
     if gpu is None:
