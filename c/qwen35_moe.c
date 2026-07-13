@@ -7,13 +7,28 @@
  * wire into the CLI/doctor/resource-planning flows.
  */
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#if defined(COLI_VULKAN)
+#include "backend_vulkan.h"
+#elif defined(COLI_ROCM)
+#include "backend_rocm.h"
+#elif defined(COLI_CUDA)
+#include "backend_cuda.h"
+#endif
 
 #include "json.h"
 #include "st.h"
@@ -304,10 +319,23 @@ static void free_model(qwen35_model *m) {
 }
 
 static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, float *out) {
+    if (in_dim <= 0 || out_dim <= 0) {
+        fprintf(stderr, "warning: invalid matmul dimensions (%d, %d)\n", in_dim, out_dim);
+        return;
+    }
+    if ((size_t)out_dim > SIZE_MAX / (size_t)in_dim) {
+        fprintf(stderr, "warning: overflow in matmul row offset for dimensions (%d, %d)\n", in_dim, out_dim);
+        return;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int out_idx = 0; out_idx < out_dim; out_idx++) {
         float sum = 0.0f;
+        const size_t row_offset = (size_t)out_idx * (size_t)in_dim;
+        const float *weight_row = w + row_offset;
         for (int in_idx = 0; in_idx < in_dim; in_idx++) {
-            sum += x[in_idx] * w[out_idx * in_dim + in_idx];
+            sum += x[in_idx] * weight_row[in_idx];
         }
         out[out_idx] = sum;
     }
@@ -332,6 +360,29 @@ static void softmax(float *values, int n) {
         sum += values[i];
     }
     for (int i = 0; i < n; i++) values[i] /= sum;
+}
+
+static void configure_parallelism(void) {
+#ifdef _OPENMP
+    const char *threads_env = getenv("COLI_THREADS");
+    if (!threads_env || !*threads_env) return;
+    char *end = NULL;
+    errno = 0;
+    long requested = strtol(threads_env, &end, 10);
+    if (errno != 0) {
+        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (invalid number or out of range)\n", threads_env);
+        return;
+    }
+    if (end == threads_env || *end != '\0') {
+        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (not a whole number)\n", threads_env);
+        return;
+    }
+    if (requested <= 0 || requested > INT_MAX) {
+        fprintf(stderr, "warning: ignoring invalid COLI_THREADS=%s (invalid number or out of range)\n", threads_env);
+        return;
+    }
+    omp_set_num_threads((int)requested);
+#endif
 }
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps, int *out_tokens) {
@@ -493,6 +544,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
+    configure_parallelism();
     qwen35_model model;
     init_model(&model, snap_dir);
     int *tokens = (int *)calloc((size_t)steps, sizeof(int));
