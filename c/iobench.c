@@ -31,7 +31,10 @@ int main(int argc,char**argv){
     int fd;
     if(direct){
         fd=compat_open_direct(argv[1]);
-        if(fd<0){ fprintf(stderr,"direct open failed (%s); using buffered I/O\n",strerror(errno)); direct=0; fd=open(argv[1],COMPAT_O_RDONLY); }
+        if(fd<0){
+            fprintf(stderr,"direct open failed (%s); using buffered I/O\n",strerror(errno));
+            direct=0; fd=open(argv[1],COMPAT_O_RDONLY);
+        }
     } else fd=open(argv[1],COMPAT_O_RDONLY);
 #else
     int fd=open(argv[1],O_RDONLY);

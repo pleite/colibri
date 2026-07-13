@@ -234,7 +234,7 @@ static inline int compat_open_direct(const char *path){
     HANDLE h = CreateFileA(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         OPEN_EXISTING,
         FILE_FLAG_NO_BUFFERING,
