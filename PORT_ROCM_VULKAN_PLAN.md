@@ -8,6 +8,25 @@ All accelerator code follows the same pattern as the CUDA backend: a thin
 abstraction layer in `c/backend_*.{hip,c}` exports the same `coli_cuda_*` API,
 so `glm.c` and the rest of the engine stay unchanged across backends.
 
+## Gap analysis: AMD Strix Halo + ROCmFPX / Charlie1234 scope
+
+The current plan covers the ROCm and Vulkan backends, but it still needs an
+explicit scope for AMD Strix Halo and ROCmFPX-style low-bit kernels. The missing
+items are:
+
+- A backend/format matrix for 8-bit, 6-bit, and 4-bit resident tensors on Strix
+  Halo (Radeon 890M, Vulkan fallback) and ROCmFPX-class AMD GPUs.
+- A concrete integration point for Charlie1234's prior FP6/FP4 work: kernel
+  entry points, packing conventions, and metadata fields must be captured so
+  ROCm and Vulkan share the same logical format contract.
+- Runtime capability checks and fallback rules for each backend/format pair
+  (ROCm native FP8/FP6/FP4, Vulkan shader fallback, CPU fallback).
+- Converter and model-layout changes to emit mixed resident formats
+  (`gpu_bits=8|6|4`) while preserving disk-streamed experts in the existing
+  int4/int8 container.
+- Validation targets for Strix Halo and ROCmFPX per bit-width (throughput,
+  memory, quality, regression tests).
+
 ---
 
 ## Phase R1 — ROCm/HIP backend (✅ complete)
@@ -79,8 +98,8 @@ Goal: a Vulkan compute path (`c/backend_vulkan.c`, `c/backend_vulkan.h`) that
 works with the **Mesa** open-source driver stack — no proprietary runtime.
 
 Scope:
-- GLSL compute shaders for q8/q4/q2/f32 matmul (same kernel semantics as
-  `backend_rocm.hip :: quant_matmul`)
+- GLSL compute shaders for 8/6/4-bit packed matmul (same kernel semantics as
+  `backend_rocm.hip :: quant_matmul`) plus a `f32` reference path
 - Compiled offline to SPIR-V with `glslc`/`glslangValidator`, embedded as
   `uint32_t` arrays in the C source
 - `VkBuffer` + `VkDescriptorSet` management via the Vulkan C API
@@ -115,19 +134,19 @@ sudo dnf install vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers
 build still passes `make -C c check`.
 
 #### V1.2 — Shader pipeline and memory model
-- Implement compute pipeline creation for q8/q4/q2/f32 kernels with offline
+- Implement compute pipeline creation for 8/6/4-bit kernels with offline
   SPIR-V blobs embedded in C.
 - Implement `VkBuffer` allocation/binding, descriptor sets, command recording,
   and queue submission for batched matmul execution.
 - Add explicit host-device synchronization and error propagation matching the
   CUDA/ROCm fallback semantics.
 
-**Exit criteria:** Vulkan backend runs quantized matmul correctness parity tests
+**Exit criteria:** Vulkan backend runs 8/6/4-bit matmul correctness parity tests
 against the CPU reference on at least one RADV device.
 
 #### V1.3 — Runtime integration and validation
 - Add accelerator discovery output for Vulkan devices in planner/doctor surfaces.
-- Add Vulkan backend tests (`tests/test_backend_vulkan.c`) with q8/q4/q2/f32
+- Add Vulkan backend tests (`tests/test_backend_vulkan.c`) with 8/6/4-bit
   coverage and CPU fallback assertions.
 - Document Fedora package/runtime requirements and troubleshooting for Mesa/RADV.
 
@@ -204,26 +223,31 @@ experimentally via `COLI_ACCEL=npu`.
 
 ## Phase Q1 — ROCmFPX quantization (execution plan)
 
-Goal: replace per-row int4/int8 with **FP8 (e4m3fnuz)** for GPU-resident
-tensors on RDNA 4 / CDNA 3+, where native hardware FP8 arithmetic is available.
+Goal: replace per-row int4/int8 with a family of resident tensor formats for
+**8/6/4-bit** workloads on AMD GPUs, starting with **FP8 (e4m3fnuz)** and then
+**FP6/FP4** kernels derived from Charlie1234's prior work where available.
 
-| axis | int4 (current) | FP8 e4m3 |
-|---|---|---|
-| bits/param | 4 | 8 |
-| hardware | software dequant in shader | native FP8 multiply on RDNA 4 |
-| quality | asymmetric round-to-nearest | closer to BF16; better tail representation |
-| dense resident | ~9.9 GB | ~19.8 GB (still fits in 128 GB Strix Halo) |
-| disk/expert | keep int4 (bandwidth-limited) | unchanged — FP8 for GPU-resident only |
+| axis | int4 (current) | 8-bit | 6-bit | 4-bit |
+|---|---|---|---|---|
+| bits/param | 4 | 8 | 6 | 4 |
+| format | int4 | FP8 e4m3 | FP6 (Charlie1234) | FP4 (Charlie1234) |
+| hardware | software dequant in shader | native FP8 multiply on RDNA 4 | ROCm/packed kernel path | ROCm/packed kernel path |
+| quality | asymmetric round-to-nearest | closer to BF16; better tail representation | higher density with more aggressive quantization | highest density; quality-sensitive |
+| dense resident | ~9.9 GB | ~19.8 GB | ~14.9 GB | ~9.9 GB |
+| disk/expert | keep int4 (bandwidth-limited) | unchanged — FP8 for GPU-resident only | unchanged — FP6 for GPU-resident only | unchanged — FP4 for GPU-resident only |
 
 **Implementation sketch:**
-- Add `fmt=4` (FP8 e4m3fnuz) to the `QT` struct in `glm.c`
+- Add `fmt=4` (FP8 e4m3fnuz) plus `fmt=5/6` placeholders for the Charlie1234
+  FP6/FP4 formats to the `QT` struct in `glm.c`
 - `backend_rocm.hip`: use `__hip_fp8_e4m3_fnuz` (ROCm ≥ 6.1) in `weight_at`
-  device function; let RDNA 4 use `v_pk_fma_f8` ISA instructions
-- Converter (`tools/convert_fp8_to_int4.py`): add `--gpu-bits fp8` option that
-  stores GPU-resident tensors in FP8 and disk-streamed experts in int4
-- Backward compatible: CPU/CUDA/Vulkan paths keep int4/int8; FP8 activates only
-  when the binary is built with `ROCM=1` and the model was converted with
-  `--gpu-bits fp8`
+  for FP8, and add explicit dispatch points for FP6/FP4 kernels or a
+  compatibility shim sourced from Charlie1234's prior work
+- Converter (`tools/convert_fp8_to_int4.py`): add `--gpu-bits fp8|fp6|fp4`
+  options that store GPU-resident tensors in the chosen format and leave
+  disk-streamed experts in int4
+- Backward compatible: CPU/CUDA/Vulkan paths keep int4/int8; FP8/FP6/FP4
+  activate only when the binary is built with the appropriate backend support and
+  the model was converted with the matching `--gpu-bits` selection
 
 ### Q1 phased execution (ROCmFPX + rocmfx follow-up)
 
