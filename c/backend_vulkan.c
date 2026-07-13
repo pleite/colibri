@@ -153,7 +153,14 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                              const void *weights, const float *scales,
                              int fmt, int I, int O, int device) {
     if (!tensor || !valid_fmt(fmt) || I <= 0 || O <= 0 || device < 0) return 0;
-    if (*tensor) coli_cuda_tensor_free(*tensor);
+    if (!weights || (fmt != 0 && !scales)) return 0;
+    if (*tensor) {
+        ColiCudaTensor *existing = *tensor;
+        if (existing->fmt == fmt && existing->I == I && existing->O == O && existing->device == device) {
+            return 1;
+        }
+        return 0;
+    }
     *tensor = (ColiCudaTensor *)calloc(1, sizeof(**tensor));
     if (!*tensor) return 0;
 
@@ -171,8 +178,7 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
             *tensor = NULL;
             return 0;
         }
-        if (weights) memcpy((*tensor)->weights, weights, (*tensor)->weight_bytes);
-        else memset((*tensor)->weights, 0, (*tensor)->weight_bytes);
+        memcpy((*tensor)->weights, weights, (*tensor)->weight_bytes);
     }
 
     if ((*tensor)->scale_bytes > 0) {
@@ -182,8 +188,7 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
             *tensor = NULL;
             return 0;
         }
-        if (scales) memcpy((*tensor)->scales, scales, (*tensor)->scale_bytes);
-        else memset((*tensor)->scales, 0, (*tensor)->scale_bytes);
+        memcpy((*tensor)->scales, scales, (*tensor)->scale_bytes);
     }
 
     register_tensor(*tensor);
