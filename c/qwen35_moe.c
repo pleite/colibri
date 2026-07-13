@@ -28,12 +28,22 @@
 #include "backend_vulkan.h"
 #elif defined(COLI_ROCM)
 #include "backend_rocm.h"
+#elif defined(COLI_NPU)
+#include "backend_npu.h"
 #elif defined(COLI_CUDA)
 #include "backend_cuda.h"
 #endif
 
 #include "json.h"
 #include "st.h"
+
+/* Keep the backend-selection condition centralized and use the same ordering as
+ * the existing include/dispatch logic: Vulkan, ROCm, NPU, then CUDA. */
+#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_NPU) || defined(COLI_CUDA)
+#define COLI_HAS_BACKEND 1
+#else
+#define COLI_HAS_BACKEND 0
+#endif
 
 typedef struct {
     int vocab_size;
@@ -428,7 +438,7 @@ static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, 
         fprintf(stderr, "warning: overflow in matmul row offset for dimensions (%d, %d)\n", in_dim, out_dim);
         return;
     }
-#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_CUDA)
+#if COLI_HAS_BACKEND
     if (init_gpu_backend()) {
         ColiCudaTensor *tensor = NULL;
         int used_gpu = 0;
@@ -488,7 +498,7 @@ static void configure_parallelism(int requested_threads) {
 #endif
 }
 
-#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_CUDA)
+#if COLI_HAS_BACKEND
 static int init_gpu_backend(void) {
     static int initialized = -1;
     if (initialized == -1) {

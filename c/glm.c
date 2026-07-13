@@ -35,12 +35,14 @@
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
-#ifdef COLI_CUDA
+#if defined(COLI_CUDA) || defined(COLI_ROCM) || defined(COLI_VULKAN) || defined(COLI_NPU)
 #include <omp.h>
 #if defined(COLI_VULKAN)
 #include "backend_vulkan.h"
 #elif defined(COLI_ROCM)
 #include "backend_rocm.h"
+#elif defined(COLI_NPU)
+#include "backend_npu.h"
 #else
 #include "backend_cuda.h"
 #endif

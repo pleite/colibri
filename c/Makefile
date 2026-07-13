@@ -65,8 +65,8 @@ NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
-CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE)
+BACKEND_OBJ  =
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE)
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -77,7 +77,7 @@ $(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see P
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
-CUDA_OBJ  = backend_cuda.o
+BACKEND_OBJ  = backend_cuda.o
 endif
 
 # ROCM=1 builds the ROCm/HIP backend instead of CUDA.
@@ -105,7 +105,24 @@ HIPCCFLAGS += --offload-arch=$(ROCM_ARCH)
 endif
 CFLAGS   += -DCOLI_CUDA -DCOLI_ROCM
 LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-CUDA_OBJ  = backend_rocm.o
+BACKEND_OBJ  = backend_rocm.o
+endif
+
+# NPU=1 builds the NPU backend shim using the same ABI as the CUDA/ROCm/Vulkan
+# backends while keeping a CPU reference path for portability.
+NPU ?= 0
+ifeq ($(NPU),1)
+ifeq ($(CUDA),1)
+$(error CUDA=1 and NPU=1 are mutually exclusive)
+endif
+ifeq ($(ROCM),1)
+$(error ROCM=1 and NPU=1 are mutually exclusive)
+endif
+ifeq ($(VULKAN),1)
+$(error VULKAN=1 and NPU=1 are mutually exclusive)
+endif
+CFLAGS   += -DCOLI_NPU
+BACKEND_OBJ  = backend_npu.o
 endif
 
 # VULKAN=1 builds the Vulkan backend shim, which exposes the same coli_cuda_*
@@ -126,7 +143,7 @@ $(error VULKAN=1 is not supported on Windows)
 endif
 CFLAGS   += -DCOLI_CUDA -DCOLI_VULKAN
 LDFLAGS  += -ldl
-CUDA_OBJ  = backend_vulkan.o
+BACKEND_OBJ  = backend_vulkan.o
 endif
 
 all: glm$(EXE) qwen35_moe$(EXE)
@@ -135,11 +152,11 @@ all: glm$(EXE) qwen35_moe$(EXE)
 glm: glm$(EXE)
 qwen35_moe_build: qwen35_moe$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(BACKEND_OBJ)
+	$(CC) $(CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
 
-qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h
-	$(CC) $(CFLAGS) qwen35_moe.c -o qwen35_moe$(EXE) $(LDFLAGS)
+qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h $(BACKEND_OBJ)
+	$(CC) $(CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -158,6 +175,13 @@ rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
 	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
 	$(HIPCC) $(HIPCCFLAGS) backend_rocm.hip tests/test_backend_rocm.hip -o backend_rocm_test$(EXE)
 	./backend_rocm_test$(EXE)
+
+backend_npu.o: backend_npu.c backend_npu.h
+	$(CC) $(CFLAGS) -c backend_npu.c -o $@
+
+npu-test: backend_npu.c backend_npu.h tests/test_backend_npu.c
+	$(CC) $(CFLAGS) backend_npu.c tests/test_backend_npu.c -o backend_npu_test$(EXE) $(LDFLAGS)
+	./backend_npu_test$(EXE)
 
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
@@ -188,6 +212,9 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
+	$(CC) $(CFLAGS) $< backend_npu.o -o $@ $(LDFLAGS)
+
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -206,7 +233,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm qwen35_moe_build cuda-test rocm-test vulkan-test portable test-c test-python test check clean
+.PHONY: all glm qwen35_moe_build cuda-test rocm-test npu-test vulkan-test portable test-c test-python test check clean
