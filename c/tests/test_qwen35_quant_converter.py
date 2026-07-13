@@ -54,9 +54,13 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             )
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['shape'], [2, 4])
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['shape'], [2])
             self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight']['dtype'], 'U8')
+            self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight']['shape'], [2, 4])
             self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight.qs']['dtype'], 'F32')
+            self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight.qs']['shape'], [2])
 
 
 if __name__ == '__main__':
