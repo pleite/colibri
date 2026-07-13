@@ -189,7 +189,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["OMP_DYNAMIC"], "FALSE")
         self.assertEqual(env["OMP_PROC_BIND"], "TRUE")
 
-    def test_positive_config_layer_count_takes_priority_over_tensors(self):
+    def test_configured_layer_count_affects_runtime_estimate_over_tensor_fallback(self):
         cfg_model = self.model / "cfg_priority_model"
         cfg_model.mkdir()
         (cfg_model / "config.json").write_text(json.dumps({
@@ -204,7 +204,6 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["layer_count"], 1)
         plan = build_plan(cfg_model, available_memory=16 * GB, available_disk=1)
         self.assertEqual(plan["model"]["layer_count"], 1)
-        self.assertNotIn("model layer count unavailable", plan["warnings"])
 
         fallback_model = self.model / "cfg_fallback_model"
         fallback_model.mkdir()

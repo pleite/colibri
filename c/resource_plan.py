@@ -21,7 +21,7 @@ LAYER_RE = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
 APU_VRAM_THRESHOLD_BYTES = 4 * GB
 
 
-def _cfg_value(cfg, *keys, default=0):
+def _cfg_value(cfg, *keys, default=None):
     """Return the first non-missing config value, preserving 0/False."""
     for key in keys:
         value = cfg.get(key)
@@ -33,6 +33,13 @@ def _cfg_value(cfg, *keys, default=0):
             continue
         return value
     return default
+
+
+def _cfg_int(cfg, *keys, default=0):
+    value = _cfg_value(cfg, *keys, default=None)
+    if value is None:
+        return default
+    return int(value)
 
 
 def _first_present_value(*values):
@@ -52,9 +59,9 @@ def apply_runtime_environment(env=None):
         threads = str(os.cpu_count() or 1)
     result.setdefault("COLI_CPU_THREADS", threads)
     result.setdefault("OMP_NUM_THREADS", threads)
-    result.setdefault("OMP_DYNAMIC", "FALSE")
-    result.setdefault("OMP_PROC_BIND", "TRUE")
-    result.setdefault("OMP_PLACES", "cores")
+    result.setdefault("OMP_DYNAMIC", result.get("OMP_DYNAMIC") or os.environ.get("COLI_OMP_DYNAMIC", "FALSE"))
+    result.setdefault("OMP_PROC_BIND", result.get("OMP_PROC_BIND") or os.environ.get("COLI_OMP_PROC_BIND", "TRUE"))
+    result.setdefault("OMP_PLACES", result.get("OMP_PLACES") or os.environ.get("COLI_OMP_PLACES", "cores"))
     return result
 
 
@@ -299,7 +306,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # Prefer config-defined layer counts when present, but fall back to tensor
     # inference and finally to a conservative default so planning remains stable
     # even for models without traditional layer metadata.
-    layers = int(_cfg_value(cfg, "num_hidden_layers", "n_layers", "num_layers", default=0))
+    layers = _cfg_int(cfg, "num_hidden_layers", "n_layers", "num_layers", default=0)
     if layers <= 0:
         layers = info["layer_count"]
     if layers <= 0:
@@ -307,18 +314,18 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         layer_warning = "model layer count unavailable; defaulting to 1 layer for planning"
     else:
         layer_warning = None
-    kv_lora_rank = int(_cfg_value(cfg, "kv_lora_rank", default=0))
-    qk_rope_head_dim = int(_cfg_value(cfg, "qk_rope_head_dim", "rope_head_dim", "rotary_dim", default=0))
-    qk_nope_head_dim = int(_cfg_value(cfg, "qk_nope_head_dim", "nope_head_dim", default=0))
-    v_head_dim = int(_cfg_value(cfg, "v_head_dim", "value_head_dim", default=0))
-    num_attention_heads = int(_cfg_value(cfg, "num_attention_heads", "n_head", "num_heads", default=0))
+    kv_lora_rank = _cfg_int(cfg, "kv_lora_rank", default=0)
+    qk_rope_head_dim = _cfg_int(cfg, "qk_rope_head_dim", "rope_head_dim", "rotary_dim", default=0)
+    qk_nope_head_dim = _cfg_int(cfg, "qk_nope_head_dim", "nope_head_dim", default=0)
+    v_head_dim = _cfg_int(cfg, "v_head_dim", "value_head_dim", default=0)
+    num_attention_heads = _cfg_int(cfg, "num_attention_heads", "n_head", "num_heads", default=0)
     kv_bytes = layers * context * (kv_lora_rank + qk_rope_head_dim) * 4
     kv_buffer = context * num_attention_heads * (qk_nope_head_dim + v_head_dim) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(_cfg_value(cfg, "n_routed_experts", "num_experts_per_tok",
-                                         "num_experts", "num_local_experts", default=0))
+    configured_experts = _cfg_int(cfg, "n_routed_experts", "num_experts_per_tok",
+                                  "num_experts", "num_local_experts", default=0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
