@@ -126,7 +126,8 @@ def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
     ram=a.ram or env_float(env,["RAM_GB"],0)
     vram=a.vram or env_float(env,["CUDA_EXPERT_GB","COLI_ACCEL_EXPERT_GB"],0)
-    backend=(a.accel or env.get("COLI_ACCEL","auto")).strip().lower()
+    accel=a.accel if a.accel is not None else env.get("COLI_ACCEL","auto")
+    backend=(accel.strip().lower() if isinstance(accel,str) and accel.strip() else "auto")
     gpu=a.gpu
     if gpu is None:
         gpu=env.get("COLI_GPUS",env.get("COLI_GPU","auto"))

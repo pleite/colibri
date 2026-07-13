@@ -112,8 +112,8 @@ def _extract_int(value):
     if isinstance(value, float):
         return int(value)
     if isinstance(value, str):
-        raw = re.sub(r"[^0-9]", "", value)
-        return int(raw) if raw else 0
+        match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+        return int(float(match.group(0))) if match else 0
     return 0
 
 
@@ -198,7 +198,7 @@ def discover_accelerators():
 
 def _select_backend(backend, accelerators):
     choices = ("cuda", "rocm", "vulkan", "npu")
-    if backend and backend not in {"auto", *choices, "cpu"}:
+    if backend and backend not in (*choices, "auto", "cpu"):
         raise ValueError(f"unsupported accelerator backend: {backend}")
     if backend in choices:
         return backend
@@ -309,16 +309,17 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     if backend == "cuda" and (not cuda_enabled or result.get("COLI_CUDA", "1") == "0"):
         return result
 
+    expert_budget = f"{vram['budget_bytes'] / GB:.3f}"
     if backend == "cuda":
         result.setdefault("COLI_CUDA", "1")
         if "COLI_GPU" not in result and "COLI_GPUS" not in result:
             key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
             result[key] = ",".join(map(str, devices))
-        expert_budget = result.setdefault("CUDA_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        expert_budget = result.setdefault("CUDA_EXPERT_GB", expert_budget)
     else:
         result.setdefault("COLI_ACCEL", backend)
         result.setdefault("COLI_ACCEL_DEVICES", ",".join(map(str, devices)))
-        expert_budget = result.setdefault("COLI_ACCEL_EXPERT_GB", f"{vram['budget_bytes'] / GB:.3f}")
+        expert_budget = result.setdefault("COLI_ACCEL_EXPERT_GB", expert_budget)
     if result.get("PIN"):
         result.setdefault("PIN_GB", expert_budget)
     return result
