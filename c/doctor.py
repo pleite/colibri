@@ -9,6 +9,7 @@ from pathlib import Path
 from resource_plan import (
     GB,
     build_plan,
+    detect_model_family,
     discover_accelerators,
     format_plan,
     memory_available,
@@ -53,12 +54,22 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("model.path", "fail", "model directory does not exist", path=str(model)))
 
     config = model / "config.json"
+    config_family = "generic"
     try:
-        valid_config = isinstance(json.loads(config.read_text()), dict)
+        config_payload = json.loads(config.read_text())
+        valid_config = isinstance(config_payload, dict)
+        config_family = detect_model_family(config_payload)
     except (OSError, ValueError):
         valid_config = False
+        config_payload = {}
     checks.append(_check("model.config", "pass" if valid_config else "fail",
                          "config.json is valid" if valid_config else "config.json is missing or invalid"))
+    if valid_config and config_family == "qwen35":
+        checks.append(_check("model.architecture", "pass", "Qwen3.5 MoE model detected",
+                            family=config_family, model_type=config_payload.get("model_type")))
+    elif valid_config:
+        checks.append(_check("model.architecture", "pass", "generic model detected",
+                            family=config_family))
     tokenizer = model / "tokenizer.json"
     checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
                          "tokenizer.json found" if tokenizer.is_file() else "tokenizer.json is missing"))

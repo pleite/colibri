@@ -22,6 +22,8 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
+from resource_plan import detect_model_family
+
 # Windows: forza output UTF-8 (console cp1252 tronca Unicode box-drawing/emoji)
 if sys.platform == "win32":
     for s in (sys.stdout, sys.stderr):
@@ -31,6 +33,7 @@ if sys.platform == "win32":
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "tools")
 GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
+QWEN35 = os.path.join(HERE, "qwen35_moe" + (".exe" if sys.platform == "win32" else ""))
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
@@ -98,13 +101,31 @@ def hline(w): return f"{C.dgray}{'─'*w}{C.r}"
 # ---------- util ----------
 def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
+def detect_engine(model):
+    cfgp = os.path.join(model, "config.json")
+    if not os.path.exists(cfgp):
+        return GLM
+    try:
+        with open(cfgp) as stream:
+            cfg = json.load(stream)
+    except (OSError, ValueError):
+        return GLM
+    if not isinstance(cfg, dict):
+        return GLM
+    if detect_model_family(cfg) == "qwen35":
+        return QWEN35
+    return GLM
+
+
 def need_model(model):
     if not os.path.isdir(model):
         sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
     if not os.path.exists(os.path.join(model,"tokenizer.json")):
         sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
-    if not os.path.exists(GLM):
+    engine = detect_engine(model)
+    if not os.path.exists(engine):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
+    return engine
 
 def cuda_binary():
     if not os.path.exists(GLM) or sys.platform != "linux": return False
@@ -297,7 +318,7 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+    sys.exit(subprocess.call(["make","-C",HERE,"all"]))
 
 def cmd_info(a):
     banner("info")
@@ -324,7 +345,8 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
+    engine = detect_engine(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine) else "not built (coli build)")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -361,7 +383,7 @@ def cmd_doctor(a):
                 "plan":None}
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
-    report=run_doctor(a.model,ram,ctx,devices,vram,backend=backend,engine_path=GLM)
+    report=run_doctor(a.model,ram,ctx,devices,vram,backend=backend,engine_path=detect_engine(a.model))
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
