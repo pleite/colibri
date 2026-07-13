@@ -3,7 +3,7 @@ FROM registry.fedoraproject.org/fedora:42
 # Build deps + runtime deps (python3 for openai_server.py)
 # ROCm/Vulkan support: rocm-dev, vulkan-headers, rocm-opencl-runtime
 RUN dnf install -y gcc gcc-c++ make git python3 python3-pip \
-    rocm-dev vulkan-headers rocm-opencl-runtime \
+    rocm vulkan-headers \
     && dnf clean all
 
 WORKDIR /opt/colibri
