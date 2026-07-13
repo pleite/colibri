@@ -22,6 +22,7 @@ APU_VRAM_THRESHOLD_BYTES = 4 * GB
 
 
 def _cfg_value(cfg, *keys, default=0):
+    """Return the first non-missing config value, preserving 0/False."""
     for key in keys:
         value = cfg.get(key)
         if value is None or value == "":
@@ -35,6 +36,7 @@ def _cfg_value(cfg, *keys, default=0):
 
 
 def _first_present_value(*values):
+    """Return the first non-empty value, preserving 0/False as valid values."""
     for value in values:
         if value is None or value == "":
             continue
@@ -302,6 +304,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         layers = info["layer_count"]
     if layers <= 0:
         layers = 1
+        layer_warning = "model layer count unavailable; defaulting to 1 layer for planning"
+    else:
+        layer_warning = None
     kv_lora_rank = int(_cfg_value(cfg, "kv_lora_rank", default=0))
     qk_rope_head_dim = int(_cfg_value(cfg, "qk_rope_head_dim", "rope_head_dim", "rotary_dim", default=0))
     qk_nope_head_dim = int(_cfg_value(cfg, "qk_nope_head_dim", "nope_head_dim", default=0))
@@ -343,6 +348,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
 
     warnings = []
+    if layer_warning:
+        warnings.append(layer_warning)
     explicit_backend = backend not in (None, "", "auto", "cpu")
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")

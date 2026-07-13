@@ -204,6 +204,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(info["layer_count"], 1)
         plan = build_plan(cfg_model, available_memory=16 * GB, available_disk=1)
         self.assertEqual(plan["model"]["layer_count"], 1)
+        self.assertNotIn("model layer count unavailable", plan["warnings"])
 
         fallback_model = self.model / "cfg_fallback_model"
         fallback_model.mkdir()
