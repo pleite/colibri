@@ -51,6 +51,10 @@ static int valid_fmt(int fmt) {
     return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3;
 }
 
+static int tensor_params_match(const ColiCudaTensor *tensor, int fmt, int I, int O, int device) {
+    return tensor && tensor->fmt == fmt && tensor->I == I && tensor->O == O && tensor->device == device;
+}
+
 static size_t packed_bytes(int fmt, int I, int O) {
     if (fmt == 0) return (size_t)O * (size_t)I * sizeof(float);
     if (fmt == 1) return (size_t)O * (size_t)I * sizeof(int8_t);
@@ -153,10 +157,15 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                              const void *weights, const float *scales,
                              int fmt, int I, int O, int device) {
     if (!tensor || !valid_fmt(fmt) || I <= 0 || O <= 0 || device < 0) return 0;
-    if (!weights || (fmt != 0 && !scales)) return 0;
+    const int has_valid_payload = weights != NULL && (fmt == 0 || scales != NULL);
+    if (!has_valid_payload) return 0;
     if (*tensor) {
         ColiCudaTensor *existing = *tensor;
-        if (existing->fmt == fmt && existing->I == I && existing->O == O && existing->device == device) {
+        /* Treat an identical re-upload as a cache hit: keep the existing resident
+         * tensor intact and return success without re-copying weights/scales.  A
+         * mismatched shape/format/device is rejected to keep the API consistent
+         * with the CUDA/ROCm backends. */
+        if (tensor_params_match(existing, fmt, I, O, device)) {
             return 1;
         }
         return 0;

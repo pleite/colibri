@@ -24,9 +24,12 @@ int main(void) {
     float want[2] = {0.0f, 0.0f};
     ColiCudaTensor *backend_tensor = NULL;
 
-    if (!coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 0, 4, 1, 0)) return 1;
+    int initial_upload_ok = coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 0, 4, 1, 0);
+    if (!initial_upload_ok) return 1;
     if (coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 0, 4, 2, 0)) return 1;
     if (coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 0, 4, 1, 1)) return 1;
+    if (coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 1, 4, 1, 0)) return 1;
+    if (coli_cuda_tensor_upload(&backend_tensor, w_f32, NULL, 0, 5, 1, 0)) return 1;
     if (coli_cuda_tensor_bytes(backend_tensor) != 4U * sizeof(float)) return 1;
     if (!coli_cuda_matmul(&backend_tensor, got, x, w_f32, NULL, 0, 1, 4, 1, 0)) return 1;
     want[0] = x[0] * w_f32[0] + x[1] * w_f32[1] + x[2] * w_f32[2] + x[3] * w_f32[3];
