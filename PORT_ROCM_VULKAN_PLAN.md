@@ -73,7 +73,7 @@ memory and reports the correct budget.
 
 ---
 
-## Phase V1 — Vulkan compute backend (planned)
+## Phase V1 — Vulkan compute backend (execution plan)
 
 Goal: a Vulkan compute path (`c/backend_vulkan.c`, `c/backend_vulkan.h`) that
 works with the **Mesa** open-source driver stack — no proprietary runtime.
@@ -96,14 +96,48 @@ RADV without the ROCm userspace), and is the only option for Vulkan-only iGPUs
 sudo dnf install vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers
 ```
 
-**Planned API:**
+**Target API:**
 - `VULKAN=1` → `make glm VULKAN=1`
 - `COLI_ACCEL=vulkan COLI_ACCEL_DEVICES=0`
 - `coli plan --accel vulkan --gpu 0`
 
+### V1 phased execution (Mesa/RADV-first)
+
+#### V1.1 — Backend scaffolding and build wiring
+- Add `c/backend_vulkan.c` + `c/backend_vulkan.h` exporting the existing
+  `coli_cuda_*` ABI (`init`, `malloc`, `free`, `copy`, `matmul`, `cleanup`).
+- Add `VULKAN=1` Makefile path that links `-lvulkan` and keeps CUDA/ROCm builds
+  unchanged.
+- Add runtime accelerator selection for `COLI_ACCEL=vulkan` without changing CPU,
+  CUDA, or ROCm behavior.
+
+**Exit criteria:** `make -C c glm VULKAN=1` succeeds on Mesa/RADV hosts; CPU-only
+build still passes `make -C c check`.
+
+#### V1.2 — Shader pipeline and memory model
+- Implement compute pipeline creation for q8/q4/q2/f32 kernels with offline
+  SPIR-V blobs embedded in C.
+- Implement `VkBuffer` allocation/binding, descriptor sets, command recording,
+  and queue submission for batched matmul execution.
+- Add explicit host-device synchronization and error propagation matching the
+  CUDA/ROCm fallback semantics.
+
+**Exit criteria:** Vulkan backend runs quantized matmul correctness parity tests
+against the CPU reference on at least one RADV device.
+
+#### V1.3 — Runtime integration and validation
+- Add accelerator discovery output for Vulkan devices in planner/doctor surfaces.
+- Add Vulkan backend tests (`tests/test_backend_vulkan.c`) with q8/q4/q2/f32
+  coverage and CPU fallback assertions.
+- Document Fedora package/runtime requirements and troubleshooting for Mesa/RADV.
+
+**Exit criteria:** Vulkan backend path is selectable from CLI, tested in CI
+where Vulkan is available, and documented as a supported fallback when ROCm is
+not present.
+
 ---
 
-## Phase N1 — NPU / XDNA 2 (planned)
+## Phase N1 — NPU / XDNA 2 (execution plan)
 
 Goal: offload subgraphs to the AMD **XDNA 2** NPU on Strix Halo
 (`/dev/accel/accel0`, visible as `npu` in `coli plan --json`).
@@ -131,14 +165,44 @@ sudo dnf install xrt xrt-devel
 amdgpu-install --usecase=aiml
 ```
 
-**Planned interface:**
+**Target interface:**
 - `backend_npu.c` / `backend_npu.h`
 - `coli_npu_init()`, `coli_npu_matmul()` (same error-fallback pattern)
 - `COLI_ACCEL=npu`, detected via `/sys/class/accel/accel0`
 
+### N1 phased execution (Ryzen AI / XDNA 2)
+
+#### N1.1 — Device discovery and capability gates
+- Add NPU probe path (`/sys/class/accel/accel*`) with vendor/device filtering for
+  AMD XDNA 2.
+- Add planner/doctor reporting for NPU availability, driver/runtime versions, and
+  unsupported-shape diagnostics.
+- Keep hard fallback to CPU/GPU when NPU runtime or shape contracts are not met.
+
+**Exit criteria:** `coli plan --json` and `coli doctor --json` report NPU
+availability and clear fallback reasons on non-XDNA systems.
+
+#### N1.2 — Fixed-shape kernel offload path
+- Add `backend_npu.c/.h` abstraction and runtime-managed buffers for NPU launch.
+- Offload fixed-shape subgraphs first (MLA attention projection/shared expert MLP)
+  behind runtime feature flags.
+- Add synchronization boundaries between NPU and GPU/CPU execution stages to
+  preserve current numerical behavior.
+
+**Exit criteria:** selected fixed-shape workloads execute on XDNA 2 with token
+output parity versus CPU baseline.
+
+#### N1.3 — Productionization and observability
+- Add per-step telemetry for NPU dispatch count, fallback count, and latency.
+- Add integration tests/mocks for NPU unavailable/degraded modes.
+- Document Fedora/XRT setup and operational constraints for Ryzen AI systems.
+
+**Exit criteria:** NPU path is observable, resilient, and safe to enable
+experimentally via `COLI_ACCEL=npu`.
+
 ---
 
-## Phase Q1 — ROCmFPX quantization (planned)
+## Phase Q1 — ROCmFPX quantization (execution plan)
 
 Goal: replace per-row int4/int8 with **FP8 (e4m3fnuz)** for GPU-resident
 tensors on RDNA 4 / CDNA 3+, where native hardware FP8 arithmetic is available.
@@ -160,6 +224,39 @@ tensors on RDNA 4 / CDNA 3+, where native hardware FP8 arithmetic is available.
 - Backward compatible: CPU/CUDA/Vulkan paths keep int4/int8; FP8 activates only
   when the binary is built with `ROCM=1` and the model was converted with
   `--gpu-bits fp8`
+
+### Q1 phased execution (ROCmFPX + rocmfx follow-up)
+
+#### Q1.1 — FP8 resident-tensor format enablement
+- Introduce FP8 e4m3fnuz quant format for GPU-resident tensors only, with on-disk
+  routed experts remaining int4.
+- Add converter mode (`--gpu-bits fp8`) plus metadata tags so runtime can enforce
+  ROCm-only activation and safe fallback.
+- Preserve backward compatibility for existing int4/int8 model directories.
+
+**Exit criteria:** converter emits mixed-format artifacts, and runtime correctly
+accepts/rejects FP8 activation based on backend/device capability.
+
+#### Q1.2 — Native ROCm FP8 arithmetic path on RDNA 4
+- Add ROCm kernel path using native FP8 arithmetic types/intrinsics for resident
+  matmuls, replacing software int4 dequant on supported devices.
+- Keep current int4 path as fallback for unsupported ROCm versions or GPUs.
+- Validate quality/perplexity deltas versus current int4 resident path.
+
+**Exit criteria:** RDNA 4 executes native FP8 resident matmuls with expected
+quality uplift and memory growth (~2× for resident tensors) while staying within
+128 GB unified memory targets.
+
+#### Q1.3 — Extended low-bit roadmap with rocmfx
+- Evaluate `rocmfx` (Charlie1234) FP6/FP4 kernels as optional follow-on formats
+  for memory/quality trade-off tiers beyond FP8.
+- Define compatibility matrix (RDNA generation, ROCm version, kernel availability)
+  and integration points with current quant container metadata.
+- Gate any FP6/FP4 adoption behind explicit experimental flags until correctness
+  and stability match existing int4/FP8 paths.
+
+**Exit criteria:** decision record produced for FP6/FP4 adoption scope, with a
+clear experimental path that does not regress existing int4/FP8 users.
 
 ---
 
