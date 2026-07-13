@@ -1,4 +1,4 @@
-"""Reproducible CPU/CUDA A/B benchmark for tools/make_glm_bench_model.py output."""
+"""Reproducible CPU/accelerator A/B benchmark for tools/make_glm_bench_model.py output."""
 
 import argparse
 import json
@@ -38,6 +38,9 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--engine", default="./glm")
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--backend", default="cuda",
+                        choices=("cuda", "rocm", "vulkan", "npu"),
+                        help="experimental accelerator backend label")
     parser.add_argument("--runs", type=int, default=7)
     parser.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--pin-gb", default="1")
@@ -49,6 +52,7 @@ def main() -> None:
     base = os.environ.copy()
     for key in (
         "COLI_CUDA", "COLI_GPU", "COLI_GPUS", "CUDA_EXPERT_GB",
+        "COLI_ACCEL", "COLI_ACCEL_DEVICES", "COLI_ACCEL_EXPERT_GB",
         "PIN", "PIN_GB", "STATS", "TF", "REPLAY", "CUDA_DENSE",
     ):
         base.pop(key, None)
@@ -62,20 +66,31 @@ def main() -> None:
     )
 
     execute(args.engine, base | {"STATS": str(stats)})
+    accel_dense = {"COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1"}
+    accel_pin = {
+        "COLI_CUDA": "1", "COLI_GPU": args.gpu,
+        "PIN": str(stats), "PIN_GB": args.pin_gb,
+        "CUDA_EXPERT_GB": args.cuda_expert_gb,
+    }
+    accel_pin_dense = {
+        "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
+        "PIN": str(stats), "PIN_GB": args.pin_gb,
+        "CUDA_EXPERT_GB": args.cuda_expert_gb,
+    }
+    if args.backend != "cuda":
+        accel_dense = {"COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu}
+        accel_pin = {
+            "COLI_ACCEL": args.backend, "COLI_ACCEL_DEVICES": args.gpu,
+            "PIN": str(stats), "PIN_GB": args.pin_gb,
+            "COLI_ACCEL_EXPERT_GB": args.cuda_expert_gb,
+        }
+        accel_pin_dense = dict(accel_pin)
     modes = {
         "cpu_stream": {},
-        "dense_cuda": {"COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1"},
+        f"dense_{args.backend}": accel_dense,
         "cpu_pin": {"PIN": str(stats), "PIN_GB": args.pin_gb},
-        "cuda_pin": {
-            "COLI_CUDA": "1", "COLI_GPU": args.gpu,
-            "PIN": str(stats), "PIN_GB": args.pin_gb,
-            "CUDA_EXPERT_GB": args.cuda_expert_gb,
-        },
-        "cuda_pin_dense": {
-            "COLI_CUDA": "1", "COLI_GPU": args.gpu, "CUDA_DENSE": "1",
-            "PIN": str(stats), "PIN_GB": args.pin_gb,
-            "CUDA_EXPERT_GB": args.cuda_expert_gb,
-        },
+        f"{args.backend}_pin": accel_pin,
+        f"{args.backend}_pin_dense": accel_pin_dense,
     }
 
     for extra in modes.values():

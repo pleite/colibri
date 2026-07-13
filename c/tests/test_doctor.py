@@ -145,6 +145,13 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("disk   backing store", output)
         self.assertTrue(output.endswith("result ok"))
 
+    def test_reports_requested_backend_when_not_detected(self):
+        report = self.report(backend="rocm", accelerators={"cuda": [], "rocm": [], "vulkan": [], "npu": []})
+        checks = self.checks_by_id(report)
+
+        self.assertEqual(checks["accelerator.backend"]["details"]["requested"], "rocm")
+        self.assertEqual(report["status"], "warning")
+
     def test_cli_json_is_machine_readable_without_loading_model(self):
         cli = Path(__file__).parents[1] / "coli"
         run = subprocess.run([

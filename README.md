@@ -99,6 +99,7 @@ Inspect the planned storage hierarchy before loading the model:
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli plan
 COLI_MODEL=/nvme/glm52_i4 ./coli plan --gpu 0,1 --ram 128 --vram 48 --json
+COLI_MODEL=/nvme/glm52_i4 ./coli plan --accel rocm --gpu 0 --ram 128 --vram 16 --json
 
 # apply the bounded plan to the normal runner
 COLI_MODEL=/nvme/glm52_i4 ./coli chat --auto-tier
@@ -119,11 +120,12 @@ explains whether the selected Disk/RAM/VRAM placement is runnable:
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor --gpu 0 --ram 128 --json
+COLI_MODEL=/nvme/glm52_i4 ./coli doctor --accel rocm --gpu 0 --ram 128 --json
 ```
 
 Doctor validates the model directory, config, tokenizer, safetensors headers,
-engine executable, available RAM, requested NVIDIA devices, CUDA linkage, and the
-same placement budget used by `coli plan`. It never starts `glm`, reads tensor
+engine executable, available RAM, requested accelerator devices, CUDA linkage (when
+relevant), and the same placement budget used by `coli plan`. It never starts `glm`, reads tensor
 payloads, imports a model framework, or creates a CUDA context. The versioned JSON
 report uses stable check IDs for automation. Warnings keep exit status 0; missing
 requirements or an unsafe RAM projection return 1, while invalid CLI values return 2.
@@ -294,11 +296,12 @@ deterministic 313M-parameter `glm_moe_dsa` fixture and run fixed-token replay:
 cd c
 python tools/make_glm_bench_model.py --output /nvme/colibri-bench-medium --device cuda
 python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 0
+python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --backend rocm --gpu 0
 ```
 
 The fixture has random weights and is not a language model. It exists only to
 preserve the real MLA/MoE/streaming shapes and compare CPU streaming, dense-only
-CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+accelerator paths, CPU hot-store, and hot-expert execution with identical replay tokens.
 
 ### Web interface
 
@@ -315,7 +318,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `--accel {auto,cpu,cuda,rocm,vulkan,npu}` backend preference for `plan`/`doctor`/`--auto-tier`, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 

@@ -59,6 +59,7 @@ class ResourcePlanTest(unittest.TestCase):
         plan = build_plan(self.model, ram_gb=16, context=32, vram_gb=20,
                           available_memory=32 * GB, available_disk=100 * GB, gpus=gpus)
         self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["accelerator"]["selected_backend"], "cuda")
         self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 16 * GB)
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
         self.assertIn("required RAM backing", plan["warnings"][0])
@@ -105,6 +106,21 @@ class ResourcePlanTest(unittest.TestCase):
         disabled = environment_for_plan(plan, {"COLI_CUDA": "0"}, cuda_enabled=True)
         self.assertNotIn("COLI_GPU", disabled)
         self.assertNotIn("CUDA_EXPERT_GB", disabled)
+
+    def test_non_cuda_backend_uses_generic_environment(self):
+        accelerators = {
+            "cuda": [],
+            "rocm": [{"index": 3, "name": "amd", "total_bytes": 16 * GB, "free_bytes": 14 * GB}],
+            "vulkan": [],
+            "npu": [],
+        }
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, backend="rocm", accelerators=accelerators)
+        env = environment_for_plan(plan)
+        self.assertEqual(plan["tiers"]["vram"]["backend"], "rocm")
+        self.assertEqual(env["COLI_ACCEL"], "rocm")
+        self.assertEqual(env["COLI_ACCEL_DEVICES"], "3")
+        self.assertIn("COLI_ACCEL_EXPERT_GB", env)
 
 
 if __name__ == "__main__":
