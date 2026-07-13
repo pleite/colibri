@@ -323,7 +323,7 @@ static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, 
         fprintf(stderr, "warning: invalid matmul dimensions (%d, %d)\n", in_dim, out_dim);
         return;
     }
-    if ((size_t)out_dim > SIZE_MAX / (size_t)in_dim) {
+    if (in_dim > 0 && (size_t)out_dim > SIZE_MAX / (size_t)in_dim) {
         fprintf(stderr, "warning: overflow in matmul row offset for dimensions (%d, %d)\n", in_dim, out_dim);
         return;
     }
@@ -386,8 +386,12 @@ static void configure_parallelism(void) {
         fprintf(stderr, "warning: ignoring invalid thread setting %s (not a whole number)\n", threads_env);
         return;
     }
-    if (requested <= 0 || requested > INT_MAX) {
-        fprintf(stderr, "warning: ignoring invalid thread setting %s (invalid number or out of range)\n", threads_env);
+    if (requested <= 0) {
+        fprintf(stderr, "warning: ignoring invalid thread setting %s (must be a positive integer)\n", threads_env);
+        return;
+    }
+    if (requested > INT_MAX) {
+        fprintf(stderr, "warning: ignoring invalid thread setting %s (exceeds the supported range)\n", threads_env);
         return;
     }
     omp_set_num_threads((int)requested);
