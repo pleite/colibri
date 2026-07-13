@@ -37,7 +37,11 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #ifdef COLI_CUDA
 #include <omp.h>
+#ifdef COLI_ROCM
+#include "backend_rocm.h"
+#else
 #include "backend_cuda.h"
+#endif
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>

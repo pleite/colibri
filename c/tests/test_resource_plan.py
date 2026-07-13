@@ -122,6 +122,40 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["COLI_ACCEL_DEVICES"], "3")
         self.assertIn("COLI_ACCEL_EXPERT_GB", env)
 
+    def test_unified_memory_apu_detected(self):
+        # APU/iGPU: VRAM carve-out < 4 GB → unified_memory=True
+        accelerators = {
+            "cuda": [],
+            "rocm": [{"index": 0, "name": "Radeon 890M", "total_bytes": 512 * 1024 * 1024,
+                      "free_bytes": 512 * 1024 * 1024, "unified_memory": True}],
+            "vulkan": [],
+            "npu": [],
+        }
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, backend="rocm", accelerators=accelerators)
+        self.assertTrue(plan["tiers"]["vram"]["unified_memory"])
+        # Budget is bounded by cache_bytes (RAM pool), not the tiny VRAM carve-out
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"],
+                           512 * 1024 * 1024)
+        env = environment_for_plan(plan)
+        self.assertEqual(env.get("COLI_ROCM_UNIFIED"), "1")
+        # Unified warning should be present
+        self.assertTrue(any("unified memory" in w for w in plan["warnings"]))
+
+    def test_unified_memory_does_not_set_flag_for_discrete(self):
+        accelerators = {
+            "cuda": [],
+            "rocm": [{"index": 0, "name": "RX 7900 XTX", "total_bytes": 24 * GB,
+                      "free_bytes": 22 * GB, "unified_memory": False}],
+            "vulkan": [],
+            "npu": [],
+        }
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, backend="rocm", accelerators=accelerators)
+        self.assertFalse(plan["tiers"]["vram"]["unified_memory"])
+        env = environment_for_plan(plan)
+        self.assertNotIn("COLI_ROCM_UNIFIED", env)
+
 
 if __name__ == "__main__":
     unittest.main()
