@@ -13,6 +13,10 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
             rocm rocm-hip-devel hipcc vulkan-headers ;; \
         npu) dnf -y --nodocs --setopt=install_weak_deps=False install \
             xrt xrt-devel vulkan-headers ;; \
+        all) dnf -y --nodocs --setopt=install_weak_deps=False install \
+            vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
+            rocm rocm-hip-devel hipcc vulkan-headers \
+            xrt xrt-devel ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
     esac \
     && dnf clean all \
@@ -25,6 +29,7 @@ RUN case "$BACKEND" in \
         vulkan) make VULKAN=1 glm qwen35_moe ;; \
         rocm) make ROCM=1 glm qwen35_moe ;; \
         npu) make NPU=1 glm qwen35_moe ;; \
+        all) make VULKAN=1 ROCM=1 NPU=1 glm qwen35_moe ;; \
     esac
 
 EXPOSE 8000

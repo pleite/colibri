@@ -20,10 +20,10 @@
 #ifdef COLI_ENABLE_VULKAN
 #include "backend_vulkan.h"
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
+#if defined(COLI_CUDA)
 #include "backend_cuda.h"
 #endif
-#if defined(COLI_ROCM) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
+#if defined(COLI_ROCM)
 #include "backend_rocm.h"
 #endif
 
@@ -304,7 +304,32 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
     }
 
     if (backend_id == 3) {
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
+#if defined(COLI_ROCM)
+        ColiCudaTensor *tensor = NULL;
+        if (!coli_rocm_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
+            free(slice_weights_buf);
+            free(slice_scales_buf);
+            return 0;
+        }
+        float *chunk_out = (float *)calloc((size_t)S * (size_t)output_chunk_size, sizeof(float));
+        if (!chunk_out) {
+            coli_rocm_tensor_free(tensor);
+            free(slice_weights_buf);
+            free(slice_scales_buf);
+            return 0;
+        }
+        const int ok = coli_rocm_matmul(&tensor, chunk_out, x, slice_weights_buf, slice_scales_buf, fmt, S, I, output_chunk_size, device);
+        if (ok) {
+            for (int s = 0; s < S; ++s) {
+                for (int o = 0; o < output_chunk_size; ++o) y[(size_t)s * (size_t)O + (size_t)(start + o)] = chunk_out[(size_t)s * (size_t)output_chunk_size + o];
+            }
+        }
+        free(chunk_out);
+        coli_rocm_tensor_free(tensor);
+        free(slice_weights_buf);
+        free(slice_scales_buf);
+        return ok;
+#elif defined(COLI_CUDA)
         ColiCudaTensor *tensor = NULL;
         if (!coli_cuda_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
@@ -351,30 +376,26 @@ int coli_runtime_init(const int *devices, int count) {
         for (int i = 0; i < g_device_count; ++i) g_devices[i] = devices[i];
     }
     g_backend_mask = 1;
-#ifdef COLI_ENABLE_NPU
-    g_backend_mask |= 2;
-#endif
-#ifdef COLI_ENABLE_VULKAN
-    g_backend_mask |= 4;
-#endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
-    g_backend_mask |= 8;
-#endif
-#if defined(COLI_ROCM) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
-    g_backend_mask |= 16;
-#endif
     configure_parallelism();
 #ifdef COLI_ENABLE_NPU
-    if (!coli_npu_init(g_devices, g_device_count)) return 0;
+    if (coli_npu_init(g_devices, g_device_count)) {
+        g_backend_mask |= 2;
+    }
 #endif
 #ifdef COLI_ENABLE_VULKAN
-    if (!coli_vulkan_init(g_devices, g_device_count)) return 0;
+    if (coli_vulkan_init(g_devices, g_device_count)) {
+        g_backend_mask |= 4;
+    }
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
-    if (!coli_cuda_init(g_devices, g_device_count)) return 0;
+#if defined(COLI_CUDA)
+    if (coli_cuda_init(g_devices, g_device_count)) {
+        g_backend_mask |= 8;
+    }
 #endif
-#if defined(COLI_ROCM) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
-    if (!coli_rocm_init(g_devices, g_device_count)) return 0;
+#if defined(COLI_ROCM)
+    if (coli_rocm_init(g_devices, g_device_count)) {
+        g_backend_mask |= 8;
+    }
 #endif
     g_initialized = 1;
     return 1;
@@ -398,10 +419,10 @@ void coli_runtime_shutdown(void) {
 #ifdef COLI_ENABLE_VULKAN
     coli_vulkan_shutdown();
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
+#if defined(COLI_CUDA)
     coli_cuda_shutdown();
 #endif
-#if defined(COLI_ROCM) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_NPU)
+#if defined(COLI_ROCM)
     coli_rocm_shutdown();
 #endif
 }

@@ -23,15 +23,16 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 
 ## Container images
 
-A reusable container build is available in `Dockerfile.colibri`. The same Dockerfile builds backend-specific images for Vulkan, ROCm, and NPU-enabled variants by passing `--build-arg BACKEND=<vulkan|rocm|npu>`.
+A reusable container build is available in `Dockerfile.colibri`. The same Dockerfile builds backend-specific images for Vulkan, ROCm, and NPU-enabled variants by passing `--build-arg BACKEND=<vulkan|rocm|npu|all>`.
 
 ```bash
 docker build -f Dockerfile.colibri -t colibri-vulkan --build-arg BACKEND=vulkan .
 docker build -f Dockerfile.colibri -t colibri-rocm --build-arg BACKEND=rocm .
 docker build -f Dockerfile.colibri -t colibri-npu --build-arg BACKEND=npu .
+docker build -f Dockerfile.colibri -t colibri-all --build-arg BACKEND=all .
 ```
 
-The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
+The `all` variant installs and builds Vulkan, ROCm, and NPU backends together so the runtime scheduler can dispatch across them from the same image. The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
 
 ## What's implemented
 

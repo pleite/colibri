@@ -27,6 +27,7 @@ jobs:
           - vulkan
           - rocm
           - npu
+          - all
 
     steps:
       - name: Checkout repository
