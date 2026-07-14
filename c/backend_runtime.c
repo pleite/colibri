@@ -562,6 +562,7 @@ int coli_runtime_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
 }
 
+#if !defined(COLI_ROCM) && !defined(COLI_ENABLE_NPU) && !defined(COLI_ENABLE_VULKAN)
 int coli_cuda_init(const int *devices, int count) {
     return coli_runtime_init(devices, count);
 }
@@ -610,3 +611,5 @@ size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return coli_runtime_tensor_device(tensor);
 }
+#endif
+
