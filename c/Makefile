@@ -65,8 +65,11 @@ NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
-BACKEND_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE)
+BACKEND_OBJ :=
+BACKEND_OBJ += backend_runtime.o
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE)
+NPU_BACKEND_CFLAGS =
+VULKAN_BACKEND_CFLAGS =
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -77,7 +80,7 @@ $(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see P
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
-BACKEND_OBJ  = backend_cuda.o
+BACKEND_OBJ  += backend_cuda.o
 endif
 
 # ROCM=1 builds the ROCm/HIP backend instead of CUDA.
@@ -105,45 +108,54 @@ HIPCCFLAGS += --offload-arch=$(ROCM_ARCH)
 endif
 CFLAGS   += -DCOLI_CUDA -DCOLI_ROCM
 LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-BACKEND_OBJ  = backend_rocm.o
+BACKEND_OBJ  += backend_rocm.o
 endif
 
 # NPU=1 builds the NPU backend shim using the same ABI as the CUDA/ROCm/Vulkan
 # backends while keeping a CPU reference path for portability.
 NPU ?= 0
 ifeq ($(NPU),1)
-ifeq ($(CUDA),1)
-$(error CUDA=1 and NPU=1 are mutually exclusive)
-endif
-ifeq ($(ROCM),1)
-$(error ROCM=1 and NPU=1 are mutually exclusive)
-endif
-ifeq ($(VULKAN),1)
-$(error VULKAN=1 and NPU=1 are mutually exclusive)
-endif
-CFLAGS   += -DCOLI_NPU
-BACKEND_OBJ  = backend_npu.o
+CFLAGS   += -DCOLI_ENABLE_NPU -DCOLI_NPU
+BACKEND_OBJ  += backend_npu.o
+NPU_BACKEND_CFLAGS += \
+	-Dcoli_cuda_init=coli_npu_compat_init \
+	-Dcoli_cuda_shutdown=coli_npu_compat_shutdown \
+	-Dcoli_cuda_device_count=coli_npu_compat_device_count \
+	-Dcoli_cuda_device_at=coli_npu_compat_device_at \
+	-Dcoli_cuda_mem_info=coli_npu_compat_mem_info \
+	-Dcoli_cuda_stats=coli_npu_compat_stats \
+	-Dcoli_cuda_tensor_upload=coli_npu_compat_tensor_upload \
+	-Dcoli_cuda_matmul=coli_npu_compat_matmul \
+	-Dcoli_cuda_tensor_free=coli_npu_compat_tensor_free \
+	-Dcoli_cuda_tensor_bytes=coli_npu_compat_tensor_bytes \
+	-Dcoli_cuda_tensor_device=coli_npu_compat_tensor_device
 endif
 
 # VULKAN=1 builds the Vulkan backend shim, which exposes the same coli_cuda_*
 # ABI while using a CPU reference path when no Vulkan runtime is present.
 VULKAN ?= 0
 ifeq ($(VULKAN),1)
-ifeq ($(CUDA),1)
-$(error CUDA=1 and VULKAN=1 are mutually exclusive)
-endif
-ifeq ($(ROCM),1)
-$(error ROCM=1 and VULKAN=1 are mutually exclusive)
-endif
 ifeq ($(UNAME_S),Darwin)
 $(error VULKAN=1 is supported only on Linux)
 endif
 ifneq ($(IS_WIN),)
 $(error VULKAN=1 is not supported on Windows)
 endif
-CFLAGS   += -DCOLI_CUDA -DCOLI_VULKAN
+CFLAGS   += -DCOLI_ENABLE_VULKAN -DCOLI_CUDA -DCOLI_VULKAN
 LDFLAGS  += -ldl
-BACKEND_OBJ  = backend_vulkan.o
+BACKEND_OBJ  += backend_vulkan.o
+VULKAN_BACKEND_CFLAGS += \
+	-Dcoli_cuda_init=coli_vulkan_init \
+	-Dcoli_cuda_shutdown=coli_vulkan_shutdown \
+	-Dcoli_cuda_device_count=coli_vulkan_device_count \
+	-Dcoli_cuda_device_at=coli_vulkan_device_at \
+	-Dcoli_cuda_mem_info=coli_vulkan_mem_info \
+	-Dcoli_cuda_stats=coli_vulkan_stats \
+	-Dcoli_cuda_tensor_upload=coli_vulkan_tensor_upload \
+	-Dcoli_cuda_matmul=coli_vulkan_matmul \
+	-Dcoli_cuda_tensor_free=coli_vulkan_tensor_free \
+	-Dcoli_cuda_tensor_bytes=coli_vulkan_tensor_bytes \
+	-Dcoli_cuda_tensor_device=coli_vulkan_tensor_device
 endif
 
 all: glm$(EXE) qwen35_moe$(EXE)
@@ -176,15 +188,18 @@ rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
 	$(HIPCC) $(HIPCCFLAGS) backend_rocm.hip tests/test_backend_rocm.hip -o backend_rocm_test$(EXE)
 	./backend_rocm_test$(EXE)
 
+backend_runtime.o: backend_runtime.c backend_runtime.h parallelism.h
+	$(CC) $(CFLAGS) -c backend_runtime.c -o $@
+
 backend_npu.o: backend_npu.c backend_npu.h
-	$(CC) $(CFLAGS) -c backend_npu.c -o $@
+	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) -c backend_npu.c -o $@
 
 npu-test: backend_npu.c backend_npu.h tests/test_backend_npu.c
 	$(CC) $(CFLAGS) backend_npu.c tests/test_backend_npu.c -o backend_npu_test$(EXE) $(LDFLAGS)
 	./backend_npu_test$(EXE)
 
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h
-	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+	$(CC) $(CFLAGS) $(VULKAN_BACKEND_CFLAGS) -c backend_vulkan.c -o $@
 
 vulkan-test: backend_vulkan.c backend_vulkan.h tests/test_backend_vulkan.c
 	$(CC) $(CFLAGS) backend_vulkan.c tests/test_backend_vulkan.c -o backend_vulkan_test$(EXE) $(LDFLAGS)
@@ -215,6 +230,9 @@ tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
 	$(CC) $(CFLAGS) $< backend_npu.o -o $@ $(LDFLAGS)
 
+tests/test_backend_runtime$(EXE): tests/test_backend_runtime.c backend_runtime.o
+	$(CC) $(CFLAGS) $< backend_runtime.o -o $@ $(LDFLAGS)
+
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -233,7 +251,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_runtime.o backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all glm qwen35_moe_build cuda-test rocm-test npu-test vulkan-test portable test-c test-python test check clean
