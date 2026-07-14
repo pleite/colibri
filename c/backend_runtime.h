@@ -9,7 +9,6 @@ extern "C" {
 #endif
 
 #define COLI_RUNTIME_MAX_DEVICES 16
-#define COLI_CUDA_MAX_DEVICES COLI_RUNTIME_MAX_DEVICES
 
 typedef struct ColiCudaTensor ColiCudaTensor;
 

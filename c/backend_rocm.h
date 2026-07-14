@@ -25,7 +25,9 @@
 extern "C" {
 #endif
 
+#ifndef COLI_CUDA_MAX_DEVICES
 #define COLI_CUDA_MAX_DEVICES 16
+#endif
 
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
@@ -53,6 +55,26 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
+
+int coli_rocm_init(const int *devices, int count);
+void coli_rocm_shutdown(void);
+int coli_rocm_device_count(void);
+int coli_rocm_device_at(int index);
+int coli_rocm_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+void coli_rocm_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+
+int coli_rocm_tensor_upload(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O, int device);
+
+int coli_rocm_matmul(ColiCudaTensor **tensor,
+                     float *y, const float *x,
+                     const void *weights, const float *scales,
+                     int fmt, int S, int I, int O, int device);
+
+void coli_rocm_tensor_free(ColiCudaTensor *tensor);
+size_t coli_rocm_tensor_bytes(const ColiCudaTensor *tensor);
+int coli_rocm_tensor_device(const ColiCudaTensor *tensor);
 
 #ifdef __cplusplus
 }

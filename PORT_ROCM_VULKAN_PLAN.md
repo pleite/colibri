@@ -179,7 +179,10 @@ Key constraints:
 **Required toolchain (Fedora 43):**
 ```bash
 # AMD XRT (Xilinx Runtime) for XDNA 2
-sudo dnf install xrt xrt-devel
+# xrt is not in the official Fedora repos; use the community COPR:
+sudo dnf install dnf-plugins-core
+sudo dnf copr enable xanderlent/amd-npu-driver
+sudo dnf install xrt
 # or via amdgpu-install:
 amdgpu-install --usecase=aiml
 ```
