@@ -6,17 +6,20 @@ ARG BACKEND=vulkan
 
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
     gcc gcc-c++ make git python3 python3-pip python3-devel ca-certificates \
+    dnf-plugins-core \
     && case "$BACKEND" in \
         vulkan) dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
         rocm) dnf -y --nodocs --setopt=install_weak_deps=False install \
             rocm rocm-hip-devel hipcc vulkan-headers ;; \
-        npu) dnf -y --nodocs --setopt=install_weak_deps=False install \
-            xrt xrt-devel vulkan-headers ;; \
-        all) dnf -y --nodocs --setopt=install_weak_deps=False install \
+        npu) dnf copr enable -y xanderlent/amd-npu-driver \
+            && dnf -y --nodocs --setopt=install_weak_deps=False install \
+            xrt vulkan-headers ;; \
+        all) dnf copr enable -y xanderlent/amd-npu-driver \
+            && dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
             rocm rocm-hip-devel hipcc vulkan-headers \
-            xrt xrt-devel ;; \
+            xrt ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
     esac \
     && dnf clean all \
