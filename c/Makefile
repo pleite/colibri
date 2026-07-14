@@ -69,6 +69,11 @@ BACKEND_OBJ :=
 BACKEND_OBJ += backend_runtime.o
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE)
 NPU_BACKEND_CFLAGS =
+NPU_BACKEND_TEST_OBJ = backend_npu.o
+NPU_BACKEND_RUNTIME_TEST_OBJ =
+ifeq ($(NPU),1)
+NPU_BACKEND_RUNTIME_TEST_OBJ = backend_npu.o
+endif
 VULKAN_BACKEND_CFLAGS =
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
@@ -93,10 +98,8 @@ ROCM_HOME ?= /opt/rocm
 HIPCC     ?= $(ROCM_HOME)/bin/hipcc
 ROCM_ARCH ?= native
 HIPCCFLAGS ?= -O3 -std=c++17 -Xcompiler=-Wall,-Wextra
+ROCM_BACKEND_CFLAGS =
 ifeq ($(ROCM),1)
-ifeq ($(CUDA),1)
-$(error CUDA=1 and ROCM=1 are mutually exclusive)
-endif
 ifeq ($(UNAME_S),Darwin)
 $(error ROCM=1 is supported only on Linux)
 endif
@@ -109,6 +112,18 @@ endif
 CFLAGS   += -DCOLI_CUDA -DCOLI_ROCM
 LDFLAGS  += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
 BACKEND_OBJ  += backend_rocm.o
+ROCM_BACKEND_CFLAGS += \
+	-Dcoli_cuda_init=coli_rocm_init \
+	-Dcoli_cuda_shutdown=coli_rocm_shutdown \
+	-Dcoli_cuda_device_count=coli_rocm_device_count \
+	-Dcoli_cuda_device_at=coli_rocm_device_at \
+	-Dcoli_cuda_mem_info=coli_rocm_mem_info \
+	-Dcoli_cuda_stats=coli_rocm_stats \
+	-Dcoli_cuda_tensor_upload=coli_rocm_tensor_upload \
+	-Dcoli_cuda_matmul=coli_rocm_matmul \
+	-Dcoli_cuda_tensor_free=coli_rocm_tensor_free \
+	-Dcoli_cuda_tensor_bytes=coli_rocm_tensor_bytes \
+	-Dcoli_cuda_tensor_device=coli_rocm_tensor_device
 endif
 
 # NPU=1 builds the NPU backend shim using the same ABI as the CUDA/ROCm/Vulkan
@@ -165,10 +180,10 @@ glm: glm$(EXE)
 qwen35_moe_build: qwen35_moe$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -181,7 +196,7 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 
 backend_rocm.o: backend_rocm.hip backend_rocm.h
 	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
-	$(HIPCC) $(HIPCCFLAGS) -c backend_rocm.hip -o $@
+	$(HIPCC) $(HIPCCFLAGS) $(ROCM_BACKEND_CFLAGS) -c backend_rocm.hip -o $@
 
 rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
 	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: install ROCm or set ROCM_HOME" >&2; exit 1; }
@@ -228,10 +243,10 @@ tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
-	$(CC) $(CFLAGS) $< backend_npu.o -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $< $(NPU_BACKEND_TEST_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_backend_runtime$(EXE): tests/test_backend_runtime.c backend_runtime.o
-	$(CC) $(CFLAGS) $< backend_runtime.o -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< backend_runtime.o $(NPU_BACKEND_RUNTIME_TEST_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
