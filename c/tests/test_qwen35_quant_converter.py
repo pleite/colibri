@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import math
 import os
@@ -72,8 +73,11 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             header_len = int.from_bytes(fh.read(8), 'little')
             return json.loads(fh.read(header_len).decode('utf-8'))
 
+    def converter_script(self):
+        return Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'
+
     def run_converter(self, input_dir, output_dir, extra_args=None):
-        command = [sys.executable, str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)]
+        command = [sys.executable, str(self.converter_script()), '--input', str(input_dir), '--output', str(output_dir)]
         if extra_args:
             command.extend(extra_args)
         subprocess.run(command, check=True)
@@ -168,7 +172,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             output_dir = tmpdir / 'output'
             output_dir.mkdir()
             result = subprocess.run(
-                [sys.executable, str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
+                [sys.executable, str(self.converter_script()), '--input', str(input_dir), '--output', str(output_dir)],
                 text=True,
                 capture_output=True,
             )
@@ -178,6 +182,66 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             log_text = log_files[0].read_text(encoding='utf-8')
             self.assertIn('conversion failed', log_text)
             self.assertIn('FileNotFoundError', log_text)
+
+    def test_converter_cleans_up_state_artifacts_after_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            state_dir = output_dir / '.state'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            self.run_converter(input_dir, output_dir, ['--state-dir', str(state_dir)])
+            self.assertTrue((state_dir / '.conversion_complete').exists())
+            self.assertFalse((state_dir / 'payloads').exists())
+            self.assertEqual(list(state_dir.glob('*.json')), [])
+            header = self.read_header(output_dir / 'model.safetensors')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
+    def test_converter_migrates_legacy_state_dir_to_state_format(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            legacy_state_dir = output_dir / '.conversion_state'
+            legacy_state_dir.mkdir(parents=True, exist_ok=True)
+            payload = struct.pack('<4B', 1, 2, 3, 4)
+            qs_payload = struct.pack('<2f', 0.1, 0.2)
+            task = {
+                'task_id': 'model.safetensors:model.layers.0.self_attn.q_proj.weight',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'model.layers.0.self_attn.q_proj.weight',
+            }
+            module.persist_task_result(
+                legacy_state_dir,
+                task,
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', payload, 'U8', [2, 2]),
+                    ('model.layers.0.self_attn.q_proj.weight.qs', qs_payload, 'F32', [2]),
+                ],
+            )
+            self.run_converter(input_dir, output_dir)
+            self.assertTrue((output_dir / '.state').exists())
+            self.assertFalse(legacy_state_dir.exists())
+            self.assertTrue((output_dir / '.state' / '.conversion_complete').exists())
 
 
 if __name__ == '__main__':

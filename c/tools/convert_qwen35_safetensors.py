@@ -249,28 +249,37 @@ def expected_output_names(tensor_name, shape):
 def convert_tensor_payload(tensor_name, meta, payload, logger=None):
     shape = meta['shape']
     dtype = meta['dtype']
+    validate_payload_length(dtype, len(payload), shape, tensor_name=tensor_name)
     values = decode_tensor_payload(dtype, payload, shape, logger=logger)
     quant_kind = should_quantize(tensor_name)
     if len(shape) == 2 and quant_kind:
         out_dim, in_dim = shape
         if quant_kind == 'int8':
             packed, scales = quantize_int8(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
+            validate_payload_length('U8', len(packed), shape, quant_kind='int8', tensor_name=tensor_name)
+            scales_payload = struct.pack('<%df' % len(scales), *scales)
+            validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=tensor_name + '.qs')
             if logger is not None:
                 logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
             return [
                 (tensor_name, packed, 'U8', shape),
-                (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
+                (tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
             ]
         packed, scales = quantize_int4(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
+        validate_payload_length('U8', len(packed), shape, quant_kind='int4', tensor_name=tensor_name)
+        scales_payload = struct.pack('<%df' % len(scales), *scales)
+        validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=tensor_name + '.qs')
         if logger is not None:
             logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
         return [
             (tensor_name, packed, 'U8', shape),
-            (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
+            (tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
         ]
     if logger is not None:
         logger.info('copied %s as F32 (shape=%s)', tensor_name, shape)
-    return [(tensor_name, encode_tensor_payload('F32', values), 'F32', shape)]
+    output_payload = encode_tensor_payload('F32', values)
+    validate_payload_length('F32', len(output_payload), shape, tensor_name=tensor_name)
+    return [(tensor_name, output_payload, 'F32', shape)]
 
 
 def encode_output_tensors(output_tensors):
@@ -284,6 +293,38 @@ def encode_output_tensors(output_tensors):
 
 def decode_output_tensors(payloads):
     return [(entry['name'], base64.b64decode(entry['payload']), entry['dtype'], entry['shape']) for entry in payloads]
+
+
+def expected_payload_size(dtype, shape, quant_kind=None):
+    shape = tuple(shape)
+    elem_count = math.prod(shape) if shape else 1
+    dtype_name = dtype.lower()
+    if dtype == 'F32':
+        return 4 * elem_count
+    if dtype in {'F16', 'BF16'}:
+        return 2 * elem_count
+    if dtype == 'U8':
+        if quant_kind == 'int4':
+            if len(shape) != 2:
+                raise ValueError('int4 quantization expects a 2D tensor')
+            out_dim, in_dim = shape
+            return out_dim * ((in_dim + 1) // 2)
+        if quant_kind == 'int8':
+            if len(shape) != 2:
+                raise ValueError('int8 quantization expects a 2D tensor')
+            out_dim, in_dim = shape
+            return out_dim * in_dim
+        return elem_count
+    if 'e4m3' in dtype_name or 'e5m2' in dtype_name:
+        return elem_count
+    raise ValueError('unsupported dtype %s' % dtype)
+
+
+def validate_payload_length(dtype, payload_length, shape, quant_kind=None, tensor_name=None):
+    expected = expected_payload_size(dtype, shape, quant_kind=quant_kind)
+    if payload_length != expected:
+        name = tensor_name or '<unknown>'
+        raise ValueError('%s payload length %d does not match expected %d for dtype=%s shape=%s' % (name, payload_length, expected, dtype, shape))
 
 
 def write_safetensors_file(path, tensors):
@@ -434,19 +475,49 @@ def convert_task(task, logger=None):
     return output_tensors
 
 
+def write_completion_marker(state_dir, out_file, tensor_names):
+    marker_path = state_dir / '.conversion_complete'
+    marker_payload = {
+        'output_file': str(out_file),
+        'tensor_names': tensor_names,
+    }
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True), encoding='utf-8')
+
+
+def cleanup_state_artifacts(state_dir):
+    if not state_dir.exists():
+        return
+    # Keep the state directory around so the completion marker remains available for
+    # subsequent resume checks after the temporary payload artifacts are removed.
+    payload_dir = state_dir / 'payloads'
+    if payload_dir.exists():
+        for child in sorted(payload_dir.iterdir()):
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+        payload_dir.rmdir()
+    for state_path in sorted(state_dir.glob('*.json')):
+        state_path.unlink(missing_ok=True)
+
+
 def write_final_output(out_file, tasks, completed, state_dir):
     header = {}
     data_offset = 0
     task_payloads = []
+    expected_tensor_names = []
     for task in tasks:
         task_entry = completed.get(task['task_id'])
         if not task_entry:
             raise ValueError('missing completed output for %s' % task['task_id'])
+        expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
+        expected_tensor_names.extend(expected)
         if task_entry['kind'] == 'state':
             task_tensors = load_state_output_tensors_metadata(task_entry['state_path'], state_dir)
             payload_entries = []
             for name, payload_path, dtype, shape in task_tensors:
                 payload_size = payload_path.stat().st_size
+                validate_payload_length(dtype, payload_size, shape, quant_kind=should_quantize(name), tensor_name=name)
                 payload_entries.append((name, payload_path, dtype, shape, payload_size))
                 header[name] = {
                     'dtype': dtype,
@@ -461,6 +532,7 @@ def write_final_output(out_file, tasks, completed, state_dir):
             ]
             payload_entries = []
             for name, payload, dtype, shape in task_tensors:
+                validate_payload_length(dtype, len(payload), shape, quant_kind=should_quantize(name), tensor_name=name)
                 payload_entries.append((name, payload, dtype, shape, len(payload)))
                 header[name] = {
                     'dtype': dtype,
@@ -469,6 +541,8 @@ def write_final_output(out_file, tasks, completed, state_dir):
                 }
                 data_offset += len(payload)
         task_payloads.append(payload_entries)
+    if len(header) != len(expected_tensor_names):
+        raise ValueError('expected %d tensor entry(s) in output but found %d' % (len(expected_tensor_names), len(header)))
     header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
     tmp_path = out_file.with_suffix(out_file.suffix + '.tmp')
     with open(tmp_path, 'wb') as fh:
@@ -476,13 +550,39 @@ def write_final_output(out_file, tasks, completed, state_dir):
         fh.write(header_bytes)
         for payload_entries in task_payloads:
             for entry in payload_entries:
-                name, payload_source, _, _, _ = entry
+                _, payload_source, _, _, _ = entry
                 if isinstance(payload_source, bytes):
                     fh.write(payload_source)
                 else:
                     with open(payload_source, 'rb') as payload_fh:
                         shutil.copyfileobj(payload_fh, fh, length=1024 * 1024)
     os.replace(tmp_path, out_file)
+    write_completion_marker(state_dir, out_file, sorted(header.keys()))
+    cleanup_state_artifacts(state_dir)
+
+
+def resolve_state_dir(output_path, requested_state_dir=None):
+    if requested_state_dir:
+        return Path(requested_state_dir).expanduser().resolve()
+    preferred_state_dir = output_path / '.state'
+    legacy_state_dir = output_path / '.conversion_state'
+    if preferred_state_dir.exists():
+        return preferred_state_dir
+    if legacy_state_dir.exists():
+        preferred_state_dir.mkdir(parents=True, exist_ok=True)
+        for child in sorted(legacy_state_dir.iterdir()):
+            target_path = preferred_state_dir / child.name
+            if child.is_dir():
+                if target_path.exists():
+                    shutil.rmtree(target_path)
+                shutil.move(str(child), str(target_path))
+            else:
+                if target_path.exists():
+                    target_path.unlink()
+                shutil.move(str(child), str(target_path))
+        legacy_state_dir.rmdir()
+        return preferred_state_dir
+    return legacy_state_dir
 
 
 def handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks):
@@ -527,8 +627,9 @@ def main():
         files, tasks = build_tasks(input_path)
         logger.info('discovered %d safetensors file(s) and %d tensor task(s)', len(files), len(tasks))
 
-        state_dir = Path(args.state_dir).expanduser().resolve() if args.state_dir else output_path / '.conversion_state'
+        state_dir = resolve_state_dir(output_path, args.state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
+        logger.info('using state dir: %s', state_dir)
         completed = load_resumed_outputs(state_dir, out_file, tasks)
         logger.info('resumed %d existing tensor task(s)', len(completed))
 
