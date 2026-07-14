@@ -25,7 +25,9 @@
 extern "C" {
 #endif
 
+#ifndef COLI_CUDA_MAX_DEVICES
 #define COLI_CUDA_MAX_DEVICES 16
+#endif
 
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;

@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
+#ifndef COLI_CUDA_MAX_DEVICES
 #define COLI_CUDA_MAX_DEVICES 16
+#endif
 
 typedef struct ColiCudaTensor ColiCudaTensor;
 

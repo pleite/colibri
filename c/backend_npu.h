@@ -9,7 +9,9 @@ extern "C" {
 #endif
 
 #define COLI_NPU_MAX_DEVICES 16
+#ifndef COLI_CUDA_MAX_DEVICES
 #define COLI_CUDA_MAX_DEVICES COLI_NPU_MAX_DEVICES
+#endif
 
 typedef struct ColiCudaTensor ColiCudaTensor;
 
