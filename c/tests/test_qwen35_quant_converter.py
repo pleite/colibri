@@ -227,9 +227,14 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.run_converter(input_dir, output_dir)
             self.assertFalse((input_dir / 'model.safetensors').exists())
             self.assertFalse((input_dir / 'model2.safetensors').exists())
-            header = self.read_header(output_dir / 'model.safetensors')
-            self.assertIn('model.layers.0.self_attn.q_proj.weight', header)
-            self.assertIn('model.layers.0.mlp.experts.0.gate_proj.weight', header)
+            self.assertTrue((output_dir / 'model.safetensors').exists())
+            self.assertTrue((output_dir / 'model2.safetensors').exists())
+            model_header = self.read_header(output_dir / 'model.safetensors')
+            model2_header = self.read_header(output_dir / 'model2.safetensors')
+            self.assertIn('model.layers.0.self_attn.q_proj.weight', model_header)
+            self.assertNotIn('model.layers.0.mlp.experts.0.gate_proj.weight', model_header)
+            self.assertIn('model.layers.0.mlp.experts.0.gate_proj.weight', model2_header)
+            self.assertNotIn('model.layers.0.self_attn.q_proj.weight', model2_header)
 
     def test_converter_migrates_legacy_state_dir_to_state_format(self):
         with tempfile.TemporaryDirectory() as tmpdir:
