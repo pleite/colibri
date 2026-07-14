@@ -95,9 +95,9 @@ endif
 # glm.c is compiled with -DCOLI_CUDA -DCOLI_ROCM and uses the same code paths.
 ROCM      ?= 0
 ROCM_HOME ?= /opt/rocm
-HIPCC     ?= $(ROCM_HOME)/bin/hipcc
+HIPCC     ?= $(or $(shell command -v hipcc 2>/dev/null),$(ROCM_HOME)/bin/hipcc)
 ROCM_ARCH ?= native
-HIPCCFLAGS ?= -O3 -std=c++17 -Xcompiler=-Wall,-Wextra
+HIPCCFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 ROCM_BACKEND_CFLAGS =
 ifeq ($(ROCM),1)
 ifeq ($(UNAME_S),Darwin)
@@ -180,10 +180,10 @@ glm: glm$(EXE)
 qwen35_moe_build: qwen35_moe$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) $(VULKAN_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(VULKAN_BACKEND_CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) $(VULKAN_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(VULKAN_BACKEND_CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -204,7 +204,7 @@ rocm-test: backend_rocm.hip backend_rocm.h tests/test_backend_rocm.hip
 	./backend_rocm_test$(EXE)
 
 backend_runtime.o: backend_runtime.c backend_runtime.h parallelism.h
-	$(CC) $(CFLAGS) -c backend_runtime.c -o $@
+	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(VULKAN_BACKEND_CFLAGS) -c backend_runtime.c -o $@
 
 backend_npu.o: backend_npu.c backend_npu.h
 	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) -c backend_npu.c -o $@
