@@ -9,7 +9,6 @@ layout expected by c/qwen35_moe.c:
 """
 import argparse
 import base64
-import concurrent.futures
 import json
 import logging
 import math
@@ -34,6 +33,20 @@ def read_safetensors_file(path):
         header = json.loads(header_bytes.decode('utf-8'))
         data = fh.read()
     return header, data
+
+
+def read_safetensors_header(path):
+    with open(path, 'rb') as fh:
+        header_len = int.from_bytes(fh.read(8), 'little')
+        header_bytes = fh.read(header_len)
+        return json.loads(header_bytes.decode('utf-8'))
+
+
+def read_safetensors_tensor_payload(path, meta):
+    offsets = meta['data_offsets']
+    with open(path, 'rb') as fh:
+        fh.seek(offsets[0])
+        return fh.read(offsets[1] - offsets[0])
 
 
 def decode_fp8_payload(payload, dtype):
@@ -307,40 +320,40 @@ def build_tasks(input_path):
     files = discover_safetensors(input_path)
     tasks = []
     for path in files:
-        header, data = read_safetensors_file(path)
+        header = read_safetensors_header(path)
         tensor_names = [name for name in header if name != '__metadata__']
         for tensor_name in tensor_names:
             meta = header[tensor_name]
-            offsets = meta['data_offsets']
-            payload = data[offsets[0]:offsets[1]]
             task_id = '%s:%s' % (path.name, tensor_name)
             tasks.append({
                 'task_id': task_id,
+                'source_path': path,
                 'source_name': path.name,
                 'tensor_name': tensor_name,
                 'meta': meta,
-                'payload': payload,
                 'index': len(tasks),
             })
     return files, tasks
 
 
-def read_existing_output_payloads(path):
+def read_existing_output_payloads(path, tensor_names=None):
     if not path.exists():
         return {}
-    header, data = read_safetensors_file(path)
+    header = read_safetensors_header(path)
     entries = {}
-    for tensor_name, meta in header.items():
-        if tensor_name == '__metadata__':
+    names = tensor_names or [name for name in header if name != '__metadata__']
+    for tensor_name in names:
+        if tensor_name not in header:
             continue
-        offsets = meta['data_offsets']
-        payload = data[offsets[0]:offsets[1]]
+        meta = header[tensor_name]
+        payload = read_safetensors_tensor_payload(path, meta)
         entries[tensor_name] = (tensor_name, payload, meta['dtype'], list(meta['shape']))
     return entries
 
 
 def load_resumed_outputs(state_dir, out_file, tasks):
     completed = {}
+    task_ids = {task['task_id'] for task in tasks}
     if state_dir.exists():
         for state_path in sorted(state_dir.glob('*.json')):
             try:
@@ -348,18 +361,16 @@ def load_resumed_outputs(state_dir, out_file, tasks):
             except (json.JSONDecodeError, OSError):
                 continue
             task_id = payload.get('task_id')
-            if not task_id:
+            if not task_id or task_id not in task_ids:
                 continue
-            if task_id not in {task['task_id'] for task in tasks}:
-                continue
-            completed[task_id] = decode_output_tensors(payload.get('output_tensors', []))
-    existing = read_existing_output_payloads(out_file)
+            completed[task_id] = {'kind': 'state', 'state_path': state_path}
     for task in tasks:
         expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
         if task['task_id'] in completed:
             continue
+        existing = read_existing_output_payloads(out_file, expected)
         if all(name in existing for name in expected):
-            completed[task['task_id']] = [existing[name] for name in expected]
+            completed[task['task_id']] = {'kind': 'output_file', 'tensor_names': expected}
     return completed
 
 
@@ -369,34 +380,88 @@ def get_state_file_name(task_id):
 
 def persist_task_result(state_dir, task, output_tensors):
     state_dir.mkdir(parents=True, exist_ok=True)
+    payload_dir = state_dir / 'payloads'
+    payload_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / get_state_file_name(task['task_id'])
+    encoded_tensors = []
+    for name, payload, dtype, shape in output_tensors:
+        safe_name = name.replace('/', '_').replace(os.sep, '_')
+        payload_path = payload_dir / ('%s_%s.bin' % (task['task_id'].replace(':', '_'), safe_name))
+        payload_path.write_bytes(payload)
+        encoded_tensors.append({
+            'name': name,
+            'payload_path': payload_path.name,
+            'dtype': dtype,
+            'shape': list(shape),
+        })
     payload = {
         'task_id': task['task_id'],
         'source_name': task['source_name'],
         'tensor_name': task['tensor_name'],
-        'output_tensors': encode_output_tensors(output_tensors),
+        'output_tensors': encoded_tensors,
     }
     state_path.write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')
+    return state_path
+
+
+def load_state_output_tensors(state_path, state_dir):
+    payload = json.loads(state_path.read_text(encoding='utf-8'))
+    tensors = []
+    for entry in payload.get('output_tensors', []):
+        payload_path = state_dir / 'payloads' / entry['payload_path']
+        tensors.append((entry['name'], payload_path.read_bytes(), entry['dtype'], entry['shape']))
+    return tensors
 
 
 def convert_task(task, logger=None):
-    output_tensors = convert_tensor_payload(task['tensor_name'], task['meta'], task['payload'], logger=logger)
+    payload = read_safetensors_tensor_payload(task['source_path'], task['meta'])
+    output_tensors = convert_tensor_payload(task['tensor_name'], task['meta'], payload, logger=logger)
     return output_tensors
 
 
-def write_final_output(out_file, tasks, completed):
-    output_tensors = []
+def write_final_output(out_file, tasks, completed, state_dir):
+    header = {}
+    data_offset = 0
     for task in tasks:
-        task_entries = completed.get(task['task_id'])
-        if not task_entries:
+        task_entry = completed.get(task['task_id'])
+        if not task_entry:
             raise ValueError('missing completed output for %s' % task['task_id'])
-        output_tensors.extend(task_entries)
-    write_safetensors_file(out_file, output_tensors)
+        if task_entry['kind'] == 'state':
+            task_tensors = load_state_output_tensors(task_entry['state_path'], state_dir)
+        else:
+            task_tensors = [
+                read_existing_output_payloads(out_file, task_entry['tensor_names'])[name]
+                for name in task_entry['tensor_names']
+            ]
+        for name, payload, dtype, shape in task_tensors:
+            header[name] = {
+                'dtype': dtype,
+                'shape': list(shape),
+                'data_offsets': [data_offset, data_offset + len(payload)],
+            }
+            data_offset += len(payload)
+    header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
+    tmp_path = out_file.with_suffix(out_file.suffix + '.tmp')
+    with open(tmp_path, 'wb') as fh:
+        fh.write(len(header_bytes).to_bytes(8, 'little'))
+        fh.write(header_bytes)
+        for task in tasks:
+            task_entry = completed.get(task['task_id'])
+            if task_entry['kind'] == 'state':
+                task_tensors = load_state_output_tensors(task_entry['state_path'], state_dir)
+            else:
+                task_tensors = [
+                    read_existing_output_payloads(out_file, task_entry['tensor_names'])[name]
+                    for name in task_entry['tensor_names']
+                ]
+            for _, payload, _, _ in task_tensors:
+                fh.write(payload)
+    os.replace(tmp_path, out_file)
 
 
 def handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks):
-    completed[task_result['task_id']] = output_tensors
-    persist_task_result(state_dir, task_result, output_tensors)
+    state_path = persist_task_result(state_dir, task_result, output_tensors)
+    completed[task_result['task_id']] = {'kind': 'state', 'state_path': state_path}
     for entry in output_tensors:
         logger.info('wrote %s', entry[0])
     render_progress(len(completed), total_tasks, 'converting %s' % task_result['source_name'])
@@ -443,33 +508,17 @@ def main():
 
         pending_tasks = [task for task in tasks if task['task_id'] not in completed]
         if pending_tasks:
-            workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
-            workers = max(1, workers)
-            logger.info('using %d worker(s) for parallel conversion', workers)
-            max_pending = max(1, workers * 2)
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = {}
-                for task in pending_tasks:
-                    futures[executor.submit(convert_task, task, logger=None)] = task
-                    if len(futures) >= max_pending:
-                        done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                        completed_future = next(iter(done))
-                        task_result = futures.pop(completed_future)
-                        output_tensors = completed_future.result()
-                        handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
-                while futures:
-                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                    completed_future = next(iter(done))
-                    task_result = futures.pop(completed_future)
-                    output_tensors = completed_future.result()
-                    handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
+            logger.info('streaming conversion and persisting output tensors to disk')
+            for task in pending_tasks:
+                output_tensors = convert_task(task, logger=logger)
+                handle_completed_task(completed, state_dir, logger, task, output_tensors, len(tasks))
         if not completed:
             raise RuntimeError('no tensors were converted')
         if len(completed) != len(tasks):
             missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
             raise RuntimeError('failed to complete %d task(s): %s' % (len(missing), ', '.join(missing)))
 
-        write_final_output(out_file, tasks, completed)
+        write_final_output(out_file, tasks, completed, state_dir)
         logger.info('wrote %s', out_file)
         return 0
     except Exception:
