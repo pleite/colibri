@@ -56,6 +56,103 @@ static size_t g_tensor_capacity = 0;
 static size_t g_cache_hits = 0;
 static int g_backend_mask = 0;
 
+static int backend_bit_for_name(const char *name) {
+    if (!name || !*name) return 0;
+    if (!strcmp(name, "cpu")) return 1;
+#ifdef COLI_ENABLE_NPU
+    if (!strcmp(name, "npu")) return 2;
+#endif
+#ifdef COLI_ENABLE_VULKAN
+    if (!strcmp(name, "vulkan")) return 4;
+#endif
+#if defined(COLI_CUDA)
+    /* CUDA and ROCm share the same runtime dispatch slot because the build-time
+     * mapping selects the appropriate implementation via the same coli_cuda_*
+     * ABI entry points. */
+    if (!strcmp(name, "cuda")) return 8;
+#endif
+#if defined(COLI_ROCM)
+    if (!strcmp(name, "rocm")) return 8;
+#endif
+    return 0;
+}
+
+static int parse_backend_names(const char *value, int *mask_out) {
+    int mask = 0;
+    int saw_any = 0;
+    if (!value || !*value) {
+        *mask_out = 0;
+        return 0;
+    }
+    char *copy = (char *)malloc(strlen(value) + 1);
+    if (!copy) {
+        fprintf(stderr, "runtime: memory allocation failed while parsing backend list '%s'\n", value);
+        *mask_out = 0;
+        return 0;
+    }
+    strcpy(copy, value);
+    char *cursor = copy;
+    while (cursor && *cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) {
+            *comma = '\0';
+        }
+        char *entry = cursor;
+        while (*entry == ' ' || *entry == '\t') ++entry;
+        char *end = entry + strlen(entry);
+        while (end > entry && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        if (*entry) {
+            saw_any = 1;
+            if (!strcmp(entry, "none")) {
+                mask = 0;
+            } else {
+                int bit = backend_bit_for_name(entry);
+                if (bit) mask |= bit;
+            }
+        }
+        if (!comma) break;
+        cursor = comma + 1;
+    }
+    free(copy);
+    *mask_out = mask;
+    return saw_any;
+}
+
+static int resolve_backend_mask(void) {
+    int mask = 1;
+#ifdef COLI_ENABLE_NPU
+    mask |= 2;
+#endif
+#ifdef COLI_ENABLE_VULKAN
+    mask |= 4;
+#endif
+#if defined(COLI_CUDA)
+    mask |= 8;
+#endif
+#if defined(COLI_ROCM)
+    mask |= 8;
+#endif
+
+    const char *disabled = getenv("COLI_RUNTIME_DISABLE_ENGINES");
+    if (disabled && *disabled) {
+        int disable_mask = 0;
+        parse_backend_names(disabled, &disable_mask);
+        mask &= ~disable_mask;
+    }
+
+    const char *enabled = getenv("COLI_RUNTIME_ENGINES");
+    if (enabled && *enabled) {
+        int requested_mask = 0;
+        if (parse_backend_names(enabled, &requested_mask)) {
+            mask = requested_mask;
+        }
+    }
+
+    return mask > 0 ? mask : 1;
+}
+
 static void configure_parallelism(void) {
 #ifdef _OPENMP
     int threads = coli_detect_thread_count();
@@ -375,26 +472,34 @@ int coli_runtime_init(const int *devices, int count) {
         g_device_count = count > COLI_RUNTIME_MAX_DEVICES ? COLI_RUNTIME_MAX_DEVICES : count;
         for (int i = 0; i < g_device_count; ++i) g_devices[i] = devices[i];
     }
-    g_backend_mask = 1;
+    g_backend_mask = resolve_backend_mask();
     configure_parallelism();
 #ifdef COLI_ENABLE_NPU
-    if (coli_npu_init(g_devices, g_device_count)) {
+    if ((g_backend_mask & 2) && coli_npu_init(g_devices, g_device_count)) {
         g_backend_mask |= 2;
+    } else {
+        g_backend_mask &= ~2;
     }
 #endif
 #ifdef COLI_ENABLE_VULKAN
-    if (coli_vulkan_init(g_devices, g_device_count)) {
+    if ((g_backend_mask & 4) && coli_vulkan_init(g_devices, g_device_count)) {
         g_backend_mask |= 4;
+    } else {
+        g_backend_mask &= ~4;
     }
 #endif
 #if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
-    if (coli_cuda_init(g_devices, g_device_count)) {
+    if ((g_backend_mask & 8) && coli_cuda_init(g_devices, g_device_count)) {
         g_backend_mask |= 8;
+    } else {
+        g_backend_mask &= ~8;
     }
 #endif
 #if defined(COLI_ROCM)
-    if (coli_rocm_init(g_devices, g_device_count)) {
+    if ((g_backend_mask & 8) && coli_rocm_init(g_devices, g_device_count)) {
         g_backend_mask |= 8;
+    } else {
+        g_backend_mask &= ~8;
     }
 #endif
     g_initialized = 1;

@@ -1,9 +1,12 @@
 #include "backend_vulkan.h"
 
 #include <stdbool.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "parallelism.h"
 
@@ -30,6 +33,13 @@ static size_t g_tensor_bytes = 0;
 static ColiCudaTensor **g_tensors = NULL;
 static size_t g_tensor_capacity = 0;
 static _Atomic bool g_parallelism_configured = false;
+static int g_vulkan_loader_available = 0;
+
+static int env_truthy(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !*value) return 0;
+    return !(strcasecmp(value, "0") == 0 || strcasecmp(value, "false") == 0 || strcasecmp(value, "off") == 0);
+}
 
 static void configure_parallelism(void) {
     bool expected = false;
@@ -39,6 +49,23 @@ static void configure_parallelism(void) {
     omp_set_dynamic(0);
     omp_set_num_threads(threads);
 #endif
+}
+
+static void probe_loader(void) {
+    if (env_truthy("COLI_VULKAN_DISABLE")) {
+        g_vulkan_loader_available = 0;
+        return;
+    }
+    void *handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    }
+    if (handle) {
+        dlclose(handle);
+        g_vulkan_loader_available = 1;
+    } else {
+        g_vulkan_loader_available = 0;
+    }
 }
 
 static void register_tensor(ColiCudaTensor *tensor) {
@@ -138,6 +165,7 @@ int coli_cuda_init(const int *devices, int count) {
         for (int i = 0; i < g_device_count; ++i) g_devices[i] = devices[i];
     }
     configure_parallelism();
+    probe_loader();
     g_initialized = 1;
     return 1;
 }
@@ -153,7 +181,9 @@ void coli_cuda_shutdown(void) {
     g_device_count = 0;
     g_tensor_count = 0;
     g_tensor_bytes = 0;
+    g_vulkan_loader_available = 0;
 }
+
 int coli_cuda_device_count(void) {
     return g_initialized ? g_device_count : 0;
 }
@@ -184,10 +214,6 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (!has_valid_payload) return 0;
     if (*tensor) {
         ColiCudaTensor *existing = *tensor;
-        /* Treat an identical re-upload as a cache hit: keep the existing resident
-         * tensor intact and return success without re-copying weights/scales.  A
-         * mismatched shape/format/device is rejected to keep the API consistent
-         * with the CUDA/ROCm backends. */
         if (tensor_params_match(existing, fmt, I, O, device)) {
             return 1;
         }
