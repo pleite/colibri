@@ -8,11 +8,11 @@ RUN dnf install -y gcc gcc-c++ make git python3 python3-pip \
 WORKDIR /opt/colibri
 RUN git clone https://github.com/pleite/colibri.git .
 
-# DEBUG: show the file content around the guard
-RUN grep -n 'COLI_ROCM' /opt/colibri/c/backend_runtime.c | head -10
+# DEBUG: preprocessor test
+WORKDIR /opt/colibri/c
+RUN gcc -E -DCOLI_CUDA -DCOLI_ROCM -DCOLI_ENABLE_NPU -DCOLI_NPU -dD backend_runtime.c 2>&1 | grep -c "int coli_cuda_init"
 
 # Build with additive backends
-WORKDIR /opt/colibri/c
 RUN ROCM_HOME=/usr make ROCM=1 NPU=1 HIPCCFLAGS="-O3 -std=c++17 -I/usr/include" all 2>&1
 
 EXPOSE 8000
