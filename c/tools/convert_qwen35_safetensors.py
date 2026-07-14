@@ -561,14 +561,22 @@ def write_completion_marker(state_dir, output_files, tensor_names):
 
 
 def discover_output_safetensors(output_path):
-    return sorted(path for path in output_path.glob('*.safetensors') if path.is_file())
+    if not output_path.exists():
+        return []
+    return sorted(
+        path for path in output_path.iterdir()
+        if path.is_file() and path.suffix == '.safetensors'
+    )
 
 
 def write_safetensors_index(output_path, output_files=None, logger=None):
     if output_files is None:
         output_files = discover_output_safetensors(output_path)
     else:
-        output_files = sorted(output_files)
+        output_files = sorted(
+            path for path in output_files
+            if path.is_file() and path.suffix == '.safetensors'
+        )
     if not output_files:
         raise FileNotFoundError('No safetensors files found in output directory')
     weight_map = {}
@@ -739,7 +747,7 @@ def main():
         try:
             files, source_groups = build_source_task_groups(input_path)
         except FileNotFoundError:
-            existing_outputs = [path for path in output_path.glob('*.safetensors') if path.is_file()]
+            existing_outputs = discover_output_safetensors(output_path)
             if existing_outputs:
                 for path in existing_outputs:
                     try:
