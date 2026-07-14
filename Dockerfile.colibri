@@ -1,22 +1,53 @@
+# Colibri Qwen3.5 MoE engine — Strix Halo build (additive backends)
+#
+# Target: AMD Ryzen AI Max+ 395 (Strix Halo)
+#   - iGPU: Radeon 8060S (ROCm HIP)
+#   - NPU:  XDNA 2 / amdxdna  (CPU reference shim via COLI_ENABLE_NPU)
+#
+# Architecture:
+#   backend_runtime.c — common scheduler/dispatch layer. Splits matmul output
+#   columns across active backends (lanes). Always built.
+#   backend_rocm.o    — HIP kernels for iGPU acceleration (ROCM=1).
+#   backend_npu.o     — CPU reference shim for NPU path (NPU=1).
+#
+# The Makefile uses additive BACKEND_OBJ += so ROCm and NPU can coexist.
+# The runtime scheduler (g_backend_mask) dispatches matmuls across all
+# available backends simultaneously.
+#
+# Build:
+#   podman build --no-cache -f Dockerfile.colibri -t pleite/colibri:qwen35moe .
+#
+# Run (iGPU only):
+#   podman run --rm -it --device /dev/dri --device /dev/kfd #     -v /opt/models:/models pleite/colibri:qwen35moe #     python3 openai_server.py --model /models/ornith-int4
+#
+# Run (NPU only):
+#   podman run --rm -it --device /dev/accel/accel0 #     -v /opt/models:/models pleite/colibri:qwen35moe #     python3 openai_server.py --model /models/ornith-int4
+#
+# Run (both iGPU + NPU — additive backends, runtime dispatches across lanes):
+#   podman run --rm -it #     --device /dev/dri --device /dev/kfd --device /dev/accel/accel0 #     -v /opt/models:/models pleite/colibri:qwen35moe #     python3 openai_server.py --model /models/ornith-int4
+
 FROM registry.fedoraproject.org/fedora:42
 
-# Build deps + runtime deps (python3 for openai_server.py)
-# ROCm/Vulkan support: rocm-dev, vulkan-headers, rocm-opencl-runtime
-RUN dnf install -y gcc gcc-c++ make git python3 python3-pip \
-    rocm vulkan-headers \
-    && dnf clean all
+# Build deps + ROCm + NPU + Vulkan headers
+# rocm metapackage provides hipcc, HIP libraries, and ROCm runtime.
+# vulkan-headers needed for the Vulkan backend shim (optional).
+# libgomp is bundled with gcc — OpenMP is used for CPU fallback matmuls.
+RUN dnf install -y gcc gcc-c++ make git python3 python3-pip     rocm     vulkan-headers     && dnf clean all
 
 WORKDIR /opt/colibri
 
-# Clone from pleite mirror
+# Clone from pleite mirror (latest main = Phase 2 + additive backends + runtime scheduler)
 RUN git clone https://github.com/pleite/colibri.git .
 
-# Build the C engine with ROCm/Vulkan support
+# Build the C engine with BOTH ROCm (iGPU) and NPU (CPU reference shim).
+# The Makefile uses additive BACKEND_OBJ += so both backends compile and link.
+# backend_runtime.o is the common scheduler that dispatches matmuls across
+# all active backends simultaneously (lanes).
 WORKDIR /opt/colibri/c
-RUN ./setup.sh 2>&1
+RUN ROCM=1 NPU=1 ./setup.sh 2>&1
 
 # Expose OpenAI-compatible API port
 EXPOSE 8000
 
 # Default: run the OpenAI server
-CMD ["python3", "openai_server.py", "--host", "0.0.0.0", "--port", "8000"]
+CMD [python3, openai_server.py, --host, 0.0.0.0, --port, 8000]
