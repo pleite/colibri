@@ -164,6 +164,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.run_converter(input_dir, output_dir)
             self.assertTrue((output_dir / 'model.safetensors').exists())
             shutil.rmtree(input_dir)
+            self.assertFalse(input_dir.exists())
             result = subprocess.run(
                 [sys.executable, str(self.converter_script_path()), '--input', str(input_dir), '--output', str(output_dir), '--generate-index-only'],
                 text=True,

@@ -568,10 +568,11 @@ def discover_output_safetensors(output_path):
         if not path.is_file() or path.suffix != '.safetensors':
             continue
         try:
-            read_safetensors_header(path)
+            header = read_safetensors_header(path)
         except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
             continue
-        discovered.append(path)
+        if header is not None:
+            discovered.append(path)
     return discovered
 
 
@@ -584,7 +585,7 @@ def write_safetensors_index(output_path, output_files=None, logger=None):
             if path.is_file() and path.suffix == '.safetensors'
         )
     if not output_files:
-        raise FileNotFoundError('No safetensors files found in output directory: %s' % output_path)
+        raise FileNotFoundError(f'No safetensors files found in output directory: {output_path}')
     weight_map = {}
     total_size = 0
     for path in output_files:
@@ -603,7 +604,7 @@ def write_safetensors_index(output_path, output_files=None, logger=None):
     index_path = output_path / 'model.safetensors.index.json'
     index_path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding='utf-8')
     if logger is not None:
-        logger.info('generated index from %d safetensors file(s)', len(output_files))
+        logger.info('generating index from %d safetensors file(s)', len(output_files))
         logger.info('wrote %s', index_path)
     return index_path
 
