@@ -106,6 +106,10 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight']['shape'], [2, 4])
             self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight.qs']['dtype'], 'F32')
             self.assertEqual(header['model.layers.0.mlp.experts.0.gate_proj.weight.qs']['shape'], [2])
+            index_payload = json.loads((output_dir / 'model.safetensors.index.json').read_text(encoding='utf-8'))
+            self.assertEqual(index_payload['weight_map']['model.layers.0.self_attn.q_proj.weight'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.layers.0.self_attn.q_proj.weight.qs'], 'model.safetensors')
+            self.assertEqual(index_payload['metadata']['total_size'], (output_dir / 'model.safetensors').stat().st_size)
 
     def test_converter_supports_fp8_inputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -144,6 +148,60 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
 
+    def test_converter_generate_index_only_from_existing_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            self.run_converter(input_dir, output_dir)
+            self.assertTrue((output_dir / 'model.safetensors').exists())
+            shutil.rmtree(input_dir)
+            self.assertFalse(input_dir.exists())
+            result = subprocess.run(
+                [sys.executable, str(self.converter_script_path()), '--input', str(input_dir), '--output', str(output_dir), '--generate-index-only'],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('generating index from 1 safetensors file(s)', result.stderr)
+            index_payload = json.loads((output_dir / 'model.safetensors.index.json').read_text(encoding='utf-8'))
+            self.assertEqual(index_payload['weight_map']['model.layers.0.self_attn.q_proj.weight'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.layers.0.self_attn.q_proj.weight.qs'], 'model.safetensors')
+ 
+    def test_converter_generate_index_only_ignores_invalid_output_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            output_dir = tmpdir / 'output'
+            output_dir.mkdir()
+            self.write_safetensors(
+                output_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            (output_dir / 'ignore.txt').write_text('ignore me', encoding='utf-8')
+            (output_dir / 'broken.safetensors').write_bytes(b'not-a-valid-safetensors-file')
+            result = subprocess.run(
+                [sys.executable, str(self.converter_script_path()), '--output', str(output_dir), '--generate-index-only'],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            index_payload = json.loads((output_dir / 'model.safetensors.index.json').read_text(encoding='utf-8'))
+            self.assertEqual(index_payload['weight_map']['model.layers.0.self_attn.q_proj.weight'], 'model.safetensors')
+            # The synthetic output shard in this test only contains the main tensor entry.
+            self.assertNotIn('model.layers.0.self_attn.q_proj.weight.qs', index_payload['weight_map'])
+ 
     def test_converter_resumes_from_existing_output_without_state_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)

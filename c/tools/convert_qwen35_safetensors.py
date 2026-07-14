@@ -26,6 +26,7 @@ INT8_MIN_VALUE = -128
 INT8_MAX_VALUE = 127
 INT4_MIN_VALUE = -8
 INT4_MAX_VALUE = 7
+METADATA_KEY = '__metadata__'
 FP8_E4M3_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e4m3')
 FP8_E5M2_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e5m2')
 
@@ -556,7 +557,58 @@ def write_completion_marker(state_dir, output_files, tensor_names):
         'output_files': [str(path) for path in output_files],
         'tensor_names': tensor_names,
     }
-    marker_path.write_text(json.dumps(marker_payload, sort_keys=True), encoding='utf-8')
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True, indent=2), encoding='utf-8')
+
+
+def discover_output_safetensors(output_path, logger=None):
+    if not output_path.exists():
+        return []
+    discovered = []
+    for path in sorted(output_path.iterdir()):
+        if not path.is_file() or path.suffix != '.safetensors':
+            continue
+        try:
+            header = read_safetensors_header(path)
+        except Exception as exc:
+            if logger is not None:
+                logger.warning('skipping invalid safetensors output file %s: %s', path, exc)
+            continue
+        if header is not None:
+            discovered.append(path)
+    return discovered
+
+
+def write_safetensors_index(output_path, output_files=None, logger=None):
+    if output_files is None:
+        output_files = discover_output_safetensors(output_path, logger=logger)
+    else:
+        output_files = sorted(
+            path for path in output_files
+            if path.is_file() and path.suffix == '.safetensors'
+        )
+    if not output_files:
+        raise FileNotFoundError(f'No valid safetensors files found in output directory: {output_path}')
+    weight_map = {}
+    total_size = 0
+    for path in output_files:
+        header = read_safetensors_header(path)
+        for tensor_name in header:
+            if tensor_name == METADATA_KEY:
+                continue
+            weight_map[tensor_name] = path.name
+        total_size += path.stat().st_size
+    payload = {
+        'metadata': {
+            'total_size': total_size,
+        },
+        'weight_map': weight_map,
+    }
+    index_path = output_path / 'model.safetensors.index.json'
+    index_path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding='utf-8')
+    if logger is not None:
+        logger.info('generating index from %d safetensors file(s)', len(output_files))
+        logger.info('wrote %s', index_path)
+    return index_path
 
 
 def cleanup_state_artifacts(state_dir):
@@ -667,20 +719,29 @@ def handle_completed_task(completed, state_dir, logger, task_result, output_tens
 
 def main():
     parser = argparse.ArgumentParser(description='Convert standard safetensors to the qwen35_moe quantized layout')
-    parser.add_argument('--input', required=True)
+    parser.add_argument('--input', default=None)
     parser.add_argument('--output', required=True)
     parser.add_argument('--log-file', default=None, help='optional path for the conversion log file')
     parser.add_argument('--workers', type=int, default=None, help='number of worker processes; defaults to all CPU cores')
     parser.add_argument('--state-dir', default=None, help='directory for per-tensor resume checkpoints')
+    parser.add_argument('--generate-index-only', action='store_true', help='generate model.safetensors.index.json from existing output shards')
     args = parser.parse_args()
 
-    input_path = Path(args.input).resolve()
+    if args.input is None and not args.generate_index_only:
+        raise SystemExit('--input is required unless --generate-index-only is used')
+    input_path = Path(args.input).resolve() if args.input is not None else None
     output_path = Path(args.output).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
     logger, log_path = setup_logger(output_path, args.log_file)
-    logger.info('converter starting: input=%s output=%s', input_path, output_path)
+    logger.info('converter starting: input=%s output=%s', input_path or '<none>', output_path)
     logger.info('log file: %s', log_path)
     try:
+        if args.generate_index_only:
+            write_safetensors_index(output_path, logger=logger)
+            return 0
+
+        if input_path is None:
+            raise FileNotFoundError('input path is required unless --generate-index-only is used')
         if input_path.is_dir():
             for name in ['config.json', 'tokenizer.json']:
                 src = input_path / name
@@ -698,7 +759,7 @@ def main():
         try:
             files, source_groups = build_source_task_groups(input_path)
         except FileNotFoundError:
-            existing_outputs = [path for path in output_path.glob('*.safetensors') if path.is_file()]
+            existing_outputs = discover_output_safetensors(output_path)
             if existing_outputs:
                 for path in existing_outputs:
                     try:
@@ -706,7 +767,8 @@ def main():
                     except (FileNotFoundError, ValueError, json.JSONDecodeError):
                         continue
                     if header:
-                        logger.info('input files are missing but output already exists; skipping conversion')
+                        logger.info('input files are missing but output already exists; generating index from converted shards')
+                        write_safetensors_index(output_path, existing_outputs, logger=logger)
                         return 0
             raise
         tasks = [task for group in source_groups for task in group['tasks']]
@@ -768,6 +830,7 @@ def main():
             raise RuntimeError('failed to complete %d task(s): %s' % (len(missing), ', '.join(missing)))
 
         write_completion_marker(state_dir, output_files, tensor_names)
+        write_safetensors_index(output_path, output_files, logger=logger)
         cleanup_state_artifacts(state_dir)
         return 0
     except Exception:
