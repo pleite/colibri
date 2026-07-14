@@ -70,7 +70,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
         with open(path, 'rb') as fh:
             header_len = int.from_bytes(fh.read(8), 'little')
             return json.loads(fh.read(header_len).decode('utf-8'))
- 
+
     def run_converter(self, input_dir, output_dir, extra_args=None):
         command = ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)]
         if extra_args:

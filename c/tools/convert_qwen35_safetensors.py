@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+INT8_MIN_VALUE = -128
 INT8_MAX_VALUE = 127
+INT4_MIN_VALUE = -8
 INT4_MAX_VALUE = 7
 
 
@@ -131,7 +133,7 @@ def quantize_int8(values, out_dim, in_dim, logger=None, tensor_name=None):
             if not math.isfinite(value):
                 non_finite_count += 1
                 value = 0.0
-            quantized = _quantize_value(value, scale, -128, 127)
+            quantized = _quantize_value(value, scale, INT8_MIN_VALUE, INT8_MAX_VALUE)
             packed[row * in_dim + col] = quantized & 0xFF
     if logger is not None and non_finite_count:
         logger.warning('substituted %d non-finite value(s) in %s with 0.0', non_finite_count, tensor_name or 'tensor')
@@ -152,7 +154,7 @@ def quantize_int4(values, out_dim, in_dim, logger=None, tensor_name=None):
             if not math.isfinite(value):
                 non_finite_count += 1
                 value = 0.0
-            quantized = _quantize_value(value, scale, -8, 7)
+            quantized = _quantize_value(value, scale, INT4_MIN_VALUE, INT4_MAX_VALUE)
             packed_byte = row * ((in_dim + 1) // 2) + (col // 2)
             if col % 2 == 0:
                 packed[packed_byte] = (quantized + 8) & 0x0F
@@ -186,7 +188,7 @@ def setup_logger(output_path, log_path=None):
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if log_path is None:
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         log_path = output_path / ('convert_qwen35_safetensors-%s.log' % timestamp)
     else:
         log_path = Path(log_path).expanduser()
@@ -361,9 +363,13 @@ def load_resumed_outputs(state_dir, out_file, tasks):
     return completed
 
 
+def get_state_file_name(task_id):
+    return '%s.json' % task_id.replace(':', '_')
+
+
 def persist_task_result(state_dir, task, output_tensors):
     state_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / ('%s.json' % task['task_id'])
+    state_path = state_dir / get_state_file_name(task['task_id'])
     payload = {
         'task_id': task['task_id'],
         'source_name': task['source_name'],
@@ -386,6 +392,14 @@ def write_final_output(out_file, tasks, completed):
             raise ValueError('missing completed output for %s' % task['task_id'])
         output_tensors.extend(task_entries)
     write_safetensors_file(out_file, output_tensors)
+
+
+def handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks):
+    completed[task_result['task_id']] = output_tensors
+    persist_task_result(state_dir, task_result, output_tensors)
+    for entry in output_tensors:
+        logger.info('wrote %s', entry[0])
+    render_progress(len(completed), total_tasks, 'converting %s' % task_result['source_name'])
 
 
 def main():
@@ -442,21 +456,13 @@ def main():
                         completed_future = next(iter(done))
                         task_result = futures.pop(completed_future)
                         output_tensors = completed_future.result()
-                        completed[task_result['task_id']] = output_tensors
-                        persist_task_result(state_dir, task_result, output_tensors)
-                        for entry in output_tensors:
-                            logger.info('wrote %s', entry[0])
-                        render_progress(len(completed), len(tasks), 'converting %s' % task_result['source_name'])
+                        handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
                 while futures:
                     done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                     completed_future = next(iter(done))
                     task_result = futures.pop(completed_future)
                     output_tensors = completed_future.result()
-                    completed[task_result['task_id']] = output_tensors
-                    persist_task_result(state_dir, task_result, output_tensors)
-                    for entry in output_tensors:
-                        logger.info('wrote %s', entry[0])
-                    render_progress(len(completed), len(tasks), 'converting %s' % task_result['source_name'])
+                    handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
         if not completed:
             raise RuntimeError('no tensors were converted')
         if len(completed) != len(tasks):
