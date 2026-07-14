@@ -20,7 +20,7 @@
 #ifdef COLI_ENABLE_VULKAN
 #include "backend_vulkan.h"
 #endif
-#if defined(COLI_CUDA)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
 #include "backend_cuda.h"
 #endif
 #if defined(COLI_ROCM)
@@ -329,7 +329,7 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         free(slice_weights_buf);
         free(slice_scales_buf);
         return ok;
-#elif defined(COLI_CUDA)
+#elif defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
         ColiCudaTensor *tensor = NULL;
         if (!coli_cuda_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
@@ -387,7 +387,7 @@ int coli_runtime_init(const int *devices, int count) {
         g_backend_mask |= 4;
     }
 #endif
-#if defined(COLI_CUDA)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
     if (coli_cuda_init(g_devices, g_device_count)) {
         g_backend_mask |= 8;
     }
@@ -419,7 +419,7 @@ void coli_runtime_shutdown(void) {
 #ifdef COLI_ENABLE_VULKAN
     coli_vulkan_shutdown();
 #endif
-#if defined(COLI_CUDA)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
     coli_cuda_shutdown();
 #endif
 #if defined(COLI_ROCM)

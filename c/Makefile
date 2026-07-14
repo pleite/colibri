@@ -180,10 +180,10 @@ glm: glm$(EXE)
 qwen35_moe_build: qwen35_moe$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(VULKAN_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) glm.c $(BACKEND_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 qwen35_moe$(EXE): qwen35_moe.c st.h json.h compat.h $(BACKEND_OBJ)
-	$(CC) $(CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(VULKAN_BACKEND_CFLAGS) $(ROCM_BACKEND_CFLAGS) $(NPU_BACKEND_CFLAGS) qwen35_moe.c $(BACKEND_OBJ) -o qwen35_moe$(EXE) $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
