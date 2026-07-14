@@ -1,19 +1,36 @@
-# Colibri Qwen3.5 MoE engine — Strix Halo build (additive backends)
-FROM registry.fedoraproject.org/fedora:42
+# syntax=docker/dockerfile:1.7
+# Colibri backend container image for Vulkan, ROCm, or NPU-enabled builds.
+FROM registry.fedoraproject.org/fedora:43 AS build
 
-RUN dnf install -y gcc gcc-c++ make git python3 python3-pip \
-    rocm rocm-hip-devel hipcc vulkan-headers \
-    && dnf clean all
+ARG BACKEND=vulkan
 
-WORKDIR /opt/colibri
-RUN git clone https://github.com/pleite/colibri.git .
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+    gcc gcc-c++ make git python3 python3-pip python3-devel ca-certificates \
+    && case "$BACKEND" in \
+        vulkan) dnf -y --nodocs --setopt=install_weak_deps=False install \
+            vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
+        rocm) dnf -y --nodocs --setopt=install_weak_deps=False install \
+            rocm rocm-hip-devel hipcc vulkan-headers ;; \
+        npu) dnf -y --nodocs --setopt=install_weak_deps=False install \
+            xrt xrt-devel vulkan-headers ;; \
+        all) dnf -y --nodocs --setopt=install_weak_deps=False install \
+            vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
+            rocm rocm-hip-devel hipcc vulkan-headers \
+            xrt xrt-devel ;; \
+        *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
+    esac \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf/*
 
-# DEBUG: preprocessor test
 WORKDIR /opt/colibri/c
-RUN gcc -E -DCOLI_CUDA -DCOLI_ROCM -DCOLI_ENABLE_NPU -DCOLI_NPU -dD backend_runtime.c 2>&1 | grep -c "int coli_cuda_init"
+COPY c /opt/colibri/c
 
-# Build with additive backends
-RUN ROCM_HOME=/usr make ROCM=1 NPU=1 HIPCCFLAGS="-O3 -std=c++17 -I/usr/include" all 2>&1
+RUN case "$BACKEND" in \
+        vulkan) make VULKAN=1 glm qwen35_moe ;; \
+        rocm) make ROCM=1 glm qwen35_moe ;; \
+        npu) make NPU=1 glm qwen35_moe ;; \
+        all) make VULKAN=1 ROCM=1 NPU=1 glm qwen35_moe ;; \
+    esac
 
 EXPOSE 8000
-CMD ["python3", "openai_server.py", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "/opt/colibri/c/openai_server.py", "--host", "0.0.0.0", "--port", "8000"]

@@ -34,8 +34,44 @@
 #include "backend_cuda.h"
 #endif
 
+#if defined(COLI_ROCM)
+int coli_rocm_init(const int *devices, int count);
+void coli_rocm_shutdown(void);
+int coli_rocm_device_count(void);
+int coli_rocm_device_at(int index);
+int coli_rocm_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+void coli_rocm_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+int coli_rocm_tensor_upload(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device);
+int coli_rocm_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device);
+void coli_rocm_tensor_free(ColiCudaTensor *tensor);
+size_t coli_rocm_tensor_bytes(const ColiCudaTensor *tensor);
+int coli_rocm_tensor_device(const ColiCudaTensor *tensor);
+#endif
+
+#if defined(COLI_ENABLE_NPU)
+int coli_npu_compat_init(const int *devices, int count);
+void coli_npu_compat_shutdown(void);
+int coli_npu_compat_device_count(void);
+int coli_npu_compat_device_at(int index);
+int coli_npu_compat_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+void coli_npu_compat_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+int coli_npu_compat_tensor_upload(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device);
+int coli_npu_compat_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device);
+void coli_npu_compat_tensor_free(ColiCudaTensor *tensor);
+size_t coli_npu_compat_tensor_bytes(const ColiCudaTensor *tensor);
+int coli_npu_compat_tensor_device(const ColiCudaTensor *tensor);
+#endif
+
 #include "json.h"
 #include "st.h"
+
+#if !defined(COLI_VULKAN) && !defined(COLI_ROCM) && !defined(COLI_NPU) && !defined(COLI_CUDA)
+typedef struct ColiCudaTensor ColiCudaTensor;
+#endif
+
+#if !defined(COLI_ROCM) && !defined(COLI_ENABLE_NPU)
+void coli_cuda_tensor_free(ColiCudaTensor *tensor);
+#endif
 
 /* Keep the backend-selection condition centralized and use the same ordering as
  * the existing include/dispatch logic: Vulkan, ROCm, NPU, then CUDA. */
@@ -666,6 +702,102 @@ static void free_model(qwen35_model *m) {
     free(m->layer_types);
 }
 
+typedef enum {
+    QWEN_BACKEND_NONE = 0,
+    QWEN_BACKEND_ROCM = 1,
+    QWEN_BACKEND_NPU = 2,
+} qwen_backend_kind_t;
+
+static int g_qwen_backend_kind = QWEN_BACKEND_NONE;
+static int g_qwen_backend_checked = 0;
+static int g_qwen_backend_ready = 0;
+
+static int qwen_backend_device_nodes_available(void) {
+    return access("/dev/dri", F_OK) == 0 && access("/dev/kfd", F_OK) == 0;
+}
+
+static int qwen_backend_init_once(void) {
+    if (g_qwen_backend_checked) return g_qwen_backend_ready;
+    int init_result = 0;
+#ifdef _OPENMP
+#pragma omp critical(qwen_backend_init_once)
+#endif
+    {
+        if (g_qwen_backend_checked) {
+            init_result = g_qwen_backend_ready;
+        } else {
+            g_qwen_backend_checked = 1;
+            g_qwen_backend_kind = QWEN_BACKEND_NONE;
+            g_qwen_backend_ready = 0;
+#if defined(COLI_ROCM)
+            if (qwen_backend_device_nodes_available()) {
+                int devices[1] = {0};
+                if (coli_rocm_init(devices, 1)) {
+                    g_qwen_backend_kind = QWEN_BACKEND_ROCM;
+                    g_qwen_backend_ready = 1;
+                } else {
+#if defined(COLI_ENABLE_NPU)
+                    fprintf(stderr, "[qwen35_moe] ROCm init failed; trying the NPU fallback backend\n");
+#else
+                    fprintf(stderr, "[qwen35_moe] ROCm init failed; no fallback backend is available\n");
+#endif
+                }
+            }
+#endif
+#if defined(COLI_ENABLE_NPU)
+            if (!g_qwen_backend_ready) {
+                int devices[1] = {0};
+                if (coli_npu_compat_init(devices, 1)) {
+                    g_qwen_backend_kind = QWEN_BACKEND_NPU;
+                    g_qwen_backend_ready = 1;
+                }
+            }
+#endif
+            init_result = g_qwen_backend_ready;
+        }
+    }
+    return init_result;
+}
+
+/* Select the initialized backend once and dispatch matmul calls to it.
+ * Returns 1 when the chosen backend accepted the operation and 0 otherwise,
+ * allowing the caller to fall back to the CPU implementation. */
+static int qwen_backend_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights,
+                               const float *scales, int fmt, int S, int I, int O, int device) {
+    if (!qwen_backend_init_once()) return 0;
+#if defined(COLI_ROCM)
+    if (g_qwen_backend_kind == QWEN_BACKEND_ROCM) {
+        return coli_rocm_matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
+    }
+#endif
+#if defined(COLI_ENABLE_NPU)
+    if (g_qwen_backend_kind == QWEN_BACKEND_NPU) {
+        return coli_npu_compat_matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
+    }
+#endif
+    return 0;
+}
+
+static void qwen_backend_tensor_free(ColiCudaTensor *tensor) {
+    if (g_qwen_backend_ready) {
+#if defined(COLI_ROCM)
+        if (g_qwen_backend_kind == QWEN_BACKEND_ROCM) {
+            coli_rocm_tensor_free(tensor);
+            return;
+        }
+#endif
+#if defined(COLI_ENABLE_NPU)
+        if (g_qwen_backend_kind == QWEN_BACKEND_NPU) {
+            coli_npu_compat_tensor_free(tensor);
+            return;
+        }
+#endif
+    }
+#if !defined(COLI_ROCM) && !defined(COLI_ENABLE_NPU)
+    coli_cuda_tensor_free(tensor);
+#endif
+}
+
 static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, float *out) {
     if (in_dim <= 0 || out_dim <= 0) {
         fprintf(stderr, "warning: invalid matmul dimensions (%d, %d)\n", in_dim, out_dim);
@@ -675,26 +807,12 @@ static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, 
     {
         const size_t matmul_size = (size_t)in_dim * (size_t)out_dim;
         if (matmul_size >= COLI_MATMUL_BACKEND_THRESHOLD) {
-            static int backend_ready = -1;
-            if (backend_ready == -1) {
-#ifdef _OPENMP
-#pragma omp critical
-#endif
-                {
-                    if (backend_ready == -1) {
-                        int devices[1] = {0};
-                        backend_ready = coli_cuda_init(devices, 1) ? 1 : 0;
-                    }
-                }
+            ColiCudaTensor *tensor = NULL;
+            if (qwen_backend_matmul(&tensor, out, x, w, NULL, 0, 1, in_dim, out_dim, 0)) {
+                if (tensor) qwen_backend_tensor_free(tensor);
+                return;
             }
-            if (backend_ready) {
-                ColiCudaTensor *tensor = NULL;
-                if (coli_cuda_matmul(&tensor, out, x, w, NULL, 0, 1, in_dim, out_dim, 0)) {
-                    if (tensor) coli_cuda_tensor_free(tensor);
-                    return;
-                }
-                if (tensor) coli_cuda_tensor_free(tensor);
-            }
+            if (tensor) qwen_backend_tensor_free(tensor);
         }
     }
 #endif

@@ -21,6 +21,19 @@ A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
 
 The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No BLAS, no Python at runtime, no GPU required (an opt-in CUDA tier for pinned experts exists — see below).
 
+## Container images
+
+A reusable container build is available in `Dockerfile.colibri`. The same Dockerfile builds backend-specific images for Vulkan, ROCm, and NPU-enabled variants by passing `--build-arg BACKEND=<vulkan|rocm|npu|all>`.
+
+```bash
+docker build -f Dockerfile.colibri -t colibri-vulkan --build-arg BACKEND=vulkan .
+docker build -f Dockerfile.colibri -t colibri-rocm --build-arg BACKEND=rocm .
+docker build -f Dockerfile.colibri -t colibri-npu --build-arg BACKEND=npu .
+docker build -f Dockerfile.colibri -t colibri-all --build-arg BACKEND=all .
+```
+
+The `all` variant installs and builds Vulkan, ROCm, and NPU backends together so the runtime scheduler can dispatch across them from the same image. The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
+
 ## What's implemented
 
 - **Faithful GLM-5.2 (`glm_moe_dsa`) forward** — validated token-exact against a `transformers` oracle (teacher-forcing 32/32, greedy 20/20 on a tiny-random model with the real architecture).
