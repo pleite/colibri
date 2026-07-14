@@ -120,6 +120,27 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
 
+    def test_converter_handles_non_finite_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, float('nan'), -0.2, float('inf')], [2, 2], 'F32'),
+                ],
+            )
+            subprocess.run(
+                ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
+                check=True,
+            )
+            header = self.read_header(output_dir / 'model.safetensors')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
 
 if __name__ == '__main__':
     unittest.main()

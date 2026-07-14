@@ -103,18 +103,29 @@ def encode_tensor_payload(dtype, values):
     raise ValueError('unsupported dtype %s' % dtype)
 
 
+def _finite_amax(values):
+    finite_values = [abs(v) for v in values if math.isfinite(v)]
+    return max(finite_values) if finite_values else 0.0
+
+
+def _quantize_value(value, scale, max_value):
+    if not math.isfinite(value):
+        value = 0.0
+    quantized = int(round(value / scale))
+    return max(-max_value, min(max_value, quantized))
+
+
 def quantize_int8(values, out_dim, in_dim):
     scales = []
     packed = bytearray(out_dim * in_dim)
     for row in range(out_dim):
         start = row * in_dim
         row_vals = values[start:start + in_dim]
-        amax = max(abs(v) for v in row_vals) if row_vals else 0.0
+        amax = _finite_amax(row_vals)
         scale = max(amax / 127.0, 1e-8)
         scales.append(scale)
         for col, value in enumerate(row_vals):
-            quantized = int(round(value / scale))
-            quantized = max(-128, min(127, quantized))
+            quantized = _quantize_value(value, scale, 127)
             packed[row * in_dim + col] = quantized & 0xFF
     return bytes(packed), scales
 
@@ -125,12 +136,11 @@ def quantize_int4(values, out_dim, in_dim):
     for row in range(out_dim):
         start = row * in_dim
         row_vals = values[start:start + in_dim]
-        amax = max(abs(v) for v in row_vals) if row_vals else 0.0
+        amax = _finite_amax(row_vals)
         scale = max(amax / 7.0, 1e-8)
         scales.append(scale)
         for col, value in enumerate(row_vals):
-            quantized = int(round(value / scale))
-            quantized = max(-8, min(7, quantized))
+            quantized = _quantize_value(value, scale, 7)
             packed_byte = row * ((in_dim + 1) // 2) + (col // 2)
             if col % 2 == 0:
                 packed[packed_byte] = (quantized + 8) & 0x0F
