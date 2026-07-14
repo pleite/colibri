@@ -359,12 +359,13 @@ def discover_safetensors(input_path):
     raise FileNotFoundError('input path is not a safetensors file or directory')
 
 
-def build_tasks(input_path):
+def build_source_task_groups(input_path):
     files = discover_safetensors(input_path)
-    tasks = []
+    source_groups = []
     for path in files:
         header = read_safetensors_header(path)
         tensor_names = [name for name in header if name != '__metadata__']
+        tasks = []
         for tensor_name in tensor_names:
             meta = header[tensor_name]
             task_id = '%s:%s' % (path.name, tensor_name)
@@ -376,6 +377,19 @@ def build_tasks(input_path):
                 'meta': meta,
                 'index': len(tasks),
             })
+        source_groups.append({
+            'source_path': path,
+            'source_name': path.name,
+            'tasks': tasks,
+        })
+    return files, source_groups
+
+
+def build_tasks(input_path):
+    files, source_groups = build_source_task_groups(input_path)
+    tasks = []
+    for group in source_groups:
+        tasks.extend(group['tasks'])
     return files, tasks
 
 
@@ -433,7 +447,8 @@ def persist_task_result(state_dir, task, output_tensors):
     encoded_tensors = []
     for name, payload, dtype, shape in output_tensors:
         safe_name = sanitize_tensor_name(name)
-        payload_path = payload_dir / ('%s_%s.bin' % (task['task_id'].replace(':', '_'), safe_name))
+        safe_task_id = sanitize_tensor_name(task['task_id'].replace(':', '_'))
+        payload_path = payload_dir / ('%s__%s.bin' % (safe_task_id, safe_name))
         payload_path.write_bytes(payload)
         encoded_tensors.append({
             'name': name,
@@ -467,6 +482,41 @@ def load_state_output_tensors_metadata(state_path, state_dir):
         payload_path = state_dir / 'payloads' / entry['payload_path']
         tensors.append((entry['name'], payload_path, entry['dtype'], entry['shape']))
     return tensors
+
+
+def load_completed_task_tensors(task, completed_entry, state_dir, out_file):
+    expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
+    if completed_entry['kind'] == 'state':
+        state_path = completed_entry['state_path']
+        if state_path.exists():
+            try:
+                return load_state_output_tensors_metadata(state_path, state_dir)
+            except (FileNotFoundError, OSError):
+                pass
+        if out_file.exists():
+            existing = read_existing_output_payloads(out_file, expected)
+            if all(name in existing for name in expected):
+                return [existing[name] for name in expected]
+        raise ValueError('state artifacts are missing for %s' % task['task_id'])
+    existing = read_existing_output_payloads(out_file, expected)
+    if all(name in existing for name in expected):
+        return [existing[name] for name in expected]
+    raise ValueError('missing completed output for %s' % task['task_id'])
+
+
+def cleanup_task_state_artifacts(state_dir, task_id):
+    state_path = state_dir / get_state_file_name(task_id)
+    if not state_path.exists():
+        return
+    try:
+        payload = json.loads(state_path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        payload = {}
+    for entry in payload.get('output_tensors', []):
+        payload_path = state_dir / 'payloads' / entry['payload_path']
+        if payload_path.exists():
+            payload_path.unlink()
+    state_path.unlink(missing_ok=True)
 
 
 def convert_task(task, logger=None):
@@ -509,38 +559,35 @@ def write_final_output(out_file, tasks, completed, state_dir):
     for task in tasks:
         task_entry = completed.get(task['task_id'])
         if not task_entry:
-            raise ValueError('missing completed output for %s' % task['task_id'])
+            continue
         expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
         expected_tensor_names.extend(expected)
-        if task_entry['kind'] == 'state':
-            task_tensors = load_state_output_tensors_metadata(task_entry['state_path'], state_dir)
-            payload_entries = []
-            for name, payload_path, dtype, shape in task_tensors:
-                payload_size = payload_path.stat().st_size
+        task_tensors = load_completed_task_tensors(task, task_entry, state_dir, out_file)
+        payload_entries = []
+        for name, payload_source, dtype, shape in task_tensors:
+            if isinstance(payload_source, bytes):
+                payload_size = len(payload_source)
                 validate_payload_length(dtype, payload_size, shape, quant_kind=should_quantize(name), tensor_name=name)
-                payload_entries.append((name, payload_path, dtype, shape, payload_size))
+                payload_entries.append((name, payload_source, dtype, shape, payload_size))
                 header[name] = {
                     'dtype': dtype,
                     'shape': list(shape),
                     'data_offsets': [data_offset, data_offset + payload_size],
                 }
                 data_offset += payload_size
-        else:
-            task_tensors = [
-                read_existing_output_payloads(out_file, task_entry['tensor_names'])[name]
-                for name in task_entry['tensor_names']
-            ]
-            payload_entries = []
-            for name, payload, dtype, shape in task_tensors:
-                validate_payload_length(dtype, len(payload), shape, quant_kind=should_quantize(name), tensor_name=name)
-                payload_entries.append((name, payload, dtype, shape, len(payload)))
+            else:
+                payload_size = payload_source.stat().st_size
+                validate_payload_length(dtype, payload_size, shape, quant_kind=should_quantize(name), tensor_name=name)
+                payload_entries.append((name, payload_source, dtype, shape, payload_size))
                 header[name] = {
                     'dtype': dtype,
                     'shape': list(shape),
-                    'data_offsets': [data_offset, data_offset + len(payload)],
+                    'data_offsets': [data_offset, data_offset + payload_size],
                 }
-                data_offset += len(payload)
+                data_offset += payload_size
         task_payloads.append(payload_entries)
+    if not header:
+        return []
     if len(header) != len(expected_tensor_names):
         raise ValueError('expected %d tensor entry(s) in output but found %d' % (len(expected_tensor_names), len(header)))
     header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
@@ -549,16 +596,14 @@ def write_final_output(out_file, tasks, completed, state_dir):
         fh.write(len(header_bytes).to_bytes(8, 'little'))
         fh.write(header_bytes)
         for payload_entries in task_payloads:
-            for entry in payload_entries:
-                _, payload_source, _, _, _ = entry
+            for _, payload_source, _, _, _ in payload_entries:
                 if isinstance(payload_source, bytes):
                     fh.write(payload_source)
                 else:
                     with open(payload_source, 'rb') as payload_fh:
                         shutil.copyfileobj(payload_fh, fh, length=1024 * 1024)
     os.replace(tmp_path, out_file)
-    write_completion_marker(state_dir, out_file, sorted(header.keys()))
-    cleanup_state_artifacts(state_dir)
+    return sorted(header.keys())
 
 
 def resolve_state_dir(output_path, requested_state_dir=None):
@@ -624,7 +669,19 @@ def main():
                     shutil.copy2(src, output_path / name)
                     logger.info('copied %s', src.name)
 
-        files, tasks = build_tasks(input_path)
+        try:
+            files, source_groups = build_source_task_groups(input_path)
+        except FileNotFoundError:
+            if out_file.exists():
+                try:
+                    header = read_safetensors_header(out_file)
+                except (FileNotFoundError, ValueError, json.JSONDecodeError):
+                    header = {}
+                if header:
+                    logger.info('input files are missing but output already exists; skipping conversion')
+                    return 0
+            raise
+        tasks = [task for group in source_groups for task in group['tasks']]
         logger.info('discovered %d safetensors file(s) and %d tensor task(s)', len(files), len(tasks))
 
         state_dir = resolve_state_dir(output_path, args.state_dir)
@@ -633,35 +690,50 @@ def main():
         completed = load_resumed_outputs(state_dir, out_file, tasks)
         logger.info('resumed %d existing tensor task(s)', len(completed))
 
-        pending_tasks = [task for task in tasks if task['task_id'] not in completed]
-        if pending_tasks:
-            workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
-            workers = max(1, workers)
-            logger.info('using %d worker(s) for streaming conversion', workers)
-            max_pending = max(1, workers * 2)
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = {}
-                for task in pending_tasks:
-                    futures[executor.submit(convert_task, task, logger=None)] = task
-                    if len(futures) >= max_pending:
+        workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
+        workers = max(1, workers)
+        logger.info('using %d worker(s) for streaming conversion', workers)
+        max_pending = max(1, workers * 2)
+        for source_group in source_groups:
+            source_tasks = source_group['tasks']
+            if not source_tasks:
+                continue
+            pending_tasks = [task for task in source_tasks if task['task_id'] not in completed]
+            if pending_tasks:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = {}
+                    for task in pending_tasks:
+                        # Worker processes do not inherit the parent logger configuration, so
+                        # conversion work stays fully self-contained here.
+                        futures[executor.submit(convert_task, task, logger=None)] = task
+                        if len(futures) >= max_pending:
+                            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                            completed_future = next(iter(done))
+                            task_result = futures.pop(completed_future)
+                            output_tensors = completed_future.result()
+                            handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
+                    while futures:
                         done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                         completed_future = next(iter(done))
                         task_result = futures.pop(completed_future)
                         output_tensors = completed_future.result()
                         handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
-                while futures:
-                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                    completed_future = next(iter(done))
-                    task_result = futures.pop(completed_future)
-                    output_tensors = completed_future.result()
-                    handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
+            write_final_output(out_file, tasks, completed, state_dir)
+            for task in source_tasks:
+                cleanup_task_state_artifacts(state_dir, task['task_id'])
+            source_path = source_group['source_path']
+            if source_path.exists():
+                source_path.unlink()
+                logger.info('removed source file %s', source_path)
         if not completed:
             raise RuntimeError('no tensors were converted')
         if len(completed) != len(tasks):
             missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
             raise RuntimeError('failed to complete %d task(s): %s' % (len(missing), ', '.join(missing)))
 
-        write_final_output(out_file, tasks, completed, state_dir)
+        tensor_names = write_final_output(out_file, tasks, completed, state_dir)
+        write_completion_marker(state_dir, out_file, tensor_names)
+        cleanup_state_artifacts(state_dir)
         logger.info('wrote %s', out_file)
         return 0
     except Exception:

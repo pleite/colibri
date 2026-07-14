@@ -74,7 +74,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             return json.loads(fh.read(header_len).decode('utf-8'))
 
     def converter_script(self):
-        return Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'
+        return Path(__file__).resolve().parent.parent / 'tools' / 'convert_qwen35_safetensors.py'
 
     def run_converter(self, input_dir, output_dir, extra_args=None):
         command = [sys.executable, str(self.converter_script()), '--input', str(input_dir), '--output', str(output_dir)]
@@ -204,6 +204,32 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
+    def test_converter_deletes_each_source_shard_after_it_is_written(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            self.write_safetensors(
+                input_dir / 'model2.safetensors',
+                [
+                    ('model.layers.0.mlp.experts.0.gate_proj.weight', [0.5, -0.6, 0.7, -0.8], [2, 2], 'F32'),
+                ],
+            )
+            self.run_converter(input_dir, output_dir)
+            self.assertFalse((input_dir / 'model.safetensors').exists())
+            self.assertFalse((input_dir / 'model2.safetensors').exists())
+            header = self.read_header(output_dir / 'model.safetensors')
+            self.assertIn('model.layers.0.self_attn.q_proj.weight', header)
+            self.assertIn('model.layers.0.mlp.experts.0.gate_proj.weight', header)
 
     def test_converter_migrates_legacy_state_dir_to_state_format(self):
         with tempfile.TemporaryDirectory() as tmpdir:
