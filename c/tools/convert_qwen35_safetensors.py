@@ -8,6 +8,8 @@ layout expected by c/qwen35_moe.c:
   - F32 tensors are copied through unchanged
 """
 import argparse
+import base64
+import concurrent.futures
 import json
 import logging
 import math
@@ -15,7 +17,6 @@ import os
 import shutil
 import struct
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -197,7 +198,14 @@ def render_progress(current, total, label):
         sys.stderr.write('\n')
 
 
-def convert_tensor_payload(tensor_name, meta, payload, logger):
+def expected_output_names(tensor_name, shape):
+    quant_kind = should_quantize(tensor_name)
+    if len(shape) == 2 and quant_kind:
+        return [tensor_name, tensor_name + '.qs']
+    return [tensor_name]
+
+
+def convert_tensor_payload(tensor_name, meta, payload, logger=None):
     shape = list(meta['shape'])
     dtype = meta['dtype']
     values = decode_tensor_payload(dtype, payload, shape, logger=logger)
@@ -206,40 +214,40 @@ def convert_tensor_payload(tensor_name, meta, payload, logger):
         out_dim, in_dim = shape
         if quant_kind == 'int8':
             packed, scales = quantize_int8(values, out_dim, in_dim)
-            logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
+            if logger is not None:
+                logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
             return [
                 (tensor_name, packed, 'U8', shape),
                 (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
             ]
         packed, scales = quantize_int4(values, out_dim, in_dim)
-        logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
+        if logger is not None:
+            logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
         return [
             (tensor_name, packed, 'U8', shape),
             (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
         ]
-    logger.info('copied %s as F32 (shape=%s)', tensor_name, shape)
+    if logger is not None:
+        logger.info('copied %s as F32 (shape=%s)', tensor_name, shape)
     return [(tensor_name, encode_tensor_payload('F32', values), 'F32', shape)]
 
 
-def convert_safetensors(path, out_path, logger):
-    header, data = read_safetensors_file(path)
-    output_tensors = []
-    tensor_names = [name for name in header if name != '__metadata__']
-    logger.info('processing safetensors file %s (%d tensors)', path.name, len(tensor_names))
-    for index, tensor_name in enumerate(tensor_names, 1):
-        meta = header[tensor_name]
-        shape = meta['shape']
-        dtype = meta['dtype']
-        offsets = meta['data_offsets']
-        raw_payload = data[offsets[0]:offsets[1]]
-        logger.info('processing tensor %d/%d %s (dtype=%s shape=%s)', index, len(tensor_names), tensor_name, dtype, shape)
-        output_tensors.extend(convert_tensor_payload(tensor_name, meta, raw_payload, logger))
-        render_progress(index, len(tensor_names), 'converting %s' % path.name)
-    write_safetensors_file(out_path, output_tensors)
-    logger.info('wrote %s', out_path)
+def encode_output_tensors(output_tensors):
+    return [{
+        'name': name,
+        'payload': base64.b64encode(payload).decode('ascii'),
+        'dtype': dtype,
+        'shape': list(shape),
+    } for name, payload, dtype, shape in output_tensors]
+
+
+def decode_output_tensors(payloads):
+    return [(entry['name'], base64.b64decode(entry['payload']), entry['dtype'], entry['shape']) for entry in payloads]
 
 
 def write_safetensors_file(path, tensors):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + '.tmp')
     header = {}
     data_offset = 0
     for name, payload, dtype, shape in tensors:
@@ -250,11 +258,12 @@ def write_safetensors_file(path, tensors):
         }
         data_offset += len(payload)
     header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
-    with open(path, 'wb') as fh:
+    with open(tmp_path, 'wb') as fh:
         fh.write(len(header_bytes).to_bytes(8, 'little'))
         fh.write(header_bytes)
         for _, payload, _, _ in tensors:
             fh.write(payload)
+    os.replace(tmp_path, path)
 
 
 def discover_safetensors(input_path):
@@ -268,16 +277,106 @@ def discover_safetensors(input_path):
     raise FileNotFoundError('input path is not a safetensors file or directory')
 
 
+def build_tasks(input_path):
+    files = discover_safetensors(input_path)
+    tasks = []
+    for path in files:
+        header, data = read_safetensors_file(path)
+        tensor_names = [name for name in header if name != '__metadata__']
+        for tensor_name in tensor_names:
+            meta = header[tensor_name]
+            offsets = meta['data_offsets']
+            payload = data[offsets[0]:offsets[1]]
+            task_id = '%s:%s' % (path.name, tensor_name)
+            tasks.append({
+                'task_id': task_id,
+                'source_name': path.name,
+                'tensor_name': tensor_name,
+                'meta': meta,
+                'payload': payload,
+                'index': len(tasks),
+            })
+    return files, tasks
+
+
+def read_existing_output_payloads(path):
+    if not path.exists():
+        return {}
+    header, data = read_safetensors_file(path)
+    entries = {}
+    for tensor_name, meta in header.items():
+        if tensor_name == '__metadata__':
+            continue
+        offsets = meta['data_offsets']
+        payload = data[offsets[0]:offsets[1]]
+        entries[tensor_name] = (tensor_name, payload, meta['dtype'], list(meta['shape']))
+    return entries
+
+
+def load_resumed_outputs(state_dir, out_file, tasks):
+    completed = {}
+    if state_dir.exists():
+        for state_path in sorted(state_dir.glob('*.json')):
+            try:
+                payload = json.loads(state_path.read_text(encoding='utf-8'))
+            except (json.JSONDecodeError, OSError):
+                continue
+            task_id = payload.get('task_id')
+            if not task_id:
+                continue
+            if task_id not in {task['task_id'] for task in tasks}:
+                continue
+            completed[task_id] = decode_output_tensors(payload.get('output_tensors', []))
+    existing = read_existing_output_payloads(out_file)
+    for task in tasks:
+        expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
+        if task['task_id'] in completed:
+            continue
+        if all(name in existing for name in expected):
+            completed[task['task_id']] = [existing[name] for name in expected]
+    return completed
+
+
+def persist_task_result(state_dir, task, output_tensors):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / ('%s.json' % task['task_id'].replace(os.sep, '_'))
+    payload = {
+        'task_id': task['task_id'],
+        'source_name': task['source_name'],
+        'tensor_name': task['tensor_name'],
+        'output_tensors': encode_output_tensors(output_tensors),
+    }
+    state_path.write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')
+
+
+def convert_task(task, logger=None):
+    output_tensors = convert_tensor_payload(task['tensor_name'], task['meta'], task['payload'], logger=logger)
+    return output_tensors
+
+
+def write_final_output(out_file, tasks, completed):
+    output_tensors = []
+    for task in tasks:
+        task_entries = completed.get(task['task_id'])
+        if not task_entries:
+            raise ValueError('missing completed output for %s' % task['task_id'])
+        output_tensors.extend(task_entries)
+    write_safetensors_file(out_file, output_tensors)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert standard safetensors to the qwen35_moe quantized layout')
     parser.add_argument('--input', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--log-file', default=None, help='optional path for the conversion log file')
+    parser.add_argument('--workers', type=int, default=None, help='number of worker processes; defaults to all CPU cores')
+    parser.add_argument('--state-dir', default=None, help='directory for per-tensor resume checkpoints')
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
     output_path = Path(args.output).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    out_file = output_path / 'model.safetensors'
     logger, log_path = setup_logger(output_path, args.log_file)
     logger.info('converter starting: input=%s output=%s', input_path, output_path)
     logger.info('log file: %s', log_path)
@@ -295,30 +394,37 @@ def main():
                 shutil.copy2(src, output_path / name)
                 logger.info('copied %s', src.name)
 
-    files = discover_safetensors(input_path)
-    logger.info('discovered %d safetensors file(s)', len(files))
-    if len(files) == 1:
-        out_file = output_path / 'model.safetensors'
-        convert_safetensors(files[0], out_file, logger)
-        return 0
+    files, tasks = build_tasks(input_path)
+    logger.info('discovered %d safetensors file(s) and %d tensor task(s)', len(files), len(tasks))
 
-    merged_tensors = []
-    for index, path in enumerate(files, 1):
-        logger.info('processing shard %d/%d %s', index, len(files), path.name)
-        header, data = read_safetensors_file(path)
-        tensor_names = [name for name in header if name != '__metadata__']
-        for tensor_index, tensor_name in enumerate(tensor_names, 1):
-            meta = header[tensor_name]
-            shape = meta['shape']
-            dtype = meta['dtype']
-            offsets = meta['data_offsets']
-            raw_payload = data[offsets[0]:offsets[1]]
-            logger.info('processing tensor %d/%d %s (dtype=%s shape=%s)', tensor_index, len(tensor_names), tensor_name, dtype, shape)
-            merged_tensors.extend(convert_tensor_payload(tensor_name, meta, raw_payload, logger))
-            render_progress(tensor_index, len(tensor_names), 'converting %s' % path.name)
-        render_progress(index, len(files), 'shards')
-    write_safetensors_file(output_path / 'model.safetensors', merged_tensors)
-    logger.info('wrote merged safetensors %s', output_path / 'model.safetensors')
+    state_dir = Path(args.state_dir).expanduser().resolve() if args.state_dir else output_path / '.conversion_state'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    completed = load_resumed_outputs(state_dir, out_file, tasks)
+    logger.info('resumed %d existing tensor task(s)', len(completed))
+
+    pending_tasks = [task for task in tasks if task['task_id'] not in completed]
+    if pending_tasks:
+        workers = max(1, args.workers if args.workers is not None else (os.cpu_count() or 1))
+        logger.info('using %d worker(s) for parallel conversion', workers)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(convert_task, task): task for task in pending_tasks}
+            for future in concurrent.futures.as_completed(future_map):
+                task = future_map[future]
+                output_tensors = future.result()
+                completed[task['task_id']] = output_tensors
+                persist_task_result(state_dir, task, output_tensors)
+                for entry in output_tensors:
+                    if len(output_tensors) > 1:
+                        logger.info('wrote %s', entry[0])
+                render_progress(len(completed), len(tasks), 'converting %s' % task['source_name'])
+    if not completed:
+        raise RuntimeError('no tensors were converted')
+    if len(completed) != len(tasks):
+        missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
+        raise RuntimeError('failed to complete tasks: %s' % ', '.join(missing))
+
+    write_final_output(out_file, tasks, completed)
+    logger.info('wrote %s', out_file)
     return 0
 
 
