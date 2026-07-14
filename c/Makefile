@@ -89,13 +89,13 @@ BACKEND_OBJ  += backend_cuda.o
 endif
 
 # ROCM=1 builds the ROCm/HIP backend instead of CUDA.
-# Requires ROCm ≥ 6.0 with hipcc at /opt/rocm/bin/hipcc (override via ROCM_HOME).
+# Requires ROCm ≥ 6.0 with hipcc at /opt/rocm/llvm/bin/hipcc (override via HIPCC).
 # Targets AMD GPUs and AMD APUs (Strix Halo, Radeon 890M) with unified memory.
 # The ROCm backend exports the same coli_cuda_* API as the CUDA backend, so
 # glm.c is compiled with -DCOLI_CUDA -DCOLI_ROCM and uses the same code paths.
 ROCM      ?= 0
 ROCM_HOME ?= /opt/rocm
-HIPCC     ?= $(or $(shell command -v hipcc 2>/dev/null),$(ROCM_HOME)/bin/hipcc)
+HIPCC     ?= $(ROCM_HOME)/llvm/bin/hipcc
 ROCM_ARCH ?= native
 HIPCCFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 ROCM_BACKEND_CFLAGS =

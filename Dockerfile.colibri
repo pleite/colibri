@@ -4,21 +4,40 @@ FROM registry.fedoraproject.org/fedora:43 AS build
 
 ARG BACKEND=vulkan
 
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    HIP_CLANG_PATH=/opt/rocm/llvm/bin \
+    HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
+    PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
     gcc gcc-c++ make git python3 python3-pip python3-devel ca-certificates \
     dnf-plugins-core \
     && case "$BACKEND" in \
+        rocm|all) printf '%s\n' \
+            '[rocm]' \
+            'name=ROCm 7.2.4' \
+            'baseurl=https://repo.radeon.com/rocm/rhel10/7.2.4/main' \
+            'enabled=1' \
+            'priority=50' \
+            'gpgcheck=1' \
+            'gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key' \
+            > /etc/yum.repos.d/rocm.repo ;; \
+    esac \
+    && case "$BACKEND" in \
         vulkan) dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
         rocm) dnf -y --nodocs --setopt=install_weak_deps=False install \
-            rocm rocm-hip-devel hipcc vulkan-headers ;; \
+            rocm-llvm hip-runtime-amd hip-devel rocblas rocblas-devel \
+            hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers ;; \
         npu) dnf copr enable -y xanderlent/amd-npu-driver \
             && dnf -y --nodocs --setopt=install_weak_deps=False install \
             xrt vulkan-headers ;; \
         all) dnf copr enable -y xanderlent/amd-npu-driver \
             && dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
-            rocm rocm-hip-devel hipcc vulkan-headers \
+            rocm-llvm hip-runtime-amd hip-devel rocblas rocblas-devel \
+            hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers \
             xrt ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
     esac \
