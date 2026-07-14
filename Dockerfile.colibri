@@ -28,7 +28,7 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
         vulkan) dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
         rocm) dnf -y --nodocs --setopt=install_weak_deps=False install \
-            rocm-llvm hip-runtime-amd hip-devel rocblas rocblas-devel \
+            rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
             hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers ;; \
         npu) dnf copr enable -y xanderlent/amd-npu-driver \
             && dnf -y --nodocs --setopt=install_weak_deps=False install \
@@ -36,7 +36,7 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
         all) dnf copr enable -y xanderlent/amd-npu-driver \
             && dnf -y --nodocs --setopt=install_weak_deps=False install \
             vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
-            rocm-llvm hip-runtime-amd hip-devel rocblas rocblas-devel \
+            rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
             hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers \
             xrt ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
