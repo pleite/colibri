@@ -69,6 +69,12 @@ class Qwen35QuantConverterTest(unittest.TestCase):
         with open(path, 'rb') as fh:
             header_len = int.from_bytes(fh.read(8), 'little')
             return json.loads(fh.read(header_len).decode('utf-8'))
+ 
+    def run_converter(self, input_dir, output_dir, extra_args=None):
+        command = ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)]
+        if extra_args:
+            command.extend(extra_args)
+        subprocess.run(command, check=True)
 
     def test_converter_emits_quantized_tensors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -84,10 +90,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
                     ('model.layers.0.mlp.experts.0.gate_proj.weight', [0.25, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0], [2, 4], 'F32'),
                 ],
             )
-            subprocess.run(
-                ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
-                check=True,
-            )
+            self.run_converter(input_dir, output_dir)
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['shape'], [2, 4])
@@ -112,10 +115,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
                     ('model.layers.0.self_attn.q_proj.weight', payload, [2, 2], 'F8_E4M3'),
                 ],
             )
-            subprocess.run(
-                ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
-                check=True,
-            )
+            self.run_converter(input_dir, output_dir)
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
@@ -133,13 +133,49 @@ class Qwen35QuantConverterTest(unittest.TestCase):
                     ('model.layers.0.self_attn.q_proj.weight', [0.1, float('nan'), -0.2, float('inf')], [2, 2], 'F32'),
                 ],
             )
-            subprocess.run(
-                ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
-                check=True,
-            )
+            self.run_converter(input_dir, output_dir)
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
+    def test_converter_resumes_from_existing_output_without_state_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            state_dir = output_dir / '.state'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            self.run_converter(input_dir, output_dir, ['--state-dir', str(state_dir)])
+            shutil.rmtree(state_dir)
+            self.run_converter(input_dir, output_dir, ['--state-dir', str(state_dir)])
+            header = self.read_header(output_dir / 'model.safetensors')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
+            self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
+    def test_converter_logs_failures_to_log_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'missing-input'
+            output_dir = tmpdir / 'output'
+            output_dir.mkdir()
+            result = subprocess.run(
+                ['python3', str(Path(__file__).resolve().parents[1] / 'tools' / 'convert_qwen35_safetensors.py'), '--input', str(input_dir), '--output', str(output_dir)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            log_files = list(output_dir.glob('convert_qwen35_safetensors-*.log'))
+            self.assertTrue(log_files)
+            log_text = log_files[0].read_text(encoding='utf-8')
+            self.assertIn('conversion failed', log_text)
+            self.assertIn('FileNotFoundError', log_text)
 
 
 if __name__ == '__main__':

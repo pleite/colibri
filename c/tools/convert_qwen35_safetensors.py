@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+INT8_MAX_VALUE = 127
+INT4_MAX_VALUE = 7
+
+
 def read_safetensors_file(path):
     with open(path, 'rb') as fh:
         header_len = int.from_bytes(fh.read(8), 'little')
@@ -108,16 +112,15 @@ def _finite_amax(values):
     return max(finite_values) if finite_values else 0.0
 
 
-def _quantize_value(value, scale, max_value):
-    if not math.isfinite(value):
-        value = 0.0
+def _quantize_value(value, scale, min_value, max_value):
     quantized = int(round(value / scale))
-    return max(-max_value, min(max_value, quantized))
+    return max(min_value, min(max_value, quantized))
 
 
-def quantize_int8(values, out_dim, in_dim):
+def quantize_int8(values, out_dim, in_dim, logger=None, tensor_name=None):
     scales = []
     packed = bytearray(out_dim * in_dim)
+    non_finite_count = 0
     for row in range(out_dim):
         start = row * in_dim
         row_vals = values[start:start + in_dim]
@@ -125,14 +128,20 @@ def quantize_int8(values, out_dim, in_dim):
         scale = max(amax / 127.0, 1e-8)
         scales.append(scale)
         for col, value in enumerate(row_vals):
-            quantized = _quantize_value(value, scale, 127)
+            if not math.isfinite(value):
+                non_finite_count += 1
+                value = 0.0
+            quantized = _quantize_value(value, scale, -128, 127)
             packed[row * in_dim + col] = quantized & 0xFF
+    if logger is not None and non_finite_count:
+        logger.warning('substituted %d non-finite value(s) in %s with 0.0', non_finite_count, tensor_name or 'tensor')
     return bytes(packed), scales
 
 
-def quantize_int4(values, out_dim, in_dim):
+def quantize_int4(values, out_dim, in_dim, logger=None, tensor_name=None):
     scales = []
     packed = bytearray(out_dim * ((in_dim + 1) // 2))
+    non_finite_count = 0
     for row in range(out_dim):
         start = row * in_dim
         row_vals = values[start:start + in_dim]
@@ -140,12 +149,17 @@ def quantize_int4(values, out_dim, in_dim):
         scale = max(amax / 7.0, 1e-8)
         scales.append(scale)
         for col, value in enumerate(row_vals):
-            quantized = _quantize_value(value, scale, 7)
+            if not math.isfinite(value):
+                non_finite_count += 1
+                value = 0.0
+            quantized = _quantize_value(value, scale, -8, 7)
             packed_byte = row * ((in_dim + 1) // 2) + (col // 2)
             if col % 2 == 0:
                 packed[packed_byte] = (quantized + 8) & 0x0F
             else:
                 packed[packed_byte] |= ((quantized + 8) & 0x0F) << 4
+    if logger is not None and non_finite_count:
+        logger.warning('substituted %d non-finite value(s) in %s with 0.0', non_finite_count, tensor_name or 'tensor')
     return bytes(packed), scales
 
 
@@ -216,21 +230,21 @@ def expected_output_names(tensor_name, shape):
 
 
 def convert_tensor_payload(tensor_name, meta, payload, logger=None):
-    shape = list(meta['shape'])
+    shape = meta['shape']
     dtype = meta['dtype']
     values = decode_tensor_payload(dtype, payload, shape, logger=logger)
     quant_kind = should_quantize(tensor_name)
     if len(shape) == 2 and quant_kind:
         out_dim, in_dim = shape
         if quant_kind == 'int8':
-            packed, scales = quantize_int8(values, out_dim, in_dim)
+            packed, scales = quantize_int8(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
             if logger is not None:
                 logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
             return [
                 (tensor_name, packed, 'U8', shape),
                 (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
             ]
-        packed, scales = quantize_int4(values, out_dim, in_dim)
+        packed, scales = quantize_int4(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
         if logger is not None:
             logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
         return [
@@ -349,7 +363,7 @@ def load_resumed_outputs(state_dir, out_file, tasks):
 
 def persist_task_result(state_dir, task, output_tensors):
     state_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / ('%s.json' % task['task_id'].replace(os.sep, '_'))
+    state_path = state_dir / ('%s.json' % task['task_id'])
     payload = {
         'task_id': task['task_id'],
         'source_name': task['source_name'],
@@ -390,52 +404,71 @@ def main():
     logger, log_path = setup_logger(output_path, args.log_file)
     logger.info('converter starting: input=%s output=%s', input_path, output_path)
     logger.info('log file: %s', log_path)
-    if input_path.is_dir():
-        for name in ['config.json', 'tokenizer.json']:
-            src = input_path / name
-            if src.exists():
-                shutil.copy2(src, output_path / name)
-                logger.info('copied %s', src.name)
-    else:
-        parent = input_path.parent
-        for name in ['config.json', 'tokenizer.json']:
-            src = parent / name
-            if src.exists():
-                shutil.copy2(src, output_path / name)
-                logger.info('copied %s', src.name)
+    try:
+        if input_path.is_dir():
+            for name in ['config.json', 'tokenizer.json']:
+                src = input_path / name
+                if src.exists():
+                    shutil.copy2(src, output_path / name)
+                    logger.info('copied %s', src.name)
+        else:
+            parent = input_path.parent
+            for name in ['config.json', 'tokenizer.json']:
+                src = parent / name
+                if src.exists():
+                    shutil.copy2(src, output_path / name)
+                    logger.info('copied %s', src.name)
 
-    files, tasks = build_tasks(input_path)
-    logger.info('discovered %d safetensors file(s) and %d tensor task(s)', len(files), len(tasks))
+        files, tasks = build_tasks(input_path)
+        logger.info('discovered %d safetensors file(s) and %d tensor task(s)', len(files), len(tasks))
 
-    state_dir = Path(args.state_dir).expanduser().resolve() if args.state_dir else output_path / '.conversion_state'
-    state_dir.mkdir(parents=True, exist_ok=True)
-    completed = load_resumed_outputs(state_dir, out_file, tasks)
-    logger.info('resumed %d existing tensor task(s)', len(completed))
+        state_dir = Path(args.state_dir).expanduser().resolve() if args.state_dir else output_path / '.conversion_state'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        completed = load_resumed_outputs(state_dir, out_file, tasks)
+        logger.info('resumed %d existing tensor task(s)', len(completed))
 
-    pending_tasks = [task for task in tasks if task['task_id'] not in completed]
-    if pending_tasks:
-        workers = max(1, args.workers if args.workers is not None else (os.cpu_count() or 1))
-        logger.info('using %d worker(s) for parallel conversion', workers)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            future_map = {executor.submit(convert_task, task): task for task in pending_tasks}
-            for future in concurrent.futures.as_completed(future_map):
-                task = future_map[future]
-                output_tensors = future.result()
-                completed[task['task_id']] = output_tensors
-                persist_task_result(state_dir, task, output_tensors)
-                for entry in output_tensors:
-                    if len(output_tensors) > 1:
+        pending_tasks = [task for task in tasks if task['task_id'] not in completed]
+        if pending_tasks:
+            workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
+            workers = max(1, workers)
+            logger.info('using %d worker(s) for parallel conversion', workers)
+            max_pending = max(1, workers * 2)
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {}
+                for task in pending_tasks:
+                    futures[executor.submit(convert_task, task)] = task
+                    if len(futures) >= max_pending:
+                        done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                        completed_future = next(iter(done))
+                        task_result = futures.pop(completed_future)
+                        output_tensors = completed_future.result()
+                        completed[task_result['task_id']] = output_tensors
+                        persist_task_result(state_dir, task_result, output_tensors)
+                        for entry in output_tensors:
+                            logger.info('wrote %s', entry[0])
+                        render_progress(len(completed), len(tasks), 'converting %s' % task_result['source_name'])
+                while futures:
+                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                    completed_future = next(iter(done))
+                    task_result = futures.pop(completed_future)
+                    output_tensors = completed_future.result()
+                    completed[task_result['task_id']] = output_tensors
+                    persist_task_result(state_dir, task_result, output_tensors)
+                    for entry in output_tensors:
                         logger.info('wrote %s', entry[0])
-                render_progress(len(completed), len(tasks), 'converting %s' % task['source_name'])
-    if not completed:
-        raise RuntimeError('no tensors were converted')
-    if len(completed) != len(tasks):
-        missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
-        raise RuntimeError('failed to complete tasks: %s' % ', '.join(missing))
+                    render_progress(len(completed), len(tasks), 'converting %s' % task_result['source_name'])
+        if not completed:
+            raise RuntimeError('no tensors were converted')
+        if len(completed) != len(tasks):
+            missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
+            raise RuntimeError('failed to complete tasks: %s' % ', '.join(missing))
 
-    write_final_output(out_file, tasks, completed)
-    logger.info('wrote %s', out_file)
-    return 0
+        write_final_output(out_file, tasks, completed)
+        logger.info('wrote %s', out_file)
+        return 0
+    except Exception:
+        logger.exception('conversion failed')
+        return 1
 
 
 if __name__ == '__main__':
