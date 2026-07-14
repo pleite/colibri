@@ -9,11 +9,14 @@ layout expected by c/qwen35_moe.c:
 """
 import argparse
 import json
+import logging
 import math
 import os
 import shutil
 import struct
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -26,7 +29,36 @@ def read_safetensors_file(path):
     return header, data
 
 
-def decode_tensor_payload(dtype, payload, shape):
+def decode_fp8_payload(payload, dtype):
+    values = []
+    dtype_name = dtype.lower()
+    if 'e4m3' in dtype_name:
+        mantissa_bits = 3
+        exponent_bias = 7
+    elif 'e5m2' in dtype_name:
+        mantissa_bits = 2
+        exponent_bias = 15
+    else:
+        raise ValueError('unsupported fp8 dtype %s' % dtype)
+    exponent_bits = 8 - mantissa_bits - 1
+    max_exponent = (1 << exponent_bits) - 1
+    for byte in payload:
+        sign = -1.0 if (byte & 0x80) else 1.0
+        exponent = (byte >> mantissa_bits) & max_exponent
+        mantissa = byte & ((1 << mantissa_bits) - 1)
+        if exponent == 0:
+            if mantissa == 0:
+                values.append(0.0)
+            else:
+                values.append(sign * (2 ** (1 - exponent_bias)) * (mantissa / (2 ** mantissa_bits)))
+        elif exponent == max_exponent:
+            values.append(math.copysign(float('inf'), sign) if mantissa == 0 else float('nan'))
+        else:
+            values.append(sign * (2 ** (exponent - exponent_bias)) * (1.0 + mantissa / (2 ** mantissa_bits)))
+    return values
+
+
+def decode_tensor_payload(dtype, payload, shape, logger=None):
     if dtype == 'F32':
         if not shape:
             return []
@@ -55,6 +87,11 @@ def decode_tensor_payload(dtype, payload, shape):
             h = struct.unpack_from('<H', payload, i)[0]
             u = (h << 16) & 0xFFFFFFFF
             values.append(struct.unpack('<f', struct.pack('<I', u))[0])
+        return values
+    if 'e4m3' in dtype.lower() or 'e5m2' in dtype.lower():
+        values = decode_fp8_payload(payload, dtype)
+        if logger is not None:
+            logger.info('decoded %s tensor as fp8 (%d values)', dtype, len(values))
         return values
     raise ValueError('unsupported dtype %s' % dtype)
 
@@ -119,35 +156,87 @@ def should_quantize(name):
     return None
 
 
-def convert_safetensors(path, out_path):
+def setup_logger(output_path, log_path=None):
+    logger = logging.getLogger('c.tools.convert_qwen35_safetensors')
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if log_path is None:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        log_path = output_path / ('convert_qwen35_safetensors-%s.log' % timestamp)
+    else:
+        log_path = Path(log_path).expanduser()
+        if not log_path.is_absolute():
+            log_path = output_path / log_path
+    if logger.handlers:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(logging.Formatter('%(levelname)s %(message)s'))
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger, log_path
+
+
+def render_progress(current, total, label):
+    if total <= 0:
+        return
+    if not sys.stderr.isatty():
+        if current == total:
+            sys.stderr.write('%s: %d/%d\n' % (label, current, total))
+        return
+    width = 24
+    filled = int(width * current / total)
+    bar = '#' * filled + '-' * (width - filled)
+    percent = int(100 * current / total)
+    sys.stderr.write('\r%s [%s] %d/%d (%d%%)' % (label, bar, current, total, percent))
+    sys.stderr.flush()
+    if current >= total:
+        sys.stderr.write('\n')
+
+
+def convert_tensor_payload(tensor_name, meta, payload, logger):
+    shape = list(meta['shape'])
+    dtype = meta['dtype']
+    values = decode_tensor_payload(dtype, payload, shape, logger=logger)
+    quant_kind = should_quantize(tensor_name)
+    if len(shape) == 2 and quant_kind:
+        out_dim, in_dim = shape
+        if quant_kind == 'int8':
+            packed, scales = quantize_int8(values, out_dim, in_dim)
+            logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
+            return [
+                (tensor_name, packed, 'U8', shape),
+                (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
+            ]
+        packed, scales = quantize_int4(values, out_dim, in_dim)
+        logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
+        return [
+            (tensor_name, packed, 'U8', shape),
+            (tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]),
+        ]
+    logger.info('copied %s as F32 (shape=%s)', tensor_name, shape)
+    return [(tensor_name, encode_tensor_payload('F32', values), 'F32', shape)]
+
+
+def convert_safetensors(path, out_path, logger):
     header, data = read_safetensors_file(path)
     output_tensors = []
-
-    for tensor_name in header:
-        if tensor_name == '__metadata__':
-            continue
-        # Each tuple stores (tensor_name, payload, dtype, shape).
+    tensor_names = [name for name in header if name != '__metadata__']
+    logger.info('processing safetensors file %s (%d tensors)', path.name, len(tensor_names))
+    for index, tensor_name in enumerate(tensor_names, 1):
         meta = header[tensor_name]
         shape = meta['shape']
         dtype = meta['dtype']
         offsets = meta['data_offsets']
         raw_payload = data[offsets[0]:offsets[1]]
-        values = decode_tensor_payload(dtype, raw_payload, shape)
-        quant_kind = should_quantize(tensor_name)
-        if len(shape) == 2 and quant_kind:
-            out_dim, in_dim = shape
-            if quant_kind == 'int8':
-                packed, scales = quantize_int8(values, out_dim, in_dim)
-                output_tensors.append((tensor_name, packed, 'U8', shape))
-                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
-            else:
-                packed, scales = quantize_int4(values, out_dim, in_dim)
-                output_tensors.append((tensor_name, packed, 'U8', shape))
-                output_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
-        else:
-            output_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', shape))
-
+        logger.info('processing tensor %d/%d %s (dtype=%s shape=%s)', index, len(tensor_names), tensor_name, dtype, shape)
+        output_tensors.extend(convert_tensor_payload(tensor_name, meta, raw_payload, logger))
+        render_progress(index, len(tensor_names), 'converting %s' % path.name)
     write_safetensors_file(out_path, output_tensors)
+    logger.info('wrote %s', out_path)
 
 
 def write_safetensors_file(path, tensors):
@@ -183,55 +272,53 @@ def main():
     parser = argparse.ArgumentParser(description='Convert standard safetensors to the qwen35_moe quantized layout')
     parser.add_argument('--input', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--log-file', default=None, help='optional path for the conversion log file')
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
     output_path = Path(args.output).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    logger, log_path = setup_logger(output_path, args.log_file)
+    logger.info('converter starting: input=%s output=%s', input_path, output_path)
+    logger.info('log file: %s', log_path)
     if input_path.is_dir():
         for name in ['config.json', 'tokenizer.json']:
             src = input_path / name
             if src.exists():
                 shutil.copy2(src, output_path / name)
+                logger.info('copied %s', src.name)
     else:
         parent = input_path.parent
         for name in ['config.json', 'tokenizer.json']:
             src = parent / name
             if src.exists():
                 shutil.copy2(src, output_path / name)
+                logger.info('copied %s', src.name)
 
     files = discover_safetensors(input_path)
+    logger.info('discovered %d safetensors file(s)', len(files))
     if len(files) == 1:
         out_file = output_path / 'model.safetensors'
-        convert_safetensors(files[0], out_file)
+        convert_safetensors(files[0], out_file, logger)
         return 0
 
     merged_tensors = []
-    for path in files:
+    for index, path in enumerate(files, 1):
+        logger.info('processing shard %d/%d %s', index, len(files), path.name)
         header, data = read_safetensors_file(path)
-        for tensor_name in header:
-            if tensor_name == '__metadata__':
-                continue
+        tensor_names = [name for name in header if name != '__metadata__']
+        for tensor_index, tensor_name in enumerate(tensor_names, 1):
             meta = header[tensor_name]
             shape = meta['shape']
             dtype = meta['dtype']
             offsets = meta['data_offsets']
             raw_payload = data[offsets[0]:offsets[1]]
-            values = decode_tensor_payload(dtype, raw_payload, shape)
-            quant_kind = should_quantize(tensor_name)
-            if len(shape) == 2 and quant_kind:
-                out_dim, in_dim = shape
-                if quant_kind == 'int8':
-                    packed, scales = quantize_int8(values, out_dim, in_dim)
-                    merged_tensors.append((tensor_name, packed, 'U8', shape))
-                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
-                else:
-                    packed, scales = quantize_int4(values, out_dim, in_dim)
-                    merged_tensors.append((tensor_name, packed, 'U8', shape))
-                    merged_tensors.append((tensor_name + '.qs', struct.pack('<%df' % len(scales), *scales), 'F32', [len(scales)]))
-            else:
-                merged_tensors.append((tensor_name, encode_tensor_payload('F32', values), 'F32', shape))
+            logger.info('processing tensor %d/%d %s (dtype=%s shape=%s)', tensor_index, len(tensor_names), tensor_name, dtype, shape)
+            merged_tensors.extend(convert_tensor_payload(tensor_name, meta, raw_payload, logger))
+            render_progress(tensor_index, len(tensor_names), 'converting %s' % path.name)
+        render_progress(index, len(files), 'shards')
     write_safetensors_file(output_path / 'model.safetensors', merged_tensors)
+    logger.info('wrote merged safetensors %s', output_path / 'model.safetensors')
     return 0
 
 
