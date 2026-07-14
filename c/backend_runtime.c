@@ -20,7 +20,7 @@
 #ifdef COLI_ENABLE_VULKAN
 #include "backend_vulkan.h"
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ROCM)
 #include "backend_cuda.h"
 #endif
 #if defined(COLI_ROCM)
@@ -488,7 +488,7 @@ int coli_runtime_init(const int *devices, int count) {
         g_backend_mask &= ~4;
     }
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ROCM)
     if ((g_backend_mask & 8) && coli_cuda_init(g_devices, g_device_count)) {
         g_backend_mask |= 8;
     } else {
@@ -524,7 +524,7 @@ void coli_runtime_shutdown(void) {
 #ifdef COLI_ENABLE_VULKAN
     coli_vulkan_shutdown();
 #endif
-#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
+#if defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ROCM)
     coli_cuda_shutdown();
 #endif
 #if defined(COLI_ROCM)
