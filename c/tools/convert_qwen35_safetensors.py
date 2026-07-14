@@ -563,10 +563,16 @@ def write_completion_marker(state_dir, output_files, tensor_names):
 def discover_output_safetensors(output_path):
     if not output_path.exists():
         return []
-    return sorted(
-        path for path in output_path.iterdir()
-        if path.is_file() and path.suffix == '.safetensors'
-    )
+    discovered = []
+    for path in sorted(output_path.iterdir()):
+        if not path.is_file() or path.suffix != '.safetensors':
+            continue
+        try:
+            read_safetensors_header(path)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
+            continue
+        discovered.append(path)
+    return discovered
 
 
 def write_safetensors_index(output_path, output_files=None, logger=None):
@@ -578,7 +584,7 @@ def write_safetensors_index(output_path, output_files=None, logger=None):
             if path.is_file() and path.suffix == '.safetensors'
         )
     if not output_files:
-        raise FileNotFoundError('No safetensors files found in output directory')
+        raise FileNotFoundError('No safetensors files found in output directory: %s' % output_path)
     weight_map = {}
     total_size = 0
     for path in output_files:
@@ -597,6 +603,7 @@ def write_safetensors_index(output_path, output_files=None, logger=None):
     index_path = output_path / 'model.safetensors.index.json'
     index_path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding='utf-8')
     if logger is not None:
+        logger.info('generated index from %d safetensors file(s)', len(output_files))
         logger.info('wrote %s', index_path)
     return index_path
 
@@ -725,9 +732,7 @@ def main():
     logger.info('log file: %s', log_path)
     try:
         if args.generate_index_only:
-            output_files = discover_output_safetensors(output_path)
-            logger.info('generating index from %d safetensors file(s)', len(output_files))
-            write_safetensors_index(output_path, output_files, logger=logger)
+            write_safetensors_index(output_path, logger=logger)
             return 0
 
         if input_path.is_dir():
