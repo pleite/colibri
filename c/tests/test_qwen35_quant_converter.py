@@ -73,11 +73,11 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             header_len = int.from_bytes(fh.read(8), 'little')
             return json.loads(fh.read(header_len).decode('utf-8'))
 
-    def converter_script(self):
+    def converter_script_path(self):
         return Path(__file__).resolve().parent.parent / 'tools' / 'convert_qwen35_safetensors.py'
 
     def run_converter(self, input_dir, output_dir, extra_args=None):
-        command = [sys.executable, str(self.converter_script()), '--input', str(input_dir), '--output', str(output_dir)]
+        command = [sys.executable, str(self.converter_script_path()), '--input', str(input_dir), '--output', str(output_dir)]
         if extra_args:
             command.extend(extra_args)
         subprocess.run(command, check=True)
@@ -172,7 +172,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             output_dir = tmpdir / 'output'
             output_dir.mkdir()
             result = subprocess.run(
-                [sys.executable, str(self.converter_script()), '--input', str(input_dir), '--output', str(output_dir)],
+                [sys.executable, str(self.converter_script_path()), '--input', str(input_dir), '--output', str(output_dir)],
                 text=True,
                 capture_output=True,
             )
@@ -249,7 +249,7 @@ class Qwen35QuantConverterTest(unittest.TestCase):
                     ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
                 ],
             )
-            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script())
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             legacy_state_dir = output_dir / '.conversion_state'

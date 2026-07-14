@@ -26,6 +26,8 @@ INT8_MIN_VALUE = -128
 INT8_MAX_VALUE = 127
 INT4_MIN_VALUE = -8
 INT4_MAX_VALUE = 7
+FP8_E4M3_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e4m3')
+FP8_E5M2_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e5m2')
 
 
 def read_safetensors_file(path):
@@ -51,13 +53,26 @@ def read_safetensors_tensor_payload(path, meta):
         return fh.read(offsets[1] - offsets[0])
 
 
+def fp8_format(dtype):
+    dtype_name = str(dtype).lower()
+    if FP8_E4M3_PATTERN.fullmatch(dtype_name):
+        return 'e4m3'
+    if FP8_E5M2_PATTERN.fullmatch(dtype_name):
+        return 'e5m2'
+    return None
+
+
+def is_fp8_dtype(dtype):
+    return fp8_format(dtype) is not None
+
+
 def decode_fp8_payload(payload, dtype):
     values = []
-    dtype_name = dtype.lower()
-    if re.fullmatch(r'(?:f8|fp8|float8)?(?:_)?e4m3', dtype_name):
+    fmt = fp8_format(dtype)
+    if fmt == 'e4m3':
         mantissa_bits = 3
         exponent_bias = 7
-    elif re.fullmatch(r'(?:f8|fp8|float8)?(?:_)?e5m2', dtype_name):
+    elif fmt == 'e5m2':
         mantissa_bits = 2
         exponent_bias = 15
     else:
@@ -110,7 +125,7 @@ def decode_tensor_payload(dtype, payload, shape, logger=None):
             u = (h << 16) & 0xFFFFFFFF
             values.append(struct.unpack('<f', struct.pack('<I', u))[0])
         return values
-    if 'e4m3' in dtype.lower() or 'e5m2' in dtype.lower():
+    if is_fp8_dtype(dtype):
         values = decode_fp8_payload(payload, dtype)
         if logger is not None:
             logger.info('decoded %s tensor as fp8 (%d values)', dtype, len(values))
@@ -203,7 +218,7 @@ def setup_logger(output_path, log_path=None):
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if log_path is None:
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%f') + 'Z'
         log_path = output_path / ('convert_qwen35_safetensors-%s.log' % timestamp)
     else:
         log_path = Path(log_path).expanduser()
@@ -315,7 +330,7 @@ def expected_payload_size(dtype, shape, quant_kind=None):
             out_dim, in_dim = shape
             return out_dim * in_dim
         return elem_count
-    if 'e4m3' in dtype_name or 'e5m2' in dtype_name:
+    if is_fp8_dtype(dtype):
         return elem_count
     raise ValueError('unsupported dtype %s' % dtype)
 
@@ -436,7 +451,7 @@ def load_resumed_outputs(state_dir, output_path, tasks):
     return completed
 
 
-def get_state_file_name(task_id):
+def state_file_name_for_task_id(task_id):
     return '%s.json' % task_id.replace(':', '_')
 
 
@@ -444,15 +459,19 @@ def sanitize_tensor_name(name):
     return ''.join(ch if ch.isalnum() or ch in '._-' else '_' for ch in name)
 
 
+def sanitize_task_id(task_id):
+    return sanitize_tensor_name(task_id.replace(':', '_'))
+
+
 def persist_task_result(state_dir, task, output_tensors):
     state_dir.mkdir(parents=True, exist_ok=True)
     payload_dir = state_dir / 'payloads'
     payload_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / get_state_file_name(task['task_id'])
+    state_path = state_dir / state_file_name_for_task_id(task['task_id'])
     encoded_tensors = []
     for name, payload, dtype, shape in output_tensors:
         safe_name = sanitize_tensor_name(name)
-        safe_task_id = sanitize_tensor_name(task['task_id'].replace(':', '_'))
+        safe_task_id = sanitize_task_id(task['task_id'])
         payload_path = payload_dir / ('%s__%s.bin' % (safe_task_id, safe_name))
         payload_path.write_bytes(payload)
         encoded_tensors.append({
@@ -511,7 +530,7 @@ def load_completed_task_tensors(task, completed_entry, state_dir, output_path):
 
 
 def cleanup_task_state_artifacts(state_dir, task_id):
-    state_path = state_dir / get_state_file_name(task_id)
+    state_path = state_dir / state_file_name_for_task_id(task_id)
     if not state_path.exists():
         return
     try:
@@ -612,28 +631,30 @@ def write_final_output(out_file, tasks, completed, state_dir, output_path):
     return sorted(header.keys())
 
 
+def _replace_existing_path(source_path, target_path):
+    if target_path.exists():
+        if target_path.is_dir() and not target_path.is_symlink():
+            shutil.rmtree(target_path)
+        else:
+            target_path.unlink()
+    shutil.move(str(source_path), str(target_path))
+
+
 def resolve_state_dir(output_path, requested_state_dir=None):
     if requested_state_dir:
         return Path(requested_state_dir).expanduser().resolve()
     preferred_state_dir = output_path / '.state'
-    legacy_state_dir = output_path / '.conversion_state'
+    default_state_dir = output_path / '.conversion_state'
     if preferred_state_dir.exists():
         return preferred_state_dir
-    if legacy_state_dir.exists():
+    if default_state_dir.exists():
         preferred_state_dir.mkdir(parents=True, exist_ok=True)
-        for child in sorted(legacy_state_dir.iterdir()):
-            target_path = preferred_state_dir / child.name
-            if child.is_dir():
-                if target_path.exists():
-                    shutil.rmtree(target_path)
-                shutil.move(str(child), str(target_path))
-            else:
-                if target_path.exists():
-                    target_path.unlink()
-                shutil.move(str(child), str(target_path))
-        legacy_state_dir.rmdir()
+        for child in sorted(default_state_dir.iterdir()):
+            _replace_existing_path(child, preferred_state_dir / child.name)
+        default_state_dir.rmdir()
         return preferred_state_dir
-    return legacy_state_dir
+    default_state_dir.mkdir(parents=True, exist_ok=True)
+    return default_state_dir
 
 
 def handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks):
@@ -712,8 +733,10 @@ def main():
                 with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
                     futures = {}
                     for task in pending_tasks:
-                        # Worker processes do not inherit the parent logger configuration, so
-                        # conversion work stays fully self-contained here.
+                        # Worker processes do not inherit the parent's logger configuration,
+                        # so each worker stays fully self-contained and no shared handler state
+                        # is required across the process pool. The converter therefore sends
+                        # the already-decoded tensor payloads back to the parent process.
                         futures[executor.submit(convert_task, task, logger=None)] = task
                         if len(futures) >= max_pending:
                             done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
