@@ -9,6 +9,13 @@ static int close_enough(float a, float b) {
 }
 
 int main(void) {
+    if (setenv("COLI_RUNTIME_ENGINES", "cpu", 1) != 0) {
+        return 77;
+    }
+    if (setenv("COLI_RUNTIME_DISABLE_ENGINES", "npu,vulkan,rocm,cuda", 1) != 0) {
+        return 77;
+    }
+
     int devices[] = {0};
     if (!coli_runtime_init(devices, 1)) {
         return 77;
