@@ -186,7 +186,7 @@ def setup_logger(output_path, log_path=None):
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if log_path is None:
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
         log_path = output_path / ('convert_qwen35_safetensors-%s.log' % timestamp)
     else:
         log_path = Path(log_path).expanduser()
@@ -436,7 +436,7 @@ def main():
             with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {}
                 for task in pending_tasks:
-                    futures[executor.submit(convert_task, task)] = task
+                    futures[executor.submit(convert_task, task, logger=None)] = task
                     if len(futures) >= max_pending:
                         done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                         completed_future = next(iter(done))
@@ -461,7 +461,7 @@ def main():
             raise RuntimeError('no tensors were converted')
         if len(completed) != len(tasks):
             missing = [task['task_id'] for task in tasks if task['task_id'] not in completed]
-            raise RuntimeError('failed to complete tasks: %s' % ', '.join(missing))
+            raise RuntimeError('failed to complete %d task(s): %s' % (len(missing), ', '.join(missing)))
 
         write_final_output(out_file, tasks, completed)
         logger.info('wrote %s', out_file)

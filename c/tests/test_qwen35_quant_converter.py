@@ -59,7 +59,8 @@ class Qwen35QuantConverterTest(unittest.TestCase):
                 mantissa = max(0, min(max_mantissa, mantissa))
                 payload.append(sign | (mantissa & 0x07))
                 continue
-            exponent = max(0, min(max_exponent, int(math.log2(magnitude)) + exponent_bias))
+            unbiased_exponent = math.frexp(magnitude)[1] - 1
+            exponent = max(0, min(max_exponent, unbiased_exponent + exponent_bias))
             mantissa = int(round((magnitude / (2 ** (exponent - exponent_bias)) - 1.0) * mantissa_scale))
             mantissa = max(0, min(max_mantissa, mantissa))
             payload.append(sign | ((exponent & max_exponent) << mantissa_bits) | (mantissa & 0x07))
