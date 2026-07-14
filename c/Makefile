@@ -95,7 +95,7 @@ endif
 # glm.c is compiled with -DCOLI_CUDA -DCOLI_ROCM and uses the same code paths.
 ROCM      ?= 0
 ROCM_HOME ?= /opt/rocm
-HIPCC     ?= $(ROCM_HOME)/llvm/bin/hipcc
+HIPCC     ?= $(or $(shell command -v hipcc 2>/dev/null),$(ROCM_HOME)/llvm/bin/hipcc)
 ROCM_ARCH ?= native
 HIPCCFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 ROCM_BACKEND_CFLAGS =
