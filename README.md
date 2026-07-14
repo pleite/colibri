@@ -34,6 +34,33 @@ docker build -f Dockerfile.colibri -t colibri-all --build-arg BACKEND=all .
 
 The `all` variant installs and builds Vulkan, ROCm, and NPU backends together so the runtime scheduler can dispatch across them from the same image. The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
 
+### Running the NPU-enabled container
+
+The NPU runtime needs the host device nodes exposed into the container explicitly. The helper script at `c/scripts/run-container.sh` bind-mounts `/dev/accel`, `/dev/dri`, `/dev/kfd`, and `/sys/bus/accel` (when present) and starts the image with `COLI_ACCEL=npu`:
+
+```bash
+./c/scripts/run-container.sh --image ghcr.io/pleite/colibri-npu:latest \
+  --model-dir /path/to/your-model
+```
+
+If you prefer to launch it manually, the equivalent Podman invocation is:
+
+```bash
+podman run --rm -d --name colibri-npu \
+  -p 8000:8000 \
+  --env COLI_ACCEL=npu \
+  --group-add keep-groups \
+  --mount type=bind,src=/dev/accel,dst=/dev/accel \
+  --mount type=bind,src=/dev/dri,dst=/dev/dri \
+  --mount type=bind,src=/dev/kfd,dst=/dev/kfd \
+  --mount type=bind,src=/sys/bus/accel,dst=/sys/bus/accel,readonly \
+  --mount type=bind,src=/path/to/your-model,dst=/models,ro \
+  --env COLI_MODEL=/models \
+  ghcr.io/pleite/colibri-npu:latest
+```
+
+The helper script also accepts `--port`, `--backend`, and `--name` overrides if you need to customize the launch; for example, `./c/scripts/run-container.sh --backend vulkan --image ghcr.io/pleite/colibri-vulkan:latest` keeps the same device pass-through while switching to a different image. A valid model directory should contain at least `config.json`, `tokenizer.json`, and one or more `*.safetensors` files (or the converted Colibri model tree produced by the repo's converter).
+
 ## What's implemented
 
 - **Faithful GLM-5.2 (`glm_moe_dsa`) forward** — validated token-exact against a `transformers` oracle (teacher-forcing 32/32, greedy 20/20 on a tiny-random model with the real architecture).
