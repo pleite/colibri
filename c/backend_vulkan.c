@@ -129,7 +129,7 @@ static void matmul_host(float *y, const float *x, const ColiCudaTensor *tensor, 
     const float *scales = tensor->scales;
 
 #ifdef _OPENMP
-#pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for schedule(static)
 #endif
     for (int o = 0; o < O; ++o) {
         const float scale = (scales && tensor->fmt != 0) ? scales[o] : 1.0f;
