@@ -85,6 +85,11 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 /* Keep accelerator dispatch opt-in for larger matmuls while preserving a CPU fallback. */
 #define COLI_MATMUL_BACKEND_THRESHOLD 64
 
+#define MAX_KV_SLOTS 16
+#define LA_STATE_DECAY 0.6f
+#define LA_STATE_UPDATE 0.4f
+#define LA_CONV1D_WIDTH 4
+
 typedef enum {
     LAYER_TYPE_LINEAR = 0,
     LAYER_TYPE_FULL = 1,
@@ -120,6 +125,7 @@ typedef struct {
     float *la_A_log;
     float *la_dt_bias;
     float *la_conv1d;
+    float *la_state;
     float *kv_cache_k;
     float *kv_cache_v;
     int kv_cache_len;
@@ -145,6 +151,11 @@ typedef struct {
     float *lm_head;
     QLayer *layers;
     int *layer_types;
+    int kv_slots;
+    float ***kv_cache_k_slots;
+    float ***kv_cache_v_slots;
+    int **kv_cache_lens;
+    int **kv_cache_caps;
     float rope_theta;
     float partial_rotary_factor;
     bool use_rope;
@@ -324,6 +335,8 @@ static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermed
         layer->in_ln[i] = 1.0f;
         layer->post_ln[i] = 1.0f;
     }
+    layer->la_state = (float *)calloc((size_t)hidden_size, sizeof(float));
+    if (!layer->la_state) fail("out of memory");
     const int q_out = num_attention_heads * head_dim;
     const int kv_out = num_kv_heads * head_dim;
     layer->q_proj = (float *)calloc((size_t)q_out * (size_t)hidden_size, sizeof(float));
@@ -415,6 +428,25 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     m->partial_rotary_factor = parse_float_field(text_cfg, "partial_rotary_factor", 0.25f);
     m->use_rope = m->rope_theta > 0.0f && m->partial_rotary_factor > 0.0f && m->head_dim > 1;
     m->has_router = parse_bool_field(cfg, "has_moe_router") || m->num_experts > 0;
+    const char *kv_slots_env = getenv("KV_SLOTS");
+    m->kv_slots = 1;
+    if (kv_slots_env && *kv_slots_env) {
+        char *end = NULL;
+        long parsed = strtol(kv_slots_env, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= MAX_KV_SLOTS) m->kv_slots = (int)parsed;
+    }
+    m->kv_cache_k_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_k_slots));
+    m->kv_cache_v_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_v_slots));
+    m->kv_cache_lens = (int **)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_lens));
+    m->kv_cache_caps = (int **)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_caps));
+    if (!m->kv_cache_k_slots || !m->kv_cache_v_slots || !m->kv_cache_lens || !m->kv_cache_caps) fail("out of memory");
+    for (int layer = 0; layer < m->num_layers; layer++) {
+        m->kv_cache_k_slots[layer] = (float **)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_k_slots[layer]));
+        m->kv_cache_v_slots[layer] = (float **)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_v_slots[layer]));
+        m->kv_cache_lens[layer] = (int *)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_lens[layer]));
+        m->kv_cache_caps[layer] = (int *)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_caps[layer]));
+        if (!m->kv_cache_k_slots[layer] || !m->kv_cache_v_slots[layer] || !m->kv_cache_lens[layer] || !m->kv_cache_caps[layer]) fail("out of memory");
+    }
     if (m->vocab_size <= 0 || m->hidden_size <= 0 || m->num_layers <= 0) {
         fail("invalid qwen config: vocab/hidden/layer sizes must be positive");
     }
@@ -689,6 +721,7 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->la_A_log);
     free(layer->la_dt_bias);
     free(layer->la_conv1d);
+    free(layer->la_state);
     free(layer->kv_cache_k);
     free(layer->kv_cache_v);
     if (layer->expert_gate_proj) {
@@ -719,6 +752,16 @@ static void free_model(qwen35_model *m) {
     for (int i = 0; i < m->num_layers; i++) free_layer(m, &m->layers[i]);
     free(m->layers);
     free(m->layer_types);
+    for (int layer = 0; layer < m->num_layers; layer++) {
+        free(m->kv_cache_k_slots[layer]);
+        free(m->kv_cache_v_slots[layer]);
+        free(m->kv_cache_lens[layer]);
+        free(m->kv_cache_caps[layer]);
+    }
+    free(m->kv_cache_k_slots);
+    free(m->kv_cache_v_slots);
+    free(m->kv_cache_lens);
+    free(m->kv_cache_caps);
 }
 
 typedef enum {
@@ -1032,6 +1075,40 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     free(indices);
 }
 
+static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot, int steps) {
+    if (slot < 0 || slot >= m->kv_slots) {
+        int invalid_slot = slot;
+        slot = 0;
+        fprintf(stderr, "[qwen35_moe] invalid cache slot %d; using slot 0\n", invalid_slot);
+    }
+    if (!m->kv_cache_k_slots[layer] || !m->kv_cache_v_slots[layer] || !m->kv_cache_lens[layer] || !m->kv_cache_caps[layer]) fail("invalid cache state");
+    int kv_dim = m->num_kv_heads * m->head_dim;
+    int *cap = &m->kv_cache_caps[layer][slot];
+    if (!m->kv_cache_k_slots[layer][slot] || !m->kv_cache_v_slots[layer][slot] || *cap < steps) {
+        size_t bytes = (size_t)steps * (size_t)kv_dim * sizeof(float);
+        float *new_k = (float *)realloc(m->kv_cache_k_slots[layer][slot], bytes);
+        float *new_v = (float *)realloc(m->kv_cache_v_slots[layer][slot], bytes);
+        if (!new_k || !new_v) fail("out of memory");
+        m->kv_cache_k_slots[layer][slot] = new_k;
+        m->kv_cache_v_slots[layer][slot] = new_v;
+        *cap = steps;
+    }
+    cur->kv_cache_k = m->kv_cache_k_slots[layer][slot];
+    cur->kv_cache_v = m->kv_cache_v_slots[layer][slot];
+    cur->kv_cache_cap = *cap;
+    cur->kv_cache_len = m->kv_cache_lens[layer][slot];
+}
+
+static void save_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot) {
+    if (slot < 0 || slot >= m->kv_slots) {
+        int invalid_slot = slot;
+        slot = 0;
+        fprintf(stderr, "[qwen35_moe] invalid cache slot %d; using slot 0\n", invalid_slot);
+    }
+    m->kv_cache_lens[layer][slot] = cur->kv_cache_len;
+    m->kv_cache_caps[layer][slot] = cur->kv_cache_cap;
+}
+
 static void configure_parallelism(int requested_threads) {
 #ifdef _OPENMP
     if (requested_threads > 0) {
@@ -1045,31 +1122,15 @@ static void configure_parallelism(int requested_threads) {
 }
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
-                      int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
+                      int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed,
+                      int cache_slot) {
     float *hidden = (float *)malloc((size_t)m->hidden_size * sizeof(float));
     if (!hidden) fail("out of memory");
     for (int layer = 0; layer < m->num_layers; layer++) {
         QLayer *cur = &m->layers[layer];
-        int kv_dim = m->num_kv_heads * m->head_dim;
-        free(cur->kv_cache_k);
-        free(cur->kv_cache_v);
-        cur->kv_cache_k = (float *)calloc((size_t)steps * (size_t)kv_dim, sizeof(float));
-        cur->kv_cache_v = (float *)calloc((size_t)steps * (size_t)kv_dim, sizeof(float));
-        if (!cur->kv_cache_k || !cur->kv_cache_v) {
-            for (int prior = 0; prior < layer; prior++) {
-                free(m->layers[prior].kv_cache_k);
-                free(m->layers[prior].kv_cache_v);
-                m->layers[prior].kv_cache_k = NULL;
-                m->layers[prior].kv_cache_v = NULL;
-            }
-            free(cur->kv_cache_k);
-            free(cur->kv_cache_v);
-            cur->kv_cache_k = NULL;
-            cur->kv_cache_v = NULL;
-            fail("out of memory");
-        }
-        cur->kv_cache_len = 0;
-        cur->kv_cache_cap = steps;
+        ensure_cache_slot(m, cur, layer, cache_slot, steps);
+        cur->kv_cache_len = m->kv_cache_lens[layer][cache_slot];
+        cur->kv_cache_cap = m->kv_cache_caps[layer][cache_slot];
     }
     if (temperature > 0.0f) {
         if (seed != 0) srand(seed);
@@ -1123,6 +1184,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     cur->kv_cache_v[cache_offset + i] = v_out[i];
                 }
                 cur->kv_cache_len++;
+                save_cache_slot(m, cur, layer, cache_slot);
                 for (int head = 0; head < m->num_attention_heads; head++) {
                     int kv_head = head / (kv_repeat > 0 ? kv_repeat : 1);
                     float *scores = (float *)calloc((size_t)cur->kv_cache_len, sizeof(float));
@@ -1169,7 +1231,17 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 matmul_vec(hidden, cur->la_in_proj_z, m->hidden_size, m->hidden_size, la_gate);
                 for (int i = 0; i < m->hidden_size; i++) {
                     float gate = silu(la_gate[i]);
-                    la_out[i] = silu(la_out[i]) * 0.5f * (1.0f + gate);
+                    float conv_term = 0.0f;
+                    if (cur->la_conv1d) {
+                        conv_term = cur->la_conv1d[i % LA_CONV1D_WIDTH];
+                    }
+                    float base = silu(la_out[i]) * 0.5f * (1.0f + gate);
+                    if (cur->la_state) {
+                        cur->la_state[i] = (cur->la_state[i] * LA_STATE_DECAY) + (base * LA_STATE_UPDATE) + conv_term;
+                        la_out[i] = cur->la_state[i];
+                    } else {
+                        la_out[i] = base + conv_term;
+                    }
                 }
                 layer_norm_inplace(hidden, cur->in_ln, m->hidden_size);
                 for (int i = 0; i < m->hidden_size; i++) hidden[i] += residual[i] + la_out[i];
@@ -1345,9 +1417,10 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
         int top_k_request = top_k;
         unsigned int seed_request = seed;
         char *cursor = header + 9;
-        if (sscanf(cursor, "%zu %d %f %f %*d %d %u", &payload_len, &max_tokens_request,
-                   &temperature_request, &top_p_request, &top_k_request,
-                   &seed_request) < 6) {
+        int cache_slot_request = 0;
+        if (sscanf(cursor, "%zu %d %f %f %d %d %u", &payload_len, &max_tokens_request,
+                   &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
+                   &seed_request) != 7) {
             fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
             continue;
         }
@@ -1374,7 +1447,7 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             }
             int n_tokens = parse_token_ids(prompt_text, tokens, max_tokens_request);
             if (n_tokens <= 0) n_tokens = 1;
-            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, top_k_request, seed);
+            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, top_k_request, seed, cache_slot_request);
             for (int i = 0; i < max_tokens_request; i++) {
                 if (i > 0) fputc(' ', stdout);
                 fprintf(stdout, "%d", out[i]);
@@ -1450,7 +1523,7 @@ int main(int argc, char **argv) {
     if (n_tokens <= 0) n_tokens = 1;
     int *out = (int *)calloc((size_t)steps, sizeof(int));
     if (!out) fail("out of memory");
-    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed);
+    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed, 0);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
     }
