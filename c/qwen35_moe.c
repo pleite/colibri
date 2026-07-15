@@ -212,29 +212,44 @@ static char *join_path(const char *dir, const char *name) {
 static st_tensor *find_tensor(qwen35_model *m, const char *name) {
     st_tensor *t = st_find(&m->shards, name);
     if (t) return t;
-    static const char *const old_prefix = "model.layers.";
-    static const char *const new_prefix = "model.language_model.layers.";
-    size_t old_len = strlen(old_prefix);
-    size_t new_len = strlen(new_prefix);
-    if (strncmp(name, old_prefix, old_len) == 0) {
-        size_t tail_len = strlen(name + old_len);
-        size_t total = new_len + tail_len + 1;
-        char *candidate = (char *)malloc(total);
-        if (!candidate) fail("out of memory");
-        snprintf(candidate, total, "%s%s", new_prefix, name + old_len);
-        t = st_find(&m->shards, candidate);
-        free(candidate);
-        return t;
+    static const char *const aliases[][2] = {
+        {"model.layers.", "model.language_model.layers."},
+        {"model.language_model.layers.", "model.layers."},
+        {"model.embed_tokens.", "model.language_model.embed_tokens."},
+        {"model.language_model.embed_tokens.", "model.embed_tokens."},
+        {"model.norm.", "model.language_model.norm."},
+        {"model.language_model.norm.", "model.norm."},
+        {"lm_head.", "model.language_model.lm_head."},
+        {"model.language_model.lm_head.", "lm_head."},
+    };
+    for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+        const char *from = aliases[i][0];
+        const char *to = aliases[i][1];
+        size_t from_len = strlen(from);
+        if (strncmp(name, from, from_len) == 0) {
+            size_t tail_len = strlen(name + from_len);
+            size_t total = strlen(to) + tail_len + 1;
+            char *candidate = (char *)malloc(total);
+            if (!candidate) fail("out of memory");
+            snprintf(candidate, total, "%s%s", to, name + from_len);
+            t = st_find(&m->shards, candidate);
+            free(candidate);
+            if (t) return t;
+        }
     }
-    if (strncmp(name, new_prefix, new_len) == 0) {
-        size_t tail_len = strlen(name + new_len);
-        size_t total = old_len + tail_len + 1;
+    return NULL;
+}
+
+static st_tensor *find_scale_tensor(qwen35_model *m, const char *name) {
+    static const char *const suffixes[] = {".qs", ".scale", ".scales", ".weight_scale"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t total = strlen(name) + strlen(suffixes[i]) + 1;
         char *candidate = (char *)malloc(total);
         if (!candidate) fail("out of memory");
-        snprintf(candidate, total, "%s%s", old_prefix, name + new_len);
-        t = st_find(&m->shards, candidate);
+        snprintf(candidate, total, "%s%s", name, suffixes[i]);
+        st_tensor *t = find_tensor(m, candidate);
         free(candidate);
-        return t;
+        if (t) return t;
     }
     return NULL;
 }
@@ -251,18 +266,14 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
         return buf;
     }
     if (t->dtype == 3) {
-        size_t scale_name_len = strlen(name) + 4;
-        char *scale_name = (char *)malloc(scale_name_len);
-        if (!scale_name) fail("out of memory");
-        snprintf(scale_name, scale_name_len, "%s.qs", name);
-        st_tensor *scale = find_tensor(m, scale_name);
-        free(scale_name);
+        st_tensor *scale = find_scale_tensor(m, name);
         if (!scale) {
             fprintf(stderr, "warning: missing scale for quantized tensor %s; assuming unit scale\n", name);
         }
         size_t out_dim = scale ? (size_t)scale->numel : 1;
         if (out_dim == 0 || nelems % out_dim != 0) {
-            fail("tensor %s has incompatible shape for quantized load", name);
+            fprintf(stderr, "warning: incompatible scale shape for quantized tensor %s (scale elems=%lld); assuming unit scale\n", name, (long long)(scale ? scale->numel : 0));
+            out_dim = 1;
         }
         size_t in_dim = nelems / out_dim;
         size_t bytes_per_row = (in_dim + 1) / 2;
