@@ -702,6 +702,12 @@ def task_payload_bytes(task):
     return data_offsets[1] - data_offsets[0]
 
 
+def task_has_invalid_payload_offsets(task):
+    meta = task.get('meta', {})
+    data_offsets = meta.get('data_offsets', [])
+    return isinstance(data_offsets, (list, tuple)) and len(data_offsets) == 2 and data_offsets[1] < data_offsets[0]
+
+
 def estimate_converted_payload_bytes(task):
     tensor_name = task.get('tensor_name')
     meta = task.get('meta', {})
@@ -985,6 +991,8 @@ def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, 
     remaining_tasks = []
     sequential_tasks = []
     for task in pending_tasks:
+        if task_has_invalid_payload_offsets(task):
+            logger.warning('ignoring invalid negative payload span while sizing %s for worker-pool execution', task['task_id'])
         skip_reason = worker_pool_skip_reason(task)
         if skip_reason is None:
             remaining_tasks.append(task)
@@ -1005,7 +1013,6 @@ def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, 
             if attempt >= max_retries - 1 or workers_for_attempt <= 1:
                 logger.warning('falling back to sequential conversion for %d task(s) after worker-pool failure', len(remaining_tasks))
                 process_tasks_sequentially(remaining_tasks, logger, completed, state_dir, total_tasks)
-                remaining_tasks = []
                 break
             logger.exception('worker pool failure details for %s', exc.task['task_id'])
             logger.warning('worker pool failure while processing %s; retrying %d task(s) with %d worker(s) (attempt %d/%d)', exc.task['task_id'], len(remaining_tasks), 1, attempt + 2, max_retries)
