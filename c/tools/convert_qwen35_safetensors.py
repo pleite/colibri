@@ -436,28 +436,113 @@ def output_file_for_source(output_path, source_name):
     return Path(output_path) / Path(source_name).name
 
 
+def inspect_task_state(state_dir, output_path, task):
+    expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
+    state_path = state_dir / state_file_name_for_task_id(task['task_id'])
+    if state_path.exists():
+        try:
+            payload = json.loads(state_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            return {'status': 'incomplete', 'reason': 'invalid_state', 'state_path': state_path}
+        if payload.get('task_id') != task['task_id']:
+            return {'status': 'incomplete', 'reason': 'state_task_mismatch', 'state_path': state_path}
+        output_tensors = payload.get('output_tensors', [])
+        if not isinstance(output_tensors, list):
+            return {'status': 'incomplete', 'reason': 'invalid_state', 'state_path': state_path}
+        has_payload_issues = False
+        for entry in output_tensors:
+            if not isinstance(entry, dict):
+                has_payload_issues = True
+                continue
+            payload_name = entry.get('payload_path')
+            if not payload_name:
+                has_payload_issues = True
+                continue
+            if not (state_dir / 'payloads' / payload_name).is_file():
+                has_payload_issues = True
+        if has_payload_issues:
+            return {'status': 'incomplete', 'reason': 'missing_payloads', 'state_path': state_path}
+        return {'status': 'complete', 'kind': 'state', 'state_path': state_path}
+    out_file = output_file_for_source(output_path, task['source_name'])
+    existing = read_existing_output_payloads(out_file, expected)
+    if all(name in existing for name in expected):
+        return {'status': 'complete', 'kind': 'output_file', 'output_file': str(out_file), 'tensor_names': expected}
+    return {'status': 'pending', 'reason': 'missing_state_and_output'}
+
+
+def summarize_state_progress(state_dir, output_path, tasks):
+    completed = {}
+    completed_from_state = 0
+    completed_from_output = 0
+    incomplete_state_files = 0
+    needs_reprocessing = []
+    for task in tasks:
+        result = inspect_task_state(state_dir, output_path, task)
+        if result['status'] == 'complete':
+            if result['kind'] == 'state':
+                completed_from_state += 1
+                completed[task['task_id']] = {'kind': 'state', 'state_path': result['state_path']}
+            else:
+                completed_from_output += 1
+                completed[task['task_id']] = {
+                    'kind': 'output_file',
+                    'output_file': result['output_file'],
+                    'tensor_names': result['tensor_names'],
+                }
+            continue
+        needs_reprocessing.append(task['task_id'])
+        if result['status'] == 'incomplete':
+            incomplete_state_files += 1
+    total_tasks = len(tasks)
+    completed_total = completed_from_state + completed_from_output
+    return {
+        'total_tasks': total_tasks,
+        'completed_total': completed_total,
+        'completed_from_state': completed_from_state,
+        'completed_from_output': completed_from_output,
+        'incomplete_state_files': incomplete_state_files,
+        'needs_reprocessing_count': len(needs_reprocessing),
+        'needs_reprocessing': needs_reprocessing,
+    }
+
+
 def load_resumed_outputs(state_dir, output_path, tasks):
     completed = {}
-    task_ids = {task['task_id'] for task in tasks}
-    if state_dir.exists():
-        for state_path in sorted(state_dir.glob('*.json')):
-            try:
-                payload = json.loads(state_path.read_text(encoding='utf-8'))
-            except (json.JSONDecodeError, OSError):
-                continue
-            task_id = payload.get('task_id')
-            if not task_id or task_id not in task_ids:
-                continue
-            completed[task_id] = {'kind': 'state', 'state_path': state_path}
     for task in tasks:
-        expected = expected_output_names(task['tensor_name'], task['meta']['shape'])
-        if task['task_id'] in completed:
+        result = inspect_task_state(state_dir, output_path, task)
+        if result['status'] != 'complete':
             continue
-        out_file = output_file_for_source(output_path, task['source_name'])
-        existing = read_existing_output_payloads(out_file, expected)
-        if all(name in existing for name in expected):
-            completed[task['task_id']] = {'kind': 'output_file', 'output_file': str(out_file), 'tensor_names': expected}
+        if result['kind'] == 'state':
+            completed[task['task_id']] = {'kind': 'state', 'state_path': result['state_path']}
+        else:
+            completed[task['task_id']] = {
+                'kind': 'output_file',
+                'output_file': result['output_file'],
+                'tensor_names': result['tensor_names'],
+            }
     return completed
+
+
+def completed_percentage(total_tasks, completed_total):
+    if total_tasks == 0:
+        return 0
+    return int(100 * completed_total / total_tasks)
+
+
+def format_state_progress(summary):
+    completed_pct = completed_percentage(summary['total_tasks'], summary['completed_total'])
+    lines = [
+        'state progress: %d/%d task(s) completed (%d%%)' % (summary['completed_total'], summary['total_tasks'], completed_pct),
+        '  completed from state files: %d' % summary['completed_from_state'],
+        '  completed from output shards: %d' % summary['completed_from_output'],
+        '  incomplete state files: %d' % summary['incomplete_state_files'],
+        '  needs reprocessing: %d' % summary['needs_reprocessing_count'],
+    ]
+    if summary['needs_reprocessing']:
+        lines.append('  reprocessing candidates:')
+        for task_id in summary['needs_reprocessing']:
+            lines.append('    - %s' % task_id)
+    return '\n'.join(lines)
 
 
 def state_file_name_for_task_id(task_id):
@@ -866,6 +951,7 @@ def main():
     parser.add_argument('--workers', type=int, default=None, help='number of worker processes; defaults to all CPU cores')
     parser.add_argument('--state-dir', default=None, help='directory for per-tensor resume checkpoints')
     parser.add_argument('--generate-index-only', action='store_true', help='generate model.safetensors.index.json from existing output shards')
+    parser.add_argument('--inspect-state', '--state-progress', action='store_true', dest='inspect_state', help='inspect state artifacts and report which tasks are complete or need reprocessing')
     args = parser.parse_args()
 
     if args.input is None and not args.generate_index_only:
@@ -879,6 +965,17 @@ def main():
     try:
         if args.generate_index_only:
             write_safetensors_index(output_path, logger=logger)
+            return 0
+
+        if args.inspect_state:
+            if input_path is None:
+                raise ValueError('--input is required for --inspect-state')
+            files, source_groups = build_source_task_groups(input_path)
+            tasks = [task for group in source_groups for task in group['tasks']]
+            state_dir = resolve_state_dir(output_path, args.state_dir)
+            state_dir.mkdir(parents=True, exist_ok=True)
+            summary = summarize_state_progress(state_dir, output_path, tasks)
+            print(format_state_progress(summary))
             return 0
 
         if input_path is None:
@@ -919,7 +1016,19 @@ def main():
         state_dir.mkdir(parents=True, exist_ok=True)
         logger.info('using state dir: %s', state_dir)
         completed = load_resumed_outputs(state_dir, output_path, tasks)
+        summary = summarize_state_progress(state_dir, output_path, tasks)
+        completed_pct = completed_percentage(summary['total_tasks'], summary['completed_total'])
         logger.info('resumed %d existing tensor task(s)', len(completed))
+        logger.info(
+            'state progress: %d/%d task(s) completed (%d%%); %d incomplete state file(s); %d need reprocessing',
+            summary['completed_total'],
+            summary['total_tasks'],
+            completed_pct,
+            summary['incomplete_state_files'],
+            summary['needs_reprocessing_count'],
+        )
+        if summary['needs_reprocessing_count']:
+            logger.warning('state inspection found %d task(s) that need reprocessing', summary['needs_reprocessing_count'])
 
         workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
         workers = max(1, workers)
