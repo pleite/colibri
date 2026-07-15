@@ -488,6 +488,8 @@ def generation_options(body, limit):
     top_p = 0.9 if top_p is None else top_p
     top_k = 0 if top_k is None else top_k
     seed = 0 if seed is None else seed
+    # The backend uses integer-valued sampling controls for `top_k` and `seed`,
+    # while `temperature` and `top_p` can be passed as floats.
     if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
         raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
