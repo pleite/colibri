@@ -133,6 +133,46 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
 
+    def test_converter_normalizes_language_model_tensor_names_for_engine(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.language_model.embed_tokens.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                    ('model.language_model.norm.weight', [1.0, 1.0], [2], 'F32'),
+                    ('model.language_model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                    ('model.language_model.layers.0.linear_attn.A_log', [0.5, -0.6], [2], 'F32'),
+                    ('model.language_model.layers.0.linear_attn.dt_bias', [0.7, -0.8], [2], 'F32'),
+                ],
+            )
+            self.run_converter(input_dir, output_dir)
+            header = self.read_header(output_dir / 'model.safetensors')
+            self.assertIn('model.embed_tokens.weight', header)
+            self.assertIn('model.embed_tokens.weight.qs', header)
+            self.assertIn('model.norm.weight', header)
+            self.assertIn('model.layers.0.self_attn.q_proj.weight', header)
+            self.assertIn('model.layers.0.self_attn.q_proj.weight.qs', header)
+            self.assertIn('model.layers.0.linear_attn.A_log.weight', header)
+            self.assertIn('model.layers.0.linear_attn.dt_bias.weight', header)
+            self.assertEqual(header['model.layers.0.linear_attn.A_log.weight']['dtype'], 'F32')
+            self.assertEqual(header['model.layers.0.linear_attn.dt_bias.weight']['dtype'], 'F32')
+            self.assertNotIn('model.language_model.embed_tokens.weight', header)
+            self.assertNotIn('model.language_model.norm.weight', header)
+            self.assertNotIn('model.language_model.layers.0.self_attn.q_proj.weight', header)
+            self.assertNotIn('model.language_model.layers.0.linear_attn.A_log', header)
+            self.assertNotIn('model.language_model.layers.0.linear_attn.dt_bias', header)
+            index_payload = json.loads((output_dir / 'model.safetensors.index.json').read_text(encoding='utf-8'))
+            self.assertEqual(index_payload['weight_map']['model.embed_tokens.weight'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.embed_tokens.weight.qs'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.norm.weight'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.layers.0.linear_attn.A_log.weight'], 'model.safetensors')
+            self.assertEqual(index_payload['weight_map']['model.layers.0.linear_attn.dt_bias.weight'], 'model.safetensors')
+
     def test_read_safetensors_tensor_payload_reads_from_data_section(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)

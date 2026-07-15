@@ -212,14 +212,36 @@ def should_quantize(name):
     if (
         name.startswith('model.embed_tokens')
         or name.startswith('lm_head')
-        or '.self_attn.' in name
+        or ('.self_attn.' in name and '.linear_attn.' not in name)
         or '.shared_expert.' in name
-        or '.linear_attn.' in name
-        or (name.startswith('model.layers.') and '.mlp.experts.' not in name)
-        or (name.startswith('model.language_model.layers.') and '.mlp.experts.' not in name)
+        or (
+            name.startswith('model.layers.')
+            and '.mlp.experts.' not in name
+            and '.linear_attn.' not in name
+        )
+        or (
+            name.startswith('model.language_model.layers.')
+            and '.mlp.experts.' not in name
+            and '.linear_attn.' not in name
+        )
     ):
         return 'int8'
     return None
+
+
+def normalize_tensor_name_for_engine(name):
+    normalized = name
+    if normalized.startswith('model.language_model.layers.'):
+        normalized = 'model.layers.' + normalized[len('model.language_model.layers.'):]
+    elif normalized.startswith('model.language_model.embed_tokens.'):
+        normalized = 'model.embed_tokens.' + normalized[len('model.language_model.embed_tokens.'):]
+    elif normalized.startswith('model.language_model.norm.'):
+        normalized = 'model.norm.' + normalized[len('model.language_model.norm.'):]
+    if normalized.endswith('.linear_attn.A_log'):
+        normalized += '.weight'
+    elif normalized.endswith('.linear_attn.dt_bias'):
+        normalized += '.weight'
+    return normalized
 
 
 def setup_logger(output_path, log_path=None):
@@ -264,46 +286,48 @@ def render_progress(current, total, label):
 
 
 def expected_output_names(tensor_name, shape):
-    quant_kind = should_quantize(tensor_name)
+    normalized_name = normalize_tensor_name_for_engine(tensor_name)
+    quant_kind = should_quantize(normalized_name)
     if len(shape) == 2 and quant_kind:
-        return [tensor_name, tensor_name + '.qs']
-    return [tensor_name]
+        return [normalized_name, normalized_name + '.qs']
+    return [normalized_name]
 
 
 def convert_tensor_payload(tensor_name, meta, payload, logger=None):
+    output_tensor_name = normalize_tensor_name_for_engine(tensor_name)
     shape = meta['shape']
     dtype = meta['dtype']
     validate_payload_length(dtype, len(payload), shape, tensor_name=tensor_name)
     values = decode_tensor_payload(dtype, payload, shape, logger=logger)
-    quant_kind = should_quantize(tensor_name)
+    quant_kind = should_quantize(output_tensor_name)
     if len(shape) == 2 and quant_kind:
         out_dim, in_dim = shape
         if quant_kind == 'int8':
-            packed, scales = quantize_int8(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
-            validate_payload_length('U8', len(packed), shape, quant_kind='int8', tensor_name=tensor_name)
+            packed, scales = quantize_int8(values, out_dim, in_dim, logger=logger, tensor_name=output_tensor_name)
+            validate_payload_length('U8', len(packed), shape, quant_kind='int8', tensor_name=output_tensor_name)
             scales_payload = struct.pack('<%df' % len(scales), *scales)
-            validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=tensor_name + '.qs')
+            validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=output_tensor_name + '.qs')
             if logger is not None:
-                logger.info('quantized %s as int8 (%dx%d)', tensor_name, out_dim, in_dim)
+                logger.info('quantized %s as int8 (%dx%d)', output_tensor_name, out_dim, in_dim)
             return [
-                (tensor_name, packed, 'U8', shape),
-                (tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
+                (output_tensor_name, packed, 'U8', shape),
+                (output_tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
             ]
-        packed, scales = quantize_int4(values, out_dim, in_dim, logger=logger, tensor_name=tensor_name)
-        validate_payload_length('U8', len(packed), shape, quant_kind='int4', tensor_name=tensor_name)
+        packed, scales = quantize_int4(values, out_dim, in_dim, logger=logger, tensor_name=output_tensor_name)
+        validate_payload_length('U8', len(packed), shape, quant_kind='int4', tensor_name=output_tensor_name)
         scales_payload = struct.pack('<%df' % len(scales), *scales)
-        validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=tensor_name + '.qs')
+        validate_payload_length('F32', len(scales_payload), [len(scales)], tensor_name=output_tensor_name + '.qs')
         if logger is not None:
-            logger.info('quantized %s as int4 (%dx%d)', tensor_name, out_dim, in_dim)
+            logger.info('quantized %s as int4 (%dx%d)', output_tensor_name, out_dim, in_dim)
         return [
-            (tensor_name, packed, 'U8', shape),
-            (tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
+            (output_tensor_name, packed, 'U8', shape),
+            (output_tensor_name + '.qs', scales_payload, 'F32', [len(scales)]),
         ]
     if logger is not None:
-        logger.info('copied %s as F32 (shape=%s)', tensor_name, shape)
+        logger.info('copied %s as F32 (shape=%s)', output_tensor_name, shape)
     output_payload = encode_tensor_payload('F32', values)
-    validate_payload_length('F32', len(output_payload), shape, tensor_name=tensor_name)
-    return [(tensor_name, output_payload, 'F32', shape)]
+    validate_payload_length('F32', len(output_payload), shape, tensor_name=output_tensor_name)
+    return [(output_tensor_name, output_payload, 'F32', shape)]
 
 
 def encode_output_tensors(output_tensors):
