@@ -29,6 +29,9 @@ INT4_MAX_VALUE = 7
 METADATA_KEY = '__metadata__'
 FP8_E4M3_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e4m3')
 FP8_E5M2_PATTERN = re.compile(r'(?:f8|fp8|float8)?(?:_)?e5m2')
+LANGUAGE_LAYER_PREFIX = 'model.language_model.layers.'
+LANGUAGE_EMBED_PREFIX = 'model.language_model.embed_tokens.'
+LANGUAGE_NORM_PREFIX = 'model.language_model.norm.'
 
 
 def read_safetensors_file(path):
@@ -231,15 +234,13 @@ def should_quantize(name):
 
 def normalize_tensor_name_for_engine(name):
     normalized = name
-    if normalized.startswith('model.language_model.layers.'):
-        normalized = 'model.layers.' + normalized[len('model.language_model.layers.'):]
-    elif normalized.startswith('model.language_model.embed_tokens.'):
-        normalized = 'model.embed_tokens.' + normalized[len('model.language_model.embed_tokens.'):]
-    elif normalized.startswith('model.language_model.norm.'):
-        normalized = 'model.norm.' + normalized[len('model.language_model.norm.'):]
-    if normalized.endswith('.linear_attn.A_log'):
-        normalized += '.weight'
-    elif normalized.endswith('.linear_attn.dt_bias'):
+    if normalized.startswith(LANGUAGE_LAYER_PREFIX):
+        normalized = 'model.layers.' + normalized.removeprefix(LANGUAGE_LAYER_PREFIX)
+    elif normalized.startswith(LANGUAGE_EMBED_PREFIX):
+        normalized = 'model.embed_tokens.' + normalized.removeprefix(LANGUAGE_EMBED_PREFIX)
+    elif normalized.startswith(LANGUAGE_NORM_PREFIX):
+        normalized = 'model.norm.' + normalized.removeprefix(LANGUAGE_NORM_PREFIX)
+    if normalized.endswith(('.linear_attn.A_log', '.linear_attn.dt_bias')):
         normalized += '.weight'
     return normalized
 
