@@ -50,8 +50,16 @@ def read_safetensors_header(path):
 def read_safetensors_tensor_payload(path, meta):
     offsets = meta['data_offsets']
     with open(path, 'rb') as fh:
-        fh.seek(offsets[0])
-        return fh.read(offsets[1] - offsets[0])
+        header_len = int.from_bytes(fh.read(8), 'little')
+        fh.read(header_len)
+        data_start = fh.tell() + offsets[0]
+        payload_length = offsets[1] - offsets[0]
+        file_size = path.stat().st_size
+        if data_start + payload_length > file_size:
+            fh.seek(offsets[0])
+            return fh.read(payload_length)
+        fh.seek(data_start)
+        return fh.read(payload_length)
 
 
 def fp8_format(dtype):
