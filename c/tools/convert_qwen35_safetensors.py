@@ -697,7 +697,9 @@ def task_payload_bytes(task):
     data_offsets = meta.get('data_offsets', [])
     if not isinstance(data_offsets, (list, tuple)) or len(data_offsets) != 2:
         return None
-    return max(0, data_offsets[1] - data_offsets[0])
+    if data_offsets[1] < data_offsets[0]:
+        return None
+    return data_offsets[1] - data_offsets[0]
 
 
 def estimate_converted_payload_bytes(task):
@@ -719,10 +721,10 @@ def estimate_converted_payload_bytes(task):
 def worker_pool_skip_reason(task, max_task_bytes=MAX_WORKER_POOL_TASK_BYTES):
     payload_bytes = task_payload_bytes(task)
     if payload_bytes is not None and payload_bytes > max_task_bytes:
-        return 'input payload %d bytes exceeds worker-pool threshold %d bytes' % (payload_bytes, max_task_bytes)
+        return f'input payload {payload_bytes} bytes exceeds worker-pool threshold {max_task_bytes} bytes'
     converted_payload_bytes = estimate_converted_payload_bytes(task)
     if converted_payload_bytes is not None and converted_payload_bytes > max_task_bytes:
-        return 'converted payload %d bytes exceeds worker-pool threshold %d bytes' % (converted_payload_bytes, max_task_bytes)
+        return f'converted payload {converted_payload_bytes} bytes exceeds worker-pool threshold {max_task_bytes} bytes'
     return None
 
 
