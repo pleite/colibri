@@ -8,6 +8,7 @@
  */
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
@@ -184,8 +185,51 @@ static char *read_text_file(const char *path) {
     return buf;
 }
 
+static bool parse_bool_env(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !*env) return false;
+    if (strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "FALSE") == 0 ||
+        strcmp(env, "no") == 0 || strcmp(env, "NO") == 0 || strcmp(env, "off") == 0 ||
+        strcmp(env, "OFF") == 0) {
+        return false;
+    }
+    if (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0 ||
+        strcmp(env, "yes") == 0 || strcmp(env, "YES") == 0 || strcmp(env, "on") == 0 ||
+        strcmp(env, "ON") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool model_debug_enabled(void) {
+    static bool initialized = false;
+    static bool enabled = false;
+    if (!initialized) {
+        enabled = parse_bool_env("COLI_QWEN_DEBUG");
+        initialized = true;
+    }
+    return enabled;
+}
+
+static void model_debug(const char *fmt, ...) {
+    if (!model_debug_enabled()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[qwen35_moe] ");
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
 static int parse_int_field(jval *obj, const char *key, int fallback) {
     jval *value = json_get(obj, key);
+    if (!value || value->t != J_NUM) return fallback;
+    return (int)value->num;
+}
+
+static int parse_int_field_with_fallback(jval *primary, jval *secondary, const char *key, int fallback) {
+    jval *value = json_get(primary, key);
+    if (!value || value->t != J_NUM) value = json_get(secondary, key);
     if (!value || value->t != J_NUM) return fallback;
     return (int)value->num;
 }
@@ -259,20 +303,28 @@ static int tensor_exists(qwen35_model *m, const char *name) {
 }
 
 static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) {
+    model_debug("load_tensor_f32: tensor=%s expected_nelems=%zu", name, nelems);
     float *buf = (float *)calloc(nelems, sizeof(float));
     if (!buf) fail("out of memory");
     st_tensor *t = find_tensor(m, name);
     if (!t) {
+        model_debug("load_tensor_f32: tensor=%s not found; returning zeroed buffer", name);
         return buf;
     }
+    model_debug("load_tensor_f32: tensor=%s found dtype=%d numel=%" PRId64 " nbytes=%" PRId64, name, t->dtype, t->numel, t->nbytes);
     if (t->dtype == 3) {
         st_tensor *scale = find_scale_tensor(m, name);
+        if (scale) {
+            model_debug("load_tensor_f32: tensor=%s scale=%s scale_elems=%" PRId64, name, scale->name, scale->numel);
+        } else {
+            model_debug("load_tensor_f32: tensor=%s missing scale tensor", name);
+        }
         if (!scale) {
             fprintf(stderr, "warning: missing scale for quantized tensor %s; assuming unit scale\n", name);
         }
         size_t out_dim = scale ? (size_t)scale->numel : 1;
         if (out_dim == 0 || nelems % out_dim != 0) {
-            fprintf(stderr, "warning: incompatible scale shape for quantized tensor %s (scale elems=%lld); assuming unit scale\n", name, (long long)(scale ? scale->numel : 0));
+            fprintf(stderr, "warning: incompatible scale shape for quantized tensor %s (scale elems=%" PRId64 "); assuming unit scale\n", name, scale ? scale->numel : 0);
             out_dim = 1;
         }
         size_t in_dim = nelems / out_dim;
@@ -323,10 +375,10 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             free(scale_vals);
             return buf;
         }
-        fail("tensor %s has unsupported packed size %lld for %zu elements", name, (long long)t->nbytes, nelems);
+        fail("tensor %s has unsupported packed size %" PRId64 " for %zu elements", name, t->nbytes, nelems);
     }
     if (t->numel != (int64_t)nelems) {
-        fail("tensor %s has %lld elements (expected %zu)", name, (long long)t->numel, nelems);
+        fail("tensor %s has %" PRId64 " elements (expected %zu)", name, t->numel, nelems);
     }
     st_read_f32(&m->shards, t->name, buf, 0);
     return buf;
@@ -425,16 +477,16 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     jval *cfg = root;
     jval *text_cfg = json_get(cfg, "text_config");
     if (!text_cfg || text_cfg->t != J_OBJ) text_cfg = cfg;
-    m->vocab_size = parse_int_field(cfg, "vocab_size", 32);
-    m->hidden_size = parse_int_field(cfg, "hidden_size", 16);
-    m->num_layers = parse_int_field(cfg, "num_hidden_layers", 1);
-    m->num_experts = parse_int_field(cfg, "num_experts", 2);
-    m->experts_per_tok = parse_int_field(cfg, "num_experts_per_tok", 1);
-    m->moe_intermediate_size = parse_int_field(text_cfg, "moe_intermediate_size", m->hidden_size);
-    m->shared_expert_intermediate_size = parse_int_field(text_cfg, "shared_expert_intermediate_size", m->moe_intermediate_size);
-    m->num_attention_heads = parse_int_field(text_cfg, "num_attention_heads", 1);
-    m->num_kv_heads = parse_int_field(text_cfg, "num_key_value_heads", 1);
-    m->head_dim = parse_int_field(text_cfg, "head_dim", m->hidden_size);
+    m->vocab_size = parse_int_field_with_fallback(text_cfg, cfg, "vocab_size", 32);
+    m->hidden_size = parse_int_field_with_fallback(text_cfg, cfg, "hidden_size", 16);
+    m->num_layers = parse_int_field_with_fallback(text_cfg, cfg, "num_hidden_layers", 1);
+    m->num_experts = parse_int_field_with_fallback(text_cfg, cfg, "num_experts", 2);
+    m->experts_per_tok = parse_int_field_with_fallback(text_cfg, cfg, "num_experts_per_tok", 1);
+    m->moe_intermediate_size = parse_int_field_with_fallback(text_cfg, cfg, "moe_intermediate_size", m->hidden_size);
+    m->shared_expert_intermediate_size = parse_int_field_with_fallback(text_cfg, cfg, "shared_expert_intermediate_size", m->moe_intermediate_size);
+    m->num_attention_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_attention_heads", 1);
+    m->num_kv_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_key_value_heads", 1);
+    m->head_dim = parse_int_field_with_fallback(text_cfg, cfg, "head_dim", m->hidden_size);
     m->rope_theta = parse_float_field(text_cfg, "rope_theta", 10000.0f);
     m->partial_rotary_factor = parse_float_field(text_cfg, "partial_rotary_factor", 0.25f);
     m->use_rope = m->rope_theta > 0.0f && m->partial_rotary_factor > 0.0f && m->head_dim > 1;
@@ -458,6 +510,7 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         m->kv_cache_caps[layer] = (int *)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_caps[layer]));
         if (!m->kv_cache_k_slots[layer] || !m->kv_cache_v_slots[layer] || !m->kv_cache_lens[layer] || !m->kv_cache_caps[layer]) fail("out of memory");
     }
+    model_debug("init_model: parsed geometry vocab=%d hidden=%d layers=%d experts=%d experts_per_tok=%d moe_intermediate=%d shared_expert_intermediate=%d heads=%d kv_heads=%d head_dim=%d", m->vocab_size, m->hidden_size, m->num_layers, m->num_experts, m->experts_per_tok, m->moe_intermediate_size, m->shared_expert_intermediate_size, m->num_attention_heads, m->num_kv_heads, m->head_dim);
     if (m->vocab_size <= 0 || m->hidden_size <= 0 || m->num_layers <= 0) {
         fail("invalid qwen config: vocab/hidden/layer sizes must be positive");
     }
@@ -468,7 +521,9 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     if (m->shared_expert_intermediate_size <= 0) m->shared_expert_intermediate_size = m->moe_intermediate_size;
     st_init(&m->shards, snap_dir);
 
-    m->embed = load_tensor_f32(m, "model.embed_tokens.weight", (size_t)m->vocab_size * (size_t)m->hidden_size);
+    size_t embed_nelems = (size_t)m->vocab_size * (size_t)m->hidden_size;
+    model_debug("init_model: loading model.embed_tokens.weight with expected_nelems=%zu", embed_nelems);
+    m->embed = load_tensor_f32(m, "model.embed_tokens.weight", embed_nelems);
     m->final_norm = load_optional_tensor_f32(m, "model.norm.weight", (size_t)m->hidden_size);
     if (!m->final_norm) {
         m->final_norm = (float *)calloc((size_t)m->hidden_size, sizeof(float));
