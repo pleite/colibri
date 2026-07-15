@@ -130,6 +130,29 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
 
+    def test_read_safetensors_tensor_payload_reads_from_data_section(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_path = tmpdir / 'model.safetensors'
+            payload = b'\x00\x00\x80?\x00\x00\x00@\x00\x00\x80?\x00\x00\x00@'
+            header = {
+                'model.layers.0.self_attn.q_proj.weight': {
+                    'dtype': 'F32',
+                    'shape': [2, 2],
+                    'data_offsets': [0, len(payload)],
+                }
+            }
+            header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
+            with open(input_path, 'wb') as fh:
+                fh.write(len(header_bytes).to_bytes(8, 'little'))
+                fh.write(header_bytes)
+                fh.write(payload)
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            got_payload = module.read_safetensors_tensor_payload(input_path, header['model.layers.0.self_attn.q_proj.weight'])
+            self.assertEqual(got_payload, payload)
+
     def test_converter_handles_non_finite_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
