@@ -1343,8 +1343,11 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
         float temperature_request = temperature;
         float top_p_request = top_p;
         int top_k_request = top_k;
+        unsigned int seed_request = seed;
         char *cursor = header + 9;
-        if (sscanf(cursor, "%zu %d %f %f", &payload_len, &max_tokens_request, &temperature_request, &top_p_request) < 4) {
+        if (sscanf(cursor, "%zu %d %f %f %*d %d %u", &payload_len, &max_tokens_request,
+                   &temperature_request, &top_p_request, &top_k_request,
+                   &seed_request) < 6) {
             fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
             continue;
         }

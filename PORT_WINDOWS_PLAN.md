@@ -4,6 +4,29 @@ Tracks the native Windows 11 x86-64 port (MinGW-w64 / MSYS2).
 All platform differences live in `c/compat.h`; the engine source (`glm.c`,
 `olmoe.c`) is unchanged across platforms.
 
+## Current status (2026-07-15)
+
+The repository now has the Phase 1 and Phase 2 compat shims in place and the
+Windows-specific code is exercised by `make test-c`. The remaining work is now
+about GPU integration and end-to-end validation rather than basic portability:
+
+- `c/compat.h` and the Windows shim layer are implemented for file I/O,
+  alignment, and environment handling.
+- The current Windows path still treats CUDA as a compile-time stub; the
+  `backend_cuda.cu` / `coli_cuda.dll` path remains unimplemented.
+- No stable DLL ABI or multi-GPU orchestration is implemented yet.
+- Full-model validation against a real Windows host with the GLM-5.2 int4
+  checkpoint is still blocked by access to a Windows machine with the model.
+
+### Next unimplemented steps
+
+1. Implement the runtime DLL loader and the production `backend_cuda.cu` /
+   `coli_cuda.dll` build path.
+2. Define and validate the DLL ABI plus multi-GPU sharding behavior for
+   `COLI_GPUS`, P2P, and UVA paths.
+3. Run byte-for-byte validation against the Linux oracle once a Windows host
+   with the model is available.
+
 ---
 
 ## Phase 1 — basic compat shims (✅ complete)

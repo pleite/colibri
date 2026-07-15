@@ -8,6 +8,34 @@ All accelerator code follows the same pattern as the CUDA backend: a thin
 abstraction layer in `c/backend_*.{hip,c}` exports the same `coli_cuda_*` API,
 so `glm.c` and the rest of the engine stay unchanged across backends.
 
+## Current status (2026-07-15)
+
+The repository now contains ROCm/HIP backend sources (`c/backend_rocm.hip`), a
+Vulkan backend shim (`c/backend_vulkan.c`), and an NPU compatibility backend
+(`c/backend_npu.c`) that are wired into the engine entry points. The main gaps
+that remain are about finishing the backend contract and proving hardware-ready
+integration rather than adding the initial abstraction layer:
+
+- ROCm/HIP support is present as a backend abstraction and build target, but the
+  low-bit resident-tensor stack is still not implemented end to end.
+- Vulkan is present as a host-fallback shim and build target; the shader
+  pipeline, descriptor/command submission path, and device-validated tests
+  remain unfinished.
+- NPU support is currently a compatibility shim and capability gate; real XDNA 2
+  offload, fixed-shape kernels, and telemetry remain pending.
+- The FP8/FP6/FP4 resident-format path, converter metadata, and runtime gating
+  are still not implemented.
+
+### Next unimplemented steps
+
+1. Complete the Vulkan compute pipeline (SPIR-V blobs, descriptor setup,
+   command recording, and tests) and prove correctness on Mesa/RADV.
+2. Add the real NPU offload path for fixed-shape subgraphs and surface
+   capability/fallback reporting in the planner and doctor flows.
+3. Implement the FP8/FP6/FP4 resident-format path end to end, including
+   converter metadata, runtime capability checks, and the ROCm kernel dispatch
+   points.
+
 ## Gap analysis: AMD Strix Halo + ROCmFPX / Charlie1234 scope
 
 The current plan covers the ROCm and Vulkan backends, but it still needs an

@@ -8,6 +8,8 @@
 
 **Tech Stack:** C99, safetensors, Qwen3 tokenizer, OpenAI API compat, Jinja2 chat template.
 
+**Current implementation note:** The qwen35 engine in `c/qwen35_moe.c` already implements the core text path for full-attention layers (including RoPE, q_norm/k_norm, GQA-style KV reuse, softmax attention, and KV cache) and the OpenAI-compatible gateway in `c/openai_server.py` now forwards `top_k` and `seed` requests. The remaining work is concentrated in multimodal support, deeper linear-attention fidelity, and other API features such as logprobs/embeddings.
+
 ---
 
 ## Model Metadata Summary (Source of Truth)
