@@ -327,6 +327,48 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(summary['needs_reprocessing_count'], 1)
             self.assertEqual(summary['needs_reprocessing'][0], task['task_id'])
 
+    def test_inspect_state_requires_all_expected_output_tensors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            state_dir = output_dir / '.state'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            state_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.language_model.embed_tokens.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            task = {
+                'task_id': 'model.safetensors:model.language_model.embed_tokens.weight',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'model.language_model.embed_tokens.weight',
+                'meta': {'dtype': 'F32', 'shape': [2, 2], 'data_offsets': [0, 16]},
+                'source_path': input_dir / 'model.safetensors',
+            }
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            payload_dir = state_dir / 'payloads'
+            payload_dir.mkdir(parents=True, exist_ok=True)
+            main_payload = payload_dir / 'main.bin'
+            main_payload.write_bytes(b'payload')
+            state_payload = {
+                'task_id': task['task_id'],
+                'output_tensors': [
+                    {'name': 'model.embed_tokens.weight', 'payload_path': main_payload.name, 'dtype': 'U8', 'shape': [2, 2]},
+                ],
+            }
+            state_path = state_dir / module.state_file_name_for_task_id(task['task_id'])
+            state_path.write_text(json.dumps(state_payload), encoding='utf-8')
+            result = module.inspect_task_state(state_dir, output_dir, task)
+            self.assertEqual(result['status'], 'incomplete')
+            self.assertEqual(result['reason'], 'missing_expected_tensors')
+            self.assertEqual(result['missing_tensors'], ['model.embed_tokens.weight.qs'])
+
     def test_inspect_state_reports_reprocessing_candidates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)

@@ -476,17 +476,24 @@ def inspect_task_state(state_dir, output_path, task):
         output_tensors = payload.get('output_tensors', [])
         if not isinstance(output_tensors, list):
             return {'status': 'incomplete', 'reason': 'invalid_state', 'state_path': state_path}
+        seen_names = set()
         has_payload_issues = False
         for entry in output_tensors:
             if not isinstance(entry, dict):
                 has_payload_issues = True
                 continue
             payload_name = entry.get('payload_path')
+            tensor_name = entry.get('name')
+            if tensor_name is not None:
+                seen_names.add(tensor_name)
             if not payload_name:
                 has_payload_issues = True
                 continue
             if not (state_dir / 'payloads' / payload_name).is_file():
                 has_payload_issues = True
+        missing_expected = [name for name in expected if name not in seen_names]
+        if missing_expected:
+            return {'status': 'incomplete', 'reason': 'missing_expected_tensors', 'state_path': state_path, 'missing_tensors': missing_expected}
         if has_payload_issues:
             return {'status': 'incomplete', 'reason': 'missing_payloads', 'state_path': state_path}
         return {'status': 'complete', 'kind': 'state', 'state_path': state_path}
