@@ -249,6 +249,82 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
 
+    def test_state_progress_marks_incomplete_state_files_for_reprocessing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            state_dir = output_dir / '.state'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            state_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            task = {
+                'task_id': 'model.safetensors:model.layers.0.self_attn.q_proj.weight',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'model.layers.0.self_attn.q_proj.weight',
+                'meta': {'dtype': 'F32', 'shape': [2, 2], 'data_offsets': [0, 16]},
+                'source_path': input_dir / 'model.safetensors',
+            }
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            state_payload = {
+                'task_id': task['task_id'],
+                'output_tensors': [
+                    {'name': 'model.layers.0.self_attn.q_proj.weight', 'payload_path': 'missing.bin', 'dtype': 'U8', 'shape': [2, 2]},
+                ],
+            }
+            state_path = state_dir / module.state_file_name_for_task_id(task['task_id'])
+            state_path.write_text(json.dumps(state_payload), encoding='utf-8')
+            summary = module.summarize_state_progress(state_dir, output_dir, [task])
+            self.assertEqual(summary['incomplete_state_files'], 1)
+            self.assertEqual(summary['needs_reprocessing_count'], 1)
+            self.assertEqual(summary['needs_reprocessing'][0], task['task_id'])
+
+    def test_inspect_state_reports_reprocessing_candidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            input_dir = tmpdir / 'input'
+            output_dir = tmpdir / 'output'
+            state_dir = output_dir / '.state'
+            input_dir.mkdir()
+            output_dir.mkdir()
+            state_dir.mkdir()
+            self.write_safetensors(
+                input_dir / 'model.safetensors',
+                [
+                    ('model.layers.0.self_attn.q_proj.weight', [0.1, -0.2, 0.3, -0.4], [2, 2], 'F32'),
+                ],
+            )
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            state_payload = {
+                'task_id': 'model.safetensors:model.layers.0.self_attn.q_proj.weight',
+                'output_tensors': [
+                    {'name': 'model.layers.0.self_attn.q_proj.weight', 'payload_path': 'missing.bin', 'dtype': 'U8', 'shape': [2, 2]},
+                ],
+            }
+            state_file_path = state_dir / module.state_file_name_for_task_id(
+                'model.safetensors:model.layers.0.self_attn.q_proj.weight',
+            )
+            state_file_path.write_text(json.dumps(state_payload), encoding='utf-8')
+            result = subprocess.run(
+                [sys.executable, str(self.converter_script_path()), '--input', str(input_dir), '--output', str(output_dir), '--inspect-state'],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('state progress:', result.stdout)
+            self.assertIn('needs reprocessing: 1', result.stdout)
+
     def test_converter_retries_after_worker_pool_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
