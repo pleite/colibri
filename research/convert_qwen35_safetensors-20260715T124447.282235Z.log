@@ -1,0 +1,73 @@
+2026-07-15 13:44:47,282 INFO converter starting: input=/opt/models/ornith-fp8 output=/opt/models/ornith-int8
+2026-07-15 13:44:47,282 INFO log file: /opt/models/ornith-int8/convert_qwen35_safetensors-20260715T124447.282235Z.log
+2026-07-15 13:44:47,282 INFO copied config.json
+2026-07-15 13:44:47,283 INFO copied tokenizer.json
+2026-07-15 13:44:47,733 INFO discovered 122 safetensors file(s) and 185811 tensor task(s)
+2026-07-15 13:44:47,733 INFO using state dir: /opt/models/ornith-int8/.state
+2026-07-15 13:44:48,576 INFO resumed 351 existing tensor task(s)
+2026-07-15 13:44:48,577 INFO using 32 worker(s) for streaming conversion
+2026-07-15 13:46:01,240 WARNING worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight; retrying 1 task(s) with 1 worker(s) (attempt 2/3)
+2026-07-15 13:46:01,240 ERROR worker pool failure details for model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 768, in _process_task_batch
+    output_tensors = completed_future.result()
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 443, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 395, in __get_result
+    raise self._exception
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 783, in process_pending_tasks
+    _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 771, in _process_task_batch
+    raise WorkerPoolFailure(task_result, exc) from exc
+WorkerPoolFailure: worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight: A process in the process pool was terminated abruptly while the future was running or pending.
+2026-07-15 13:47:15,373 WARNING worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight; retrying 1 task(s) with 1 worker(s) (attempt 3/3)
+2026-07-15 13:47:15,373 ERROR worker pool failure details for model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 768, in _process_task_batch
+    output_tensors = completed_future.result()
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 443, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 395, in __get_result
+    raise self._exception
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 783, in process_pending_tasks
+    _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 771, in _process_task_batch
+    raise WorkerPoolFailure(task_result, exc) from exc
+WorkerPoolFailure: worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight: A process in the process pool was terminated abruptly while the future was running or pending.
+2026-07-15 13:48:27,837 ERROR conversion failed
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 768, in _process_task_batch
+    output_tensors = completed_future.result()
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 443, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 395, in __get_result
+    raise self._exception
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 875, in main
+    process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, len(tasks))
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 783, in process_pending_tasks
+    _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 771, in _process_task_batch
+    raise WorkerPoolFailure(task_result, exc) from exc
+WorkerPoolFailure: worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight: A process in the process pool was terminated abruptly while the future was running or pending.
