@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class Qwen35QuantConverterTest(unittest.TestCase):
@@ -245,6 +246,68 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             header = self.read_header(output_dir / 'model.safetensors')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight']['dtype'], 'U8')
             self.assertEqual(header['model.layers.0.self_attn.q_proj.weight.qs']['dtype'], 'F32')
+
+    def test_converter_retries_after_worker_pool_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            state_dir = tmpdir / 'state'
+            state_dir.mkdir()
+            task = {
+                'task_id': 'model.safetensors:some.tensor',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'some.tensor',
+            }
+
+            class FakeFuture:
+                def __init__(self, result=None, exception=None):
+                    self._result = result
+                    self._exception = exception
+
+                def result(self):
+                    if self._exception is not None:
+                        raise self._exception
+                    return self._result
+
+            class FakeExecutor:
+                submit_calls = 0
+
+                def __init__(self, max_workers):
+                    self.max_workers = max_workers
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def submit(self, fn, task, logger=None):
+                    FakeExecutor.submit_calls += 1
+                    if FakeExecutor.submit_calls == 1:
+                        raise module.concurrent.futures.process.BrokenProcessPool('simulated worker crash')
+                    return FakeFuture(result=[('some.tensor', b'payload', 'U8', [1])])
+
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            def fake_wait(futures, return_when=None):
+                return ({next(iter(futures))}, set())
+
+            with patch.object(module.concurrent.futures, 'ProcessPoolExecutor', FakeExecutor), \
+                 patch.object(module.concurrent.futures, 'wait', side_effect=fake_wait):
+                completed = {}
+                module.process_pending_tasks(
+                    [task],
+                    workers=2,
+                    logger=module.logging.getLogger('test'),
+                    completed=completed,
+                    state_dir=state_dir,
+                    total_tasks=1,
+                    max_retries=2,
+                )
+
+            self.assertIn(task['task_id'], completed)
+            self.assertEqual(completed[task['task_id']]['kind'], 'state')
 
     def test_converter_logs_failures_to_log_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
