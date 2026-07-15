@@ -219,6 +219,44 @@ static void write_quantized_model(const char *dir) {
     write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
 }
 
+static void write_quantized_model_with_language_model_prefixes(const char *dir) {
+    make_model_dir(dir);
+    char config_path[1024];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
+    FILE *fp = fopen(config_path, "w");
+    if (!fp) fail("cannot write %s", config_path);
+    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fclose(fp);
+
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_path[1024];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+
+    const uint8_t embed_bytes[16] = {
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15, 16,
+    };
+    const float embed_scales[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    const uint8_t q_proj_bytes[8] = {0x0b, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c};
+    const float q_proj_scales[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    raw_tensor tensors[] = {
+        {"model.language_model.embed_tokens.weight", embed_bytes, 16, sizeof(embed_bytes), "U8"},
+        {"model.language_model.embed_tokens.weight.qs", embed_scales, 4, sizeof(embed_scales), "F32"},
+        {"model.language_model.norm.weight", embed_scales, 4, sizeof(embed_scales), "F32"},
+        {"model.language_model.layers.0.self_attn.q_proj.weight", q_proj_bytes, 8, sizeof(q_proj_bytes), "U8"},
+        {"model.language_model.layers.0.self_attn.q_proj.weight.qs", q_proj_scales, 4, sizeof(q_proj_scales), "F32"},
+    };
+    write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+}
+
 static void write_model_with_split_index(const char *dir) {
     make_model_dir(dir);
     char config_path[1024];
@@ -449,6 +487,16 @@ int main(void) {
     run_engine(quant_tmp, 4, tokens, 2, quant_actual);
     for (int i = 0; i < 4; i++) {
         if (quant_actual[i] < 0) fail("quantized model produced invalid token %d", quant_actual[i]);
+    }
+
+    char prefix_dir[] = "/tmp/colibri-qwen35-prefix-XXXXXX";
+    char *prefix_tmp = mkdtemp(prefix_dir);
+    if (!prefix_tmp) fail("mkdtemp failed");
+    write_quantized_model_with_language_model_prefixes(prefix_tmp);
+    int prefix_actual[4] = {0, 0, 0, 0};
+    run_engine(prefix_tmp, 4, tokens, 2, prefix_actual);
+    for (int i = 0; i < 4; i++) {
+        if (prefix_actual[i] < 0) fail("prefixed quantized model produced invalid token %d", prefix_actual[i]);
     }
 
     puts("qwen35_moe test: ok");
