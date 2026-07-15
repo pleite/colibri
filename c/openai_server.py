@@ -468,8 +468,6 @@ def generation_options(body, limit):
         raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
-    if body.get("seed") is not None:
-        raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
     response_format = body.get("response_format")
     if response_format not in (None, {"type": "text"}):
         raise APIError(400, "Only the default text response format is supported.",
@@ -484,15 +482,23 @@ def generation_options(body, limit):
         maximum = min(256, limit)
     temperature = body.get("temperature")
     top_p = body.get("top_p")
+    top_k = body.get("top_k")
+    seed = body.get("seed")
     temperature = 0.7 if temperature is None else temperature
     top_p = 0.9 if top_p is None else top_p
+    top_k = 0 if top_k is None else top_k
+    seed = 0 if seed is None else seed
     if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
         raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
     if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p)
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+        raise APIError(400, "`top_k` must be a non-negative integer.", "top_k")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise APIError(400, "`seed` must be a non-negative integer.", "seed")
+    return maximum, float(temperature), float(top_p), top_k, seed
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -536,7 +542,7 @@ class Engine:
         self.kv_slots = kv_slots
         read_engine_turn(self.process.stdout, READY, lambda _: None)
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0, top_k=0, seed=0):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -553,7 +559,7 @@ class Engine:
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
             header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
-                      f"{top_p:.8g} {cache_slot}\n").encode()
+                      f"{top_p:.8g} {cache_slot} {top_k} {seed}\n").encode()
             self.process.stdin.write(header + payload + b"\n")
             self.process.stdin.flush()
             stats = read_engine_turn(self.process.stdout, END, decode)
@@ -709,7 +715,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def generation(self, body, prompt, request_id, chat, enable_thinking=False):
-        maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, top_k, seed = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
         cache_slot = body.get("cache_slot", 0)
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
@@ -736,7 +742,8 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot)
+                    prompt, maximum, temperature, top_p, output.append, cache_slot,
+                    top_k=top_k, seed=seed)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
@@ -852,7 +859,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         emit_content(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
+                    top_k=top_k, seed=seed)
                 if not sp["tool"] and sp["buf"]:
                     emit_content(sp["buf"])             # no tool call happened: flush held tail
                 _content, calls = _parse_tools("".join(raw), tools)
@@ -908,7 +916,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 ts["buf"] = ts["buf"][flush:]
                             break
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_thinking, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_thinking, cache_slot,
+                    top_k=top_k, seed=seed)
                 # Flush any remaining buffer
                 if ts["buf"]:
                     if ts["seen_close"] or not ts["in_think"]:
@@ -922,7 +931,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     emit_content(chunk)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
+                    top_k=top_k, seed=seed)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
