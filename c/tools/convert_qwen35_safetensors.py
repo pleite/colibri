@@ -725,6 +725,74 @@ def handle_completed_task(completed, state_dir, logger, task_result, output_tens
     render_progress(len(completed), total_tasks, 'converting %s' % task_result['source_name'])
 
 
+class WorkerPoolFailure(RuntimeError):
+    def __init__(self, task, exc):
+        self.task = task
+        self.exc = exc
+        super().__init__('worker pool failure while processing %s: %s' % (task['task_id'], exc))
+
+
+def _is_retryable_worker_error(exc):
+    broken_pool_type = getattr(concurrent.futures.process, 'BrokenProcessPool', None)
+    if broken_pool_type is not None and isinstance(exc, broken_pool_type):
+        return True
+    return isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError, OSError, TimeoutError))
+
+
+def _process_task_batch(pending_tasks, workers, logger, completed, state_dir, total_tasks):
+    futures = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        for task in pending_tasks:
+            try:
+                futures[executor.submit(convert_task, task, logger=None)] = task
+            except Exception as exc:
+                if _is_retryable_worker_error(exc):
+                    raise WorkerPoolFailure(task, exc) from exc
+                raise
+            if len(futures) >= max(1, workers * 2):
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                for completed_future in done:
+                    task_result = futures.pop(completed_future)
+                    try:
+                        output_tensors = completed_future.result()
+                    except Exception as exc:
+                        if _is_retryable_worker_error(exc):
+                            raise WorkerPoolFailure(task_result, exc) from exc
+                        raise
+                    handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks)
+        while futures:
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            for completed_future in done:
+                task_result = futures.pop(completed_future)
+                try:
+                    output_tensors = completed_future.result()
+                except Exception as exc:
+                    if _is_retryable_worker_error(exc):
+                        raise WorkerPoolFailure(task_result, exc) from exc
+                    raise
+                handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks)
+
+
+def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, total_tasks, max_retries=3):
+    remaining_tasks = list(pending_tasks)
+    workers_for_attempt = max(1, workers)
+    for attempt in range(max_retries):
+        if not remaining_tasks:
+            return
+        try:
+            _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
+            return
+        except WorkerPoolFailure as exc:
+            if attempt >= max_retries - 1:
+                raise
+            remaining_tasks = [task for task in remaining_tasks if task['task_id'] not in completed]
+            if not remaining_tasks:
+                return
+            logger.warning('worker pool failure while processing %s; retrying %d task(s) with %d worker(s) (attempt %d/%d)', exc.task['task_id'], len(remaining_tasks), 1, attempt + 2, max_retries)
+            logger.exception('worker pool failure details for %s', exc.task['task_id'])
+            workers_for_attempt = 1
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert standard safetensors to the qwen35_moe quantized layout')
     parser.add_argument('--input', default=None)
@@ -800,26 +868,11 @@ def main():
                 continue
             pending_tasks = [task for task in source_tasks if task['task_id'] not in completed]
             if pending_tasks:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                    futures = {}
-                    for task in pending_tasks:
-                        # Worker processes do not inherit the parent's logger configuration,
-                        # so each worker stays fully self-contained and no shared handler state
-                        # is required across the process pool. The converter therefore sends
-                        # the already-decoded tensor payloads back to the parent process.
-                        futures[executor.submit(convert_task, task, logger=None)] = task
-                        if len(futures) >= max_pending:
-                            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                            completed_future = next(iter(done))
-                            task_result = futures.pop(completed_future)
-                            output_tensors = completed_future.result()
-                            handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
-                    while futures:
-                        done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                        completed_future = next(iter(done))
-                        task_result = futures.pop(completed_future)
-                        output_tensors = completed_future.result()
-                        handle_completed_task(completed, state_dir, logger, task_result, output_tensors, len(tasks))
+                # Worker processes do not inherit the parent's logger configuration,
+                # so each worker stays fully self-contained and no shared handler state
+                # is required across the process pool. The converter therefore sends
+                # the already-decoded tensor payloads back to the parent process.
+                process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, len(tasks))
             source_out_file = output_file_for_source(output_path, source_group['source_name'])
             written_names = write_final_output(source_out_file, source_tasks, completed, state_dir, output_path)
             tensor_names.extend(written_names)
