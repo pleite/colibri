@@ -617,7 +617,8 @@ class APIHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not origin or ("*" not in self.server.cors_origins and origin not in self.server.cors_origins):
             return
-        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
+        safe_origin = origin.replace("\r", "").replace("\n", "")
+        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else safe_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Expose-Headers",
