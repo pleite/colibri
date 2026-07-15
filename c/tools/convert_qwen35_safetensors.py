@@ -692,20 +692,16 @@ def log_task_start(task, logger):
     logger.info('starting %s', describe_task(task))
 
 
-def task_payload_bytes(task):
+def task_payload_bytes(task, logger=None):
     meta = task.get('meta', {})
     data_offsets = meta.get('data_offsets', [])
     if not isinstance(data_offsets, (list, tuple)) or len(data_offsets) != 2:
         return None
     if data_offsets[1] < data_offsets[0]:
+        if logger is not None:
+            logger.warning('ignoring invalid negative payload span while sizing %s for worker-pool execution', task.get('task_id', '<unknown>'))
         return None
     return data_offsets[1] - data_offsets[0]
-
-
-def task_has_invalid_payload_offsets(task):
-    meta = task.get('meta', {})
-    data_offsets = meta.get('data_offsets', [])
-    return isinstance(data_offsets, (list, tuple)) and len(data_offsets) == 2 and data_offsets[1] < data_offsets[0]
 
 
 def estimate_converted_payload_bytes(task):
@@ -714,8 +710,11 @@ def estimate_converted_payload_bytes(task):
     shape = meta.get('shape')
     if tensor_name is None or not isinstance(shape, (list, tuple)):
         return None
-    output_tensor_name = normalize_tensor_name_for_engine(tensor_name)
-    quant_kind = should_quantize(output_tensor_name)
+    try:
+        output_tensor_name = normalize_tensor_name_for_engine(tensor_name)
+        quant_kind = should_quantize(output_tensor_name)
+    except Exception:
+        return None
     if len(shape) == 2 and quant_kind:
         out_dim = shape[0]
         packed_bytes = expected_payload_size('U8', shape, quant_kind=quant_kind)
@@ -724,8 +723,8 @@ def estimate_converted_payload_bytes(task):
     return expected_payload_size('F32', shape)
 
 
-def worker_pool_skip_reason(task, max_task_bytes=MAX_WORKER_POOL_TASK_BYTES):
-    payload_bytes = task_payload_bytes(task)
+def worker_pool_skip_reason(task, max_task_bytes=MAX_WORKER_POOL_TASK_BYTES, logger=None):
+    payload_bytes = task_payload_bytes(task, logger=logger)
     if payload_bytes is not None and payload_bytes > max_task_bytes:
         return f'input payload {payload_bytes} bytes exceeds worker-pool threshold {max_task_bytes} bytes'
     converted_payload_bytes = estimate_converted_payload_bytes(task)
@@ -991,9 +990,7 @@ def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, 
     remaining_tasks = []
     sequential_tasks = []
     for task in pending_tasks:
-        if task_has_invalid_payload_offsets(task):
-            logger.warning('ignoring invalid negative payload span while sizing %s for worker-pool execution', task['task_id'])
-        skip_reason = worker_pool_skip_reason(task)
+        skip_reason = worker_pool_skip_reason(task, logger=logger)
         if skip_reason is None:
             remaining_tasks.append(task)
             continue
