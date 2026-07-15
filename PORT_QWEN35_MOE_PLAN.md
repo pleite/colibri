@@ -7,6 +7,40 @@ This is a **new engine**, not a modification of `glm.c`. The Qwen3.5 architectur
 differs from GLM-5.2 in attention mechanism, routing, MTP placement, and weight
 layout — all of which require a separate implementation.
 
+## Current status (2026-07-15)
+
+The repository now has a real `c/qwen35_moe.c` engine binary, safetensors
+loading logic, a toy-model test harness, and converter/tooling glue. The
+implementation is still a CPU-only correctness scaffold rather than a full
+Qwen3.5 production engine, so the remaining work is focused on feature
+completeness and validation:
+
+- `c/qwen35_moe.c` now has a working skeleton for config parsing, safetensors
+  loading, tokenizer scaffolding, and a tiny forward pass.
+- The current path is not yet a faithful implementation of the full Qwen3.5
+  attention/MoE/MTP architecture for real-world models.
+- Quantization and optimization work (int4 weights, int8 activations, expert
+  caching, GPU offload) remains pending.
+- Reference-level validation against a transformers oracle is still missing.
+- The feature audits in `docs/plans/2026-07-15_engine-capability-audit.md` and
+  `docs/plans/2026-07-15_copilot-ornith-feature-completeness.md` call out
+  additional expected capabilities beyond the initial skeleton: full attention
+  math (RoPE/GQA/KV cache), faithful linear-attention behavior, grammar-
+  constrained decoding, embeddings/logprobs, and multimodal token handling for
+  vision/video/audio.
+
+### Next unimplemented steps
+
+1. Replace the scaffolding with a fuller forward-pass implementation for the
+   Qwen3.5 layer types and tensor layout used by real models.
+2. Add teacher-forcing and generation tests against a transformers oracle, not
+   just the current synthetic fixture.
+3. Implement the docs-driven feature gaps: actual attention computation,
+   linear-attention fidelity, KV-cache persistence, grammar-constrained
+   decoding, embeddings/logprobs, and multimodal prompt handling.
+4. Implement quantization and caching optimizations, then harden the
+   integration points in the CLI, doctor, planning, and serving flows.
+
 ---
 
 ## Architecture Differences: GLM-5.2 vs Qwen3.5 MoE
