@@ -13,8 +13,8 @@ class FakeEngine:
     def __init__(self):
         self.calls = []
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
-        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0, top_k=0, seed=0):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, top_k, seed))
         on_text("Hé")
         on_text("llo")
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
@@ -26,10 +26,11 @@ class BlockingEngine(FakeEngine):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0, top_k=0, seed=0):
         self.entered.set()
         self.release.wait(2)
-        return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot)
+        return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
+                                top_k=top_k, seed=seed)
 
 
 class TemplateTest(unittest.TestCase):
@@ -48,11 +49,15 @@ class TemplateTest(unittest.TestCase):
             "<|assistant|><think></think>",
         )
 
-    def test_rejects_non_text_content(self):
-        with self.assertRaisesRegex(APIError, "text message content only"):
-            render_chat([{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "x"}}
-            ]}])
+    def test_renders_multimodal_placeholders(self):
+        prompt = render_chat([{"role": "user", "content": [
+            {"type": "text", "text": "Hi"},
+            {"type": "image_url", "image_url": {"url": "x"}},
+            {"type": "audio_url", "audio_url": {"url": "y"}},
+        ]}])
+        self.assertIn("Hi", prompt)
+        self.assertIn("[image]", prompt)
+        self.assertIn("[audio]", prompt)
 
     def test_renders_thinking_prefix(self):
         self.assertEqual(
@@ -61,12 +66,18 @@ class TemplateTest(unittest.TestCase):
         )
 
     def test_validates_generation_limits(self):
-        self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
-                         (4, 0.0, 1.0))
+        self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1, "top_k": 8, "seed": 7}, 8),
+                         (4, 0.0, 1.0, 8, 7, None))
         with self.assertRaises(APIError):
             generation_options({"max_tokens": 9}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
-                         (8, 0.7, 0.9))
+                         (8, 0.7, 0.9, 0, 0, None))
+        self.assertEqual(generation_options({"logprobs": True, "response_format": {"type": "json_object"}}, 8),
+                         (8, 0.7, 0.9, 0, 0, 5))
+        with self.assertRaises(APIError):
+            generation_options({"top_k": -1}, 8)
+        with self.assertRaises(APIError):
+            generation_options({"seed": -1}, 8)
 
 
 class ProtocolTest(unittest.TestCase):

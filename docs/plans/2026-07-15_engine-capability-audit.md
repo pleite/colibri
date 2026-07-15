@@ -13,32 +13,32 @@ The colibrì engine for Qwen3.5 MoE is a **skeleton forward pass** with correct 
 
 ### Status at a Glance
 
-> Follow-up note for the next implementation pass: the current qwen35 serve path now speaks the gateway protocol, but the prompt-to-token path remains a lightweight placeholder (`parse_token_ids()` still uses a hash-based fallback) and the gateway still needs a real token-to-text decoder before it can expose model-native text output instead of scaffold-style token IDs.
+> Implementation update: the current qwen35 serve path now speaks the gateway protocol with real attention math, RoPE, q_norm/k_norm, KV cache, and request-level sampling controls. The prompt-to-token path is still a lightweight fallback for non-numeric tokens (`parse_token_ids()` uses a hash fallback), but the engine/runtime path is substantially more complete than the original skeleton audit.
 
 | Component | Status | Lines of Code | Notes |
 |-----------|--------|--------------|-------|
 | Model loading (config + tensors) | ✅ Working | ~350 lines | Handles all text_config fields, layer types, quantized tensors |
-| Full attention layer | ⚠️ Skeleton | ~40 lines | QKV projected but **no actual attention computation** (no softmax, no scaling, no KV cache) |
-| Linear attention layer | ❌ Stub | ~5 lines | Only does `hidden * 0.1` — **not a real linear attention forward** |
+| Full attention layer | ✅ Working | ~40 lines | Implements QKV projection, RoPE, q_norm/k_norm, GQA-style KV reuse, softmax attention, and KV cache |
+| Linear attention layer | ⚠️ Partial | ~20 lines | Uses a lightweight gated projection path rather than a full SSM implementation |
 | Shared expert | ✅ Working | ~30 lines | gate→silu→up→silu→down→residual with sigmoid gating |
 | Expert routing (top-k MoE) | ✅ Working | ~50 lines | Router softmax → top-k → weighted expert sum |
 | Dense MLP (full-attn only) | ✅ Working | ~15 lines | gate→silu→up→silu→down |
-| Sampling (greedy + top-k) | ✅ Working | ~40 lines | Temperature-scaled top-k with cumulative probability sampling |
+| Sampling (greedy + top-k + top-p + seed) | ✅ Working | ~40 lines | Temperature-scaled sampling with top-k/top-p filtering and seeded RNG |
 | Chat template (Qwen format) | ✅ Working | ~120 lines | Text-only subset of jinja template, tool calling support |
 | Tool calling (GLM + Qwen) | ✅ Working | ~100 lines | Two parsers/formatters, streaming support |
 | Reasoning/thinking split | ✅ Working | ~15 lines | `split_thinking()` separates `<think>...</think>` blocks |
-| OpenAI API server | ✅ Working | ~400 lines | Chat completions, streaming, KV slots, CORS, auth |
+| OpenAI API server | ✅ Working | ~400 lines | Chat completions, streaming, KV slots, CORS, auth, top_k and seed forwarding |
 | Embeddings endpoint | ❌ Stub | 3 lines | Returns 501 |
 | Vision encoder | ❌ Missing | 0 lines | No vision model loaded or implemented |
 | Video support | ❌ Missing | 0 lines | No video preprocessing or temporal handling |
 | Audio support | ❌ Missing | 0 lines | No audio encoder or processing |
-| KV cache persistence | ❌ Missing | 0 lines | No cache struct, no save/load |
-| RoPE (rotary position embeddings) | ❌ Missing | 0 lines | Not implemented in attention or embedding |
-| GQA norms (q_norm, k_norm) | ⚠️ Loaded but unused | tensors loaded | Fields exist in struct but never used in forward |
+| KV cache persistence | ❌ Missing | 0 lines | Cache is in-memory only; no save/load |
+| RoPE (rotary position embeddings) | ✅ Working | ~20 lines | Implemented for full attention heads |
+| GQA norms (q_norm, k_norm) | ✅ Working | ~10 lines | Loaded and applied in attention forward |
 | Grammar-constrained decoding | ❌ Missing | 0 lines | `grammar.h` exists but not integrated |
 | Logits output (for logprobs) | ❌ Missing | 0 lines | Engine discards logits after argmax |
-| Seed support | ❌ Rejected | 0 lines | API returns 400 "not supported yet" |
-| top_k in API | ⚠️ Engine supports, API doesn't pass | engine: yes, server: no | `generation_options()` ignores top_k |
+| Seed support | ✅ Working | ~10 lines | API passes per-request seeds into sampling |
+| top_k in API | ✅ Working | ~10 lines | API validates and forwards `top_k` to the engine |
 
 ---
 
@@ -146,24 +146,21 @@ The Qwen3.5 linear attention layer is a **State Space Model (SSM)** similar to M
 
 ---
 
-## 4. Sampling — ✅ WORKING (but limited)
+## 4. Sampling — ✅ WORKING (with request-level controls)
 
 **File:** `c/qwen35_moe.c:891-1020` (`run_model()` sampling section)
 
 ### What works:
 - **Greedy decoding** (`temperature=0`): argmax over logits
 - **Top-k sampling** with temperature: selects top-k logits, applies temperature-scaled softmax, samples proportionally
-- `top_k` CLI flag accepted and passed to `run_model()`
+- **Top-p sampling**: filters the top-k pool to the cumulative-probability subset before sampling
+- **Per-request seed control**: `run_model()` seeds the RNG when `seed != 0`
+- `top_k` / `top_p` / `seed` are accepted by the CLI and API gateway
 
-### What's missing:
-1. **`top_p` (nucleus sampling):** Not implemented. The model's `generation_config.json` specifies `top_p: 0.95`.
-2. **`min_p` sampling:** Not implemented but supported by Qwen3.5.
-3. **Repetition penalty:** Not implemented.
-4. **Seed control:** `srand(time(NULL))` — non-deterministic. API rejects `seed` parameter.
-5. **Logits output:** Engine discards logits after sampling. No way to get probabilities for `logprobs`.
-
-### How to add top_p:
-After selecting top-k, filter to cumulative probability ≤ top_p, then sample from that subset.
+### What's still missing:
+1. **`min_p` sampling:** Not implemented but supported by Qwen3.5.
+2. **Repetition penalty:** Not implemented.
+3. **Logits output:** Engine discards logits after sampling. No way to get probabilities for `logprobs`.
 
 ---
 
@@ -321,12 +318,11 @@ After selecting top-k, filter to cumulative probability ≤ top_p, then sample f
 | `logprobs` | ❌ Rejected | "not supported yet" |
 | `frequency_penalty` | ❌ Rejected | "not supported yet" |
 | `presence_penalty` | ❌ Rejected | "not supported yet" |
-| `seed` | ❌ Rejected | "not supported yet" |
 | `response_format` | ⚠️ Text only | Only `{"type": "text"}` |
 | `n` | ❌ Rejected | Only `n=1` |
 
 ### Supported parameters:
-- `messages`, `model`, `temperature`, `top_p`, `max_tokens`/`max_completion_tokens`
+- `messages`, `model`, `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`/`max_completion_tokens`
 - `stream`, `stream_options`, `cache_slot`, `enable_thinking`, `reasoning_effort`
 - `tools`/`functions`
 

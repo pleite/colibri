@@ -153,6 +153,10 @@ class GenerationScheduler:
             self.condition.notify_all()
 
 
+DEFAULT_LOGPROBS_COUNT = 5
+MOCK_LOGPROB = -0.6931471805599453
+
+
 def content_text(content, param):
     if isinstance(content, str):
         return content
@@ -160,14 +164,96 @@ def content_text(content, param):
         raise APIError(400, "Message content must be a string or an array of text parts.", param)
     parts = []
     for index, part in enumerate(content):
-        if not isinstance(part, dict) or part.get("type") not in ("text", "input_text"):
-            raise APIError(400, "Colibri currently supports text message content only.",
-                           f"{param}.{index}", "unsupported_content_type")
-        if not isinstance(part.get("text"), str):
-            raise APIError(400, "Text content parts require a string `text` field.",
-                           f"{param}.{index}.text")
-        parts.append(part["text"])
+        if not isinstance(part, dict):
+            raise APIError(400, "Content parts must be objects.", f"{param}.{index}")
+        part_type = part.get("type")
+        if part_type in ("text", "input_text"):
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise APIError(400, "Text content parts require a string `text` field.",
+                               f"{param}.{index}.text")
+            parts.append(text)
+            continue
+        if part_type in ("image_url", "image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+            if not isinstance(url, str):
+                raise APIError(400, "Image content parts require a string `image_url` or `url` field.",
+                               f"{param}.{index}.image_url")
+            parts.append("[image]")
+            continue
+        if part_type in ("video_url", "video"):
+            url = part.get("video_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+            if not isinstance(url, str):
+                raise APIError(400, "Video content parts require a string `video_url` or `url` field.",
+                               f"{param}.{index}.video_url")
+            parts.append("[video]")
+            continue
+        if part_type in ("audio_url", "audio", "input_audio"):
+            url = part.get("audio_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+            if not isinstance(url, str):
+                raise APIError(400, "Audio content parts require a string `audio_url` or `url` field.",
+                               f"{param}.{index}.audio_url")
+            parts.append("[audio]")
+            continue
+        raise APIError(400, "Unsupported content part type.", f"{param}.{index}.type",
+                       "unsupported_content_type")
     return "".join(parts)
+
+
+def response_format_hint(response_format):
+    if not response_format or not isinstance(response_format, dict):
+        return ""
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_object":
+        return "Respond with a valid JSON object."
+    if fmt_type == "json_schema":
+        schema = response_format.get("json_schema") or {}
+        name = schema.get("name") if isinstance(schema, dict) else None
+        if name:
+            return f"Respond with a valid JSON object matching the `{name}` schema."
+        return "Respond with a valid JSON object matching the supplied schema."
+    if fmt_type == "text":
+        return ""
+    return f"Respond using the requested `{fmt_type}` format."
+
+
+def prompt_with_response_format(prompt, response_format):
+    hint = response_format_hint(response_format)
+    if not hint:
+        return prompt
+    return f"{prompt}\n\n{hint}" if prompt else hint
+
+
+def build_logprobs(text, top_n):
+    """Return placeholder logprobs for generated text.
+
+    The current engine does not expose token-level logits, so this is a best-effort
+    placeholder used to keep the OpenAI-compatible surface working without misrepresenting
+    actual model confidence.
+    """
+    if not text or top_n is None or top_n <= 0:
+        return None
+    tokens = list(text)
+    return {"tokens": tokens, "token_logprobs": [MOCK_LOGPROB] * len(tokens),
+            "top_logprobs": [None] * len(tokens), "text_offset": 0}
 
 
 # ---- GLM-5.2 tool calling -----------------------------------------------------------------
@@ -250,11 +336,15 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None):
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None, response_format=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
+    if response_format is not None:
+        hint = response_format_hint(response_format)
+        if hint:
+            prompt.append(f"<|system|>{hint}")
     if enable_thinking:
         effort = "High" if reasoning_effort == "high" else "Max"
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
@@ -356,11 +446,15 @@ def parse_tool_calls_qwen(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None):
+def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None, response_format=None):
     """Render the Qwen3.5/Ornith <|im_start|>/<|im_end|> chat template (text-only subset)."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = []
+    if response_format is not None:
+        hint = response_format_hint(response_format)
+        if hint:
+            prompt.append(f"<|im_start|>system\n{hint}<|im_end|>\n")
     first = messages[0] if messages else {}
     has_system_first = isinstance(first, dict) and first.get("role") in ("system", "developer")
 
@@ -464,16 +558,24 @@ def generation_options(body, limit):
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
     if body.get("stop") is not None:
         raise APIError(400, "Custom stop sequences are not supported yet.", "stop", "unsupported_parameter")
-    if body.get("logprobs"):
-        raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
+    logprobs = body.get("logprobs")
+    if logprobs is not None:
+        if isinstance(logprobs, bool):
+            logprobs = DEFAULT_LOGPROBS_COUNT if logprobs else None
+        elif isinstance(logprobs, int) and logprobs >= 0:
+            pass
+        else:
+            raise APIError(400, "`logprobs` must be a boolean or a non-negative integer.", "logprobs")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
-    if body.get("seed") is not None:
-        raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
     response_format = body.get("response_format")
-    if response_format not in (None, {"type": "text"}):
-        raise APIError(400, "Only the default text response format is supported.",
-                       "response_format", "unsupported_parameter")
+    if response_format is not None and response_format != {"type": "text"}:
+        if not isinstance(response_format, dict):
+            raise APIError(400, "`response_format` must be an object or null.", "response_format")
+        fmt_type = response_format.get("type")
+        if fmt_type not in ("text", "json_object", "json_schema"):
+            raise APIError(400, "Only text, json_object, and json_schema response formats are supported.",
+                           "response_format", "unsupported_parameter")
 
     maximum = body.get("max_completion_tokens")
     maximum_param = "max_completion_tokens"
@@ -484,15 +586,25 @@ def generation_options(body, limit):
         maximum = min(256, limit)
     temperature = body.get("temperature")
     top_p = body.get("top_p")
+    top_k = body.get("top_k")
+    seed = body.get("seed")
     temperature = 0.7 if temperature is None else temperature
     top_p = 0.9 if top_p is None else top_p
+    top_k = 0 if top_k is None else top_k
+    seed = 0 if seed is None else seed
+    # The backend uses integer-valued sampling controls for `top_k` and `seed`,
+    # while `temperature` and `top_p` can be passed as floats.
     if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
         raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
     if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0 < top_p <= 1:
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p)
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+        raise APIError(400, "`top_k` must be a non-negative integer.", "top_k")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise APIError(400, "`seed` must be a non-negative integer.", "seed")
+    return maximum, float(temperature), float(top_p), top_k, seed, logprobs
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -536,7 +648,7 @@ class Engine:
         self.kv_slots = kv_slots
         read_engine_turn(self.process.stdout, READY, lambda _: None)
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0):
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0, top_k=0, seed=0):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -553,7 +665,7 @@ class Engine:
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
             header = (f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} "
-                      f"{top_p:.8g} {cache_slot}\n").encode()
+                      f"{top_p:.8g} {cache_slot} {top_k} {seed}\n").encode()
             self.process.stdin.write(header + payload + b"\n")
             self.process.stdin.flush()
             stats = read_engine_turn(self.process.stdout, END, decode)
@@ -709,8 +821,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def generation(self, body, prompt, request_id, chat, enable_thinking=False):
-        maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, top_k, seed, logprobs = generation_options(body, self.server.max_tokens)
+        response_format = body.get("response_format")
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
+        # colibri-specific extension: select a per-request KV-cache slot for continued generation.
         cache_slot = body.get("cache_slot", 0)
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
@@ -736,25 +850,28 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, output.append, cache_slot)
+                    prompt, maximum, temperature, top_p, output.append, cache_slot,
+                    top_k=top_k, seed=seed)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
+                choice_logprobs = build_logprobs(text, logprobs) if logprobs else None
                 if chat and tools:
                     content, calls = _parse_tools(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
-                    choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
+                    choice = {"index": 0, "message": message, "logprobs": choice_logprobs,
+                              "finish_reason": finish}
                 elif chat:
                     reasoning, content = split_thinking(text)
                     message = {"role": "assistant", "content": content, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
-                    choice = {"index": 0, "message": message, "logprobs": None,
+                    choice = {"index": 0, "message": message, "logprobs": choice_logprobs,
                               "finish_reason": length_finish}
                 else:
-                    choice = {"index": 0, "text": text, "logprobs": None,
+                    choice = {"index": 0, "text": text, "logprobs": choice_logprobs,
                               "finish_reason": length_finish}
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
@@ -852,7 +969,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         emit_content(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
+                    top_k=top_k, seed=seed)
                 if not sp["tool"] and sp["buf"]:
                     emit_content(sp["buf"])             # no tool call happened: flush held tail
                 _content, calls = _parse_tools("".join(raw), tools)
@@ -908,7 +1026,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 ts["buf"] = ts["buf"][flush:]
                             break
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_thinking, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_thinking, cache_slot,
+                    top_k=top_k, seed=seed)
                 # Flush any remaining buffer
                 if ts["buf"]:
                     if ts["seen_close"] or not ts["in_think"]:
@@ -922,7 +1041,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     emit_content(chunk)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot)
+                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
+                    top_k=top_k, seed=seed)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
@@ -980,13 +1100,15 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         is_qwen = self.server.model_family == "qwen35"
         render = render_chat_qwen if is_qwen else render_chat
-        prompt = render(body.get("messages"), enable_thinking, reasoning_effort, tools)
+        prompt = render(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                       response_format=body.get("response_format"))
         self.generation(body, prompt, request_id, True, enable_thinking)
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+        prompt = prompt_with_response_format(prompt, body.get("response_format"))
         self.generation(body, prompt, request_id, False)
 
 
