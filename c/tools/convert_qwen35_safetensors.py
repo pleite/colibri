@@ -241,7 +241,7 @@ def normalize_tensor_name_for_engine(name):
         normalized = 'model.embed_tokens.' + normalized.removeprefix(LANGUAGE_EMBED_PREFIX)
     elif normalized.startswith(LANGUAGE_NORM_PREFIX):
         normalized = 'model.norm.' + normalized.removeprefix(LANGUAGE_NORM_PREFIX)
-    if normalized.endswith(LINEAR_ATTN_SCALAR_SUFFIXES):
+    if any(normalized.endswith(suffix) for suffix in LINEAR_ATTN_SCALAR_SUFFIXES):
         normalized += '.weight'
     return normalized
 
