@@ -120,6 +120,10 @@ typedef struct {
     float *la_A_log;
     float *la_dt_bias;
     float *la_conv1d;
+    float *kv_cache_k;
+    float *kv_cache_v;
+    int kv_cache_len;
+    int kv_cache_cap;
 } QLayer;
 
 typedef struct {
@@ -141,6 +145,9 @@ typedef struct {
     float *lm_head;
     QLayer *layers;
     int *layer_types;
+    float rope_theta;
+    float partial_rotary_factor;
+    bool use_rope;
 } qwen35_model;
 
 static void fail(const char *fmt, ...) {
@@ -170,6 +177,12 @@ static int parse_int_field(jval *obj, const char *key, int fallback) {
     jval *value = json_get(obj, key);
     if (!value || value->t != J_NUM) return fallback;
     return (int)value->num;
+}
+
+static float parse_float_field(jval *obj, const char *key, float fallback) {
+    jval *value = json_get(obj, key);
+    if (!value || value->t != J_NUM) return fallback;
+    return (float)value->num;
 }
 
 static bool parse_bool_field(jval *obj, const char *key) {
@@ -398,6 +411,9 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     m->num_attention_heads = parse_int_field(text_cfg, "num_attention_heads", 1);
     m->num_kv_heads = parse_int_field(text_cfg, "num_key_value_heads", 1);
     m->head_dim = parse_int_field(text_cfg, "head_dim", m->hidden_size);
+    m->rope_theta = parse_float_field(text_cfg, "rope_theta", 10000.0f);
+    m->partial_rotary_factor = parse_float_field(text_cfg, "partial_rotary_factor", 0.25f);
+    m->use_rope = m->rope_theta > 0.0f && m->partial_rotary_factor > 0.0f && m->head_dim > 1;
     m->has_router = parse_bool_field(cfg, "has_moe_router") || m->num_experts > 0;
     if (m->vocab_size <= 0 || m->hidden_size <= 0 || m->num_layers <= 0) {
         fail("invalid qwen config: vocab/hidden/layer sizes must be positive");
@@ -673,6 +689,8 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->la_A_log);
     free(layer->la_dt_bias);
     free(layer->la_conv1d);
+    free(layer->kv_cache_k);
+    free(layer->kv_cache_v);
     if (layer->expert_gate_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
             free(layer->expert_gate_proj[expert]);
@@ -887,6 +905,133 @@ static void blend_vector(float *out, const float *a, const float *b, int n) {
     for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
 }
 
+static void apply_rope(float *values, int head_dim, int position, float theta, float partial_factor) {
+    if (!values || head_dim < 2 || position < 0) return;
+    int rotary_dim = (int)floorf(head_dim * partial_factor);
+    if (rotary_dim <= 0) rotary_dim = 2;
+    if (rotary_dim > head_dim) rotary_dim = head_dim;
+    if ((rotary_dim & 1) != 0) rotary_dim -= 1;
+    if (rotary_dim <= 0) return;
+    for (int pair = 0; pair < rotary_dim / 2; pair++) {
+        int base = pair * 2;
+        float x0 = values[base];
+        float x1 = values[base + 1];
+        float inv_freq = 1.0f / powf(theta, (float)(2 * pair) / (float)head_dim);
+        float angle = (float)position * inv_freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        values[base] = x0 * cos_a - x1 * sin_a;
+        values[base + 1] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+static void sample_logits(const float *logits, int n, float temperature, float top_p, int top_k, int *out_token) {
+    if (n <= 0) return;
+    if (temperature <= 0.0f) {
+        int best = 0;
+        float best_score = logits[0];
+        for (int i = 1; i < n; i++) {
+            if (logits[i] > best_score) {
+                best_score = logits[i];
+                best = i;
+            }
+        }
+        *out_token = best;
+        return;
+    }
+    int *indices = NULL;
+    float *values = NULL;
+    int *kept = NULL;
+    float *keep_scores = NULL;
+    float *probs = NULL;
+    int best = 0;
+    indices = (int *)malloc((size_t)n * sizeof(int));
+    values = (float *)malloc((size_t)n * sizeof(float));
+    if (!indices || !values) {
+        free(indices);
+        free(values);
+        fail("out of memory");
+    }
+    for (int i = 0; i < n; i++) {
+        indices[i] = i;
+        values[i] = logits[i];
+    }
+    for (int i = 0; i < n; i++) {
+        int local_best = i;
+        for (int j = i + 1; j < n; j++) {
+            if (values[indices[j]] > values[indices[local_best]]) local_best = j;
+        }
+        int tmp = indices[i];
+        indices[i] = indices[local_best];
+        indices[local_best] = tmp;
+    }
+    int keep = n;
+    if (top_k > 0 && top_k < keep) keep = top_k;
+    kept = (int *)malloc((size_t)keep * sizeof(int));
+    keep_scores = (float *)malloc((size_t)keep * sizeof(float));
+    if (!kept || !keep_scores) {
+        free(kept);
+        free(keep_scores);
+        free(values);
+        free(indices);
+        fail("out of memory");
+    }
+    for (int i = 0; i < keep; i++) {
+        kept[i] = indices[i];
+        keep_scores[i] = values[indices[i]];
+    }
+    float maxv = keep_scores[0];
+    for (int i = 1; i < keep; i++) if (keep_scores[i] > maxv) maxv = keep_scores[i];
+    float sum = 0.0f;
+    probs = (float *)malloc((size_t)keep * sizeof(float));
+    if (!probs) {
+        free(probs);
+        free(keep_scores);
+        free(kept);
+        free(values);
+        free(indices);
+        fail("out of memory");
+    }
+    for (int i = 0; i < keep; i++) {
+        probs[i] = expf((keep_scores[i] - maxv) / temperature);
+        sum += probs[i];
+    }
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float target = sum * top_p;
+        float cumulative = 0.0f;
+        int limit = keep;
+        for (int i = 0; i < keep; i++) {
+            cumulative += probs[i];
+            if (cumulative >= target) {
+                limit = i + 1;
+                break;
+            }
+        }
+        keep = limit;
+        sum = 0.0f;
+        for (int i = 0; i < keep; i++) {
+            sum += probs[i];
+        }
+    }
+    if (keep <= 0) keep = 1;
+    float r = (float)rand() / ((float)RAND_MAX + 1.0f) * sum;
+    float cumsum = 0.0f;
+    best = kept[0];
+    for (int i = 0; i < keep; i++) {
+        cumsum += probs[i];
+        if (cumsum >= r) {
+            best = kept[i];
+            break;
+        }
+    }
+    *out_token = best;
+    free(probs);
+    free(keep_scores);
+    free(kept);
+    free(values);
+    free(indices);
+}
+
 static void configure_parallelism(int requested_threads) {
 #ifdef _OPENMP
     if (requested_threads > 0) {
@@ -900,9 +1045,36 @@ static void configure_parallelism(int requested_threads) {
 }
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
-                      int *out_tokens, float temperature, int top_k) {
+                      int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
     float *hidden = (float *)malloc((size_t)m->hidden_size * sizeof(float));
     if (!hidden) fail("out of memory");
+    for (int layer = 0; layer < m->num_layers; layer++) {
+        QLayer *cur = &m->layers[layer];
+        int kv_dim = m->num_kv_heads * m->head_dim;
+        free(cur->kv_cache_k);
+        free(cur->kv_cache_v);
+        cur->kv_cache_k = (float *)calloc((size_t)steps * (size_t)kv_dim, sizeof(float));
+        cur->kv_cache_v = (float *)calloc((size_t)steps * (size_t)kv_dim, sizeof(float));
+        if (!cur->kv_cache_k || !cur->kv_cache_v) {
+            for (int prior = 0; prior < layer; prior++) {
+                free(m->layers[prior].kv_cache_k);
+                free(m->layers[prior].kv_cache_v);
+                m->layers[prior].kv_cache_k = NULL;
+                m->layers[prior].kv_cache_v = NULL;
+            }
+            free(cur->kv_cache_k);
+            free(cur->kv_cache_v);
+            cur->kv_cache_k = NULL;
+            cur->kv_cache_v = NULL;
+            fail("out of memory");
+        }
+        cur->kv_cache_len = 0;
+        cur->kv_cache_cap = steps;
+    }
+    if (temperature > 0.0f) {
+        if (seed != 0) srand(seed);
+        else srand((unsigned int)time(NULL));
+    }
     for (int step = 0; step < steps; step++) {
         int token_id = step < n_tokens ? tokens[step] : (step > 0 ? out_tokens[step - 1] : tokens[0]);
         for (int i = 0; i < m->hidden_size; i++) hidden[i] = m->embed[token_id * m->hidden_size + i];
@@ -924,10 +1096,62 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 matmul_vec(hidden, cur->q_proj, m->hidden_size, q_dim, q_out);
                 matmul_vec(hidden, cur->k_proj, m->hidden_size, kv_dim, k_out);
                 matmul_vec(hidden, cur->v_proj, m->hidden_size, kv_dim, v_out);
-                for (int i = 0; i < q_dim; i++) {
-                    float kv_term = i < kv_dim ? k_out[i] : 0.0f;
-                    float v_term = i < kv_dim ? v_out[i] : 0.0f;
-                    attn[i] = q_out[i] + kv_term + v_term;
+                for (int head = 0; head < m->num_attention_heads; head++) {
+                    for (int dim = 0; dim < m->head_dim; dim++) {
+                        int index = head * m->head_dim + dim;
+                        float scale = cur->q_norm ? cur->q_norm[dim % m->head_dim] : 1.0f;
+                        q_out[index] *= scale;
+                    }
+                }
+                for (int head = 0; head < m->num_kv_heads; head++) {
+                    for (int dim = 0; dim < m->head_dim; dim++) {
+                        int index = head * m->head_dim + dim;
+                        float scale = cur->k_norm ? cur->k_norm[dim % m->head_dim] : 1.0f;
+                        k_out[index] *= scale;
+                    }
+                }
+                int position = cur->kv_cache_len;
+                if (m->use_rope) {
+                    for (int head = 0; head < m->num_attention_heads; head++) {
+                        apply_rope(q_out + head * m->head_dim, m->head_dim, position, m->rope_theta, m->partial_rotary_factor);
+                    }
+                }
+                int kv_repeat = m->num_attention_heads / (m->num_kv_heads > 0 ? m->num_kv_heads : 1);
+                size_t cache_offset = (size_t)position * (size_t)kv_dim;
+                for (int i = 0; i < kv_dim; i++) {
+                    cur->kv_cache_k[cache_offset + i] = k_out[i];
+                    cur->kv_cache_v[cache_offset + i] = v_out[i];
+                }
+                cur->kv_cache_len++;
+                for (int head = 0; head < m->num_attention_heads; head++) {
+                    int kv_head = head / (kv_repeat > 0 ? kv_repeat : 1);
+                    float *scores = (float *)calloc((size_t)cur->kv_cache_len, sizeof(float));
+                    if (!scores) {
+                        free(q_out);
+                        free(k_out);
+                        free(v_out);
+                        free(attn);
+                        free(post);
+                        fail("out of memory");
+                    }
+                    for (int pos = 0; pos < cur->kv_cache_len; pos++) {
+                        float score = 0.0f;
+                        size_t key_offset = (size_t)pos * (size_t)kv_dim + (size_t)kv_head * (size_t)m->head_dim;
+                        for (int dim = 0; dim < m->head_dim; dim++) {
+                            score += q_out[head * m->head_dim + dim] * cur->kv_cache_k[key_offset + dim];
+                        }
+                        scores[pos] = score / sqrtf((float)m->head_dim);
+                    }
+                    softmax(scores, cur->kv_cache_len);
+                    for (int dim = 0; dim < m->head_dim; dim++) {
+                        float value = 0.0f;
+                        for (int pos = 0; pos < cur->kv_cache_len; pos++) {
+                            size_t key_offset = (size_t)pos * (size_t)kv_dim + (size_t)kv_head * (size_t)m->head_dim;
+                            value += scores[pos] * cur->kv_cache_v[key_offset + dim];
+                        }
+                        attn[head * m->head_dim + dim] = value;
+                    }
+                    free(scores);
                 }
                 matmul_vec(attn, cur->o_proj, q_dim, m->hidden_size, post);
                 layer_norm_inplace(hidden, cur->in_ln, m->hidden_size);
@@ -939,11 +1163,18 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 free(post);
             } else {
                 float *la_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
-                if (!la_out) fail("out of memory");
-                for (int i = 0; i < m->hidden_size; i++) la_out[i] = hidden[i] * 0.1f;
+                float *la_gate = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+                if (!la_out || !la_gate) fail("out of memory");
+                matmul_vec(hidden, cur->la_in_proj_qkv, m->hidden_size, m->hidden_size, la_out);
+                matmul_vec(hidden, cur->la_in_proj_z, m->hidden_size, m->hidden_size, la_gate);
+                for (int i = 0; i < m->hidden_size; i++) {
+                    float gate = silu(la_gate[i]);
+                    la_out[i] = silu(la_out[i]) * 0.5f * (1.0f + gate);
+                }
                 layer_norm_inplace(hidden, cur->in_ln, m->hidden_size);
                 for (int i = 0; i < m->hidden_size; i++) hidden[i] += residual[i] + la_out[i];
                 free(la_out);
+                free(la_gate);
             }
 
             float *ffn_in = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
@@ -1033,9 +1264,8 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             }
             logits[vocab] = sum;
         }
-        int best;
+        int best = 0;
         if (temperature <= 0.0f) {
-            /* greedy argmax */
             best = 0;
             float best_score = logits[0];
             for (int vocab = 1; vocab < m->vocab_size; vocab++) {
@@ -1045,41 +1275,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 }
             }
         } else {
-            /* top-k sampling with temperature */
-            int k = (top_k > 0 && top_k < m->vocab_size) ? top_k : m->vocab_size;
-            int *topk_idx = (int *)malloc((size_t)k * sizeof(int));
-            if (!topk_idx) fail("out of memory");
-            /* partial selection of top-k indices */
-            for (int i = 0; i < m->vocab_size; i++) {
-                if (i < k) {
-                    topk_idx[i] = i;
-                } else {
-                    /* find min in current top-k */
-                    int min_pos = 0;
-                    for (int j = 1; j < k; j++) if (logits[topk_idx[j]] < logits[topk_idx[min_pos]]) min_pos = j;
-                    if (logits[i] > logits[topk_idx[min_pos]]) topk_idx[min_pos] = i;
-                }
-            }
-            /* apply temperature and compute softmax over top-k */
-            float maxv = logits[topk_idx[0]];
-            for (int i = 1; i < k; i++) if (logits[topk_idx[i]] > maxv) maxv = logits[topk_idx[i]];
-            float *probs = (float *)malloc((size_t)k * sizeof(float));
-            if (!probs) fail("out of memory");
-            float sum_p = 0.0f;
-            for (int i = 0; i < k; i++) {
-                probs[i] = expf((logits[topk_idx[i]] - maxv) / temperature);
-                sum_p += probs[i];
-            }
-            /* sample */
-            float r = (float)rand() / ((float)RAND_MAX + 1.0f) * sum_p;
-            best = topk_idx[k - 1];
-            float cumsum = 0.0f;
-            for (int i = 0; i < k; i++) {
-                cumsum += probs[i];
-                if (cumsum >= r) { best = topk_idx[i]; break; }
-            }
-            free(probs);
-            free(topk_idx);
+            sample_logits(logits, m->vocab_size, temperature, top_p, top_k, &best);
         }
         out_tokens[step] = best;
         free(logits);
@@ -1115,8 +1311,83 @@ static int parse_token_ids(const char *text, int *out, int max_ids) {
     return count;
 }
 
+static int read_exact(FILE *fp, unsigned char *buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        size_t got = fread(buf + total, 1, len - total, fp);
+        if (got == 0) return 0;
+        total += got;
+    }
+    return 1;
+}
+
 static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N]\n", prog);
+    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--seed N]\n", prog);
+}
+
+static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
+    printf("\x01\x01READY\x01\x01\n");
+    printf("STAT 0 0.00 0.0 0.00\n");
+    fflush(stdout);
+    while (1) {
+        char header[4096];
+        if (!fgets(header, sizeof(header), stdin)) break;
+        if (strncmp(header, "\x02PROMPT ", 9) != 0 && strcmp(header, "\x02MORE\n") != 0) {
+            continue;
+        }
+        if (strncmp(header, "\x02PROMPT ", 9) != 0) {
+            continue;
+        }
+        size_t payload_len = 0;
+        int max_tokens_request = max_tokens;
+        float temperature_request = temperature;
+        float top_p_request = top_p;
+        int top_k_request = top_k;
+        char *cursor = header + 9;
+        if (sscanf(cursor, "%zu %d %f %f", &payload_len, &max_tokens_request, &temperature_request, &top_p_request) < 4) {
+            fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
+            continue;
+        }
+        if (payload_len > 0) {
+            unsigned char *payload = (unsigned char *)malloc(payload_len + 1);
+            if (!payload) fail("out of memory");
+            if (!read_exact(stdin, payload, payload_len)) {
+                fprintf(stderr, "[qwen35_moe] short read while reading prompt payload\n");
+                free(payload);
+                printf("ERR short read\x01\x01END\x01\x01\n");
+                printf("STAT 0 0.00 0.0 0.00\n");
+                fflush(stdout);
+                break;
+            }
+            payload[payload_len] = '\0';
+            char *prompt_text = (char *)payload;
+            int *tokens = (int *)calloc((size_t)max_tokens_request, sizeof(int));
+            int *out = (int *)calloc((size_t)max_tokens_request, sizeof(int));
+            if (!tokens || !out) {
+                free(tokens);
+                free(out);
+                free(payload);
+                fail("out of memory");
+            }
+            int n_tokens = parse_token_ids(prompt_text, tokens, max_tokens_request);
+            if (n_tokens <= 0) n_tokens = 1;
+            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, top_k_request, seed);
+            for (int i = 0; i < max_tokens_request; i++) {
+                if (i > 0) fputc(' ', stdout);
+                fprintf(stdout, "%d", out[i]);
+            }
+            printf("\x01\x01END\x01\x01\n");
+            printf("STAT %d 0.00 0.0 0.00\n", max_tokens_request);
+            fflush(stdout);
+            free(tokens);
+            free(out);
+            free(payload);
+        } else {
+            printf("\x01\x01END\x01\x01\n");
+            printf("STAT 0 0.00 0.0 0.00\n");
+            fflush(stdout);
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1125,7 +1396,9 @@ int main(int argc, char **argv) {
     int steps = 4;
     int threads = 0;
     float temperature = 0.0f;
+    float top_p = 0.0f;
     int top_k = 0;
+    unsigned int seed = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             snap_dir = argv[++i];
@@ -1143,6 +1416,10 @@ int main(int argc, char **argv) {
             temperature = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) {
             top_k = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) {
+            top_p = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
+            seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else {
             usage(argv[0]);
             return 1;
@@ -1155,17 +1432,22 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-    if (temperature > 0.0f) srand((unsigned int)time(NULL));
+    if (temperature > 0.0f && seed == 0) srand((unsigned int)time(NULL));
     configure_parallelism(threads);
     qwen35_model model;
     init_model(&model, snap_dir);
+    if (getenv("SERVE")) {
+        run_server(&model, steps, temperature, top_p, top_k, seed);
+        free_model(&model);
+        return 0;
+    }
     int *tokens = (int *)calloc((size_t)steps, sizeof(int));
     if (!tokens) fail("out of memory");
     int n_tokens = parse_token_ids(prompt ? prompt : "0", tokens, steps);
     if (n_tokens <= 0) n_tokens = 1;
     int *out = (int *)calloc((size_t)steps, sizeof(int));
     if (!out) fail("out of memory");
-    run_model(&model, tokens, n_tokens, steps, out, temperature, top_k);
+    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
     }

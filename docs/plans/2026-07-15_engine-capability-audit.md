@@ -13,6 +13,8 @@ The colibrì engine for Qwen3.5 MoE is a **skeleton forward pass** with correct 
 
 ### Status at a Glance
 
+> Follow-up note for the next implementation pass: the current qwen35 serve path now speaks the gateway protocol, but the prompt-to-token path remains a lightweight placeholder (`parse_token_ids()` still uses a hash-based fallback) and the gateway still needs a real token-to-text decoder before it can expose model-native text output instead of scaffold-style token IDs.
+
 | Component | Status | Lines of Code | Notes |
 |-----------|--------|--------------|-------|
 | Model loading (config + tensors) | ✅ Working | ~350 lines | Handles all text_config fields, layer types, quantized tensors |
