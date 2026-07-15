@@ -272,7 +272,10 @@ export default function App() {
                   <div>
                     <div className="message-meta">{item.role === "user" ? "You" : "colibrì"}</div>
                     {item.reasoningContent ? <ReasoningPanel text={item.reasoningContent} /> : null}
-                    <div className="message-body">{item.content || (item.role === "assistant" && !item.reasoningContent ? <span className="typing" aria-label="Generating"><i /><i /><i /></span> : null)}</div>
+                    {(() => {
+                      const showTyping = item.role === "assistant" && !item.content && !item.reasoningContent
+                      return <div className="message-body">{item.content || (showTyping ? <span className="typing" aria-label="Generating"><i /><i /><i /></span> : null)}</div>
+                    })()}
                   </div>
                 </article>
               ))}
