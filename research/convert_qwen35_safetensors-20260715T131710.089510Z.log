@@ -1,0 +1,33 @@
+2026-07-15 14:17:10,089 INFO converter starting: input=/opt/models/ornith-fp8 output=/opt/models/ornith-int8
+2026-07-15 14:17:10,089 INFO log file: /opt/models/ornith-int8/convert_qwen35_safetensors-20260715T131710.089510Z.log
+2026-07-15 14:17:10,089 INFO copied config.json
+2026-07-15 14:17:10,090 INFO copied tokenizer.json
+2026-07-15 14:17:10,545 INFO discovered 122 safetensors file(s) and 185811 tensor task(s)
+2026-07-15 14:17:10,546 INFO using state dir: /opt/models/ornith-int8/.state
+2026-07-15 14:17:11,388 INFO resumed 351 existing tensor task(s)
+2026-07-15 14:17:11,388 INFO using 32 worker(s) for streaming conversion
+2026-07-15 14:18:22,927 ERROR worker pool failure details for model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 818, in _process_task_batch
+    output_tensors = completed_future.result()
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 443, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/concurrent/futures/_base.py", line 395, in __get_result
+    raise self._exception
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 846, in process_pending_tasks
+    _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/leite/colibri/c/tools/./convert_qwen35_safetensors.py", line 821, in _process_task_batch
+    raise WorkerPoolFailure(task_result, exc) from exc
+WorkerPoolFailure: worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight: A process in the process pool was terminated abruptly while the future was running or pending.
+2026-07-15 14:18:22,932 WARNING worker pool failure while processing model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight; retrying 1 task(s) with 1 worker(s) (attempt 2/3)
+2026-07-15 14:19:34,874 WARNING falling back to sequential conversion for 1 task(s) after worker-pool failure
+2026-07-15 14:19:34,875 INFO sequential fallback 1/1 for model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight
+2026-07-15 14:19:34,875 INFO starting task_id=model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight source=model-00001-of-00122.safetensors tensor=model.language_model.embed_tokens.weight dtype=BF16 shape=[248320, 4096] payload_bytes=2034237440 quant_kind=<none>
+2026-07-15 14:19:35,706 INFO read 2034237440-byte payload for task_id=model-00001-of-00122.safetensors:model.language_model.embed_tokens.weight source=model-00001-of-00122.safetensors tensor=model.language_model.embed_tokens.weight dtype=BF16 shape=[248320, 4096] payload_bytes=2034237440 quant_kind=<none>
