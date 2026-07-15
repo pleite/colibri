@@ -3,6 +3,8 @@ import {
   Activity,
   ArrowUp,
   BrainCircuit,
+  ChevronDown,
+  ChevronRight,
   CircleStop,
   Cpu,
   Feather,
@@ -25,6 +27,25 @@ import { persistPublicSettings, stored } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
 const message = (role: ChatMessage["role"], content: string): ChatMessage => ({ id: crypto.randomUUID(), role, content })
+
+function ReasoningPanel({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="reasoning-panel">
+      <button
+        type="button"
+        className="reasoning-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        <BrainCircuit className="size-3.5" />
+        <span>Thinking</span>
+      </button>
+      {open && <pre className="reasoning-body">{text}</pre>}
+    </div>
+  )
+}
 
 export default function App() {
   const [baseUrl, setBaseUrl] = useState(() => stored(localStorage, "colibri.baseUrl", "http://127.0.0.1:8000/v1"))
@@ -156,6 +177,12 @@ export default function App() {
           updateMessages((current) => current.map((item) =>
             item.id === assistant.id ? { ...item, content: item.content + delta } : item,
           )),
+        onReasoningDelta: (delta) =>
+          updateMessages((current) => current.map((item) =>
+            item.id === assistant.id
+              ? { ...item, reasoningContent: (item.reasoningContent ?? "") + delta }
+              : item,
+          )),
       })
       setLastRun(result)
       setConnected(true)
@@ -242,7 +269,11 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? "You" : "colibrì"}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                  <div>
+                    <div className="message-meta">{item.role === "user" ? "You" : "colibrì"}</div>
+                    {item.reasoningContent ? <ReasoningPanel text={item.reasoningContent} /> : null}
+                    <div className="message-body">{item.content || (item.role === "assistant" && !item.reasoningContent ? <span className="typing" aria-label="Generating"><i /><i /><i /></span> : null)}</div>
+                  </div>
                 </article>
               ))}
               <div ref={bottomRef} />

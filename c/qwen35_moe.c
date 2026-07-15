@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "parallelism.h"
@@ -530,34 +531,6 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
                 if (!cur->mlp_down_proj) fail("out of memory");
                 for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->moe_intermediate_size; j++) if (i == j) cur->mlp_down_proj[i * m->moe_intermediate_size + j] = 0.75f;
             }
-            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer);
-            cur->sh_gate = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
-            if (!cur->sh_gate) {
-                cur->sh_gate = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->sh_gate) fail("out of memory");
-                for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_gate[i * m->hidden_size + j] = 0.25f;
-            }
-            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer);
-            cur->sh_up = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
-            if (!cur->sh_up) {
-                cur->sh_up = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->sh_up) fail("out of memory");
-                for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_up[i * m->hidden_size + j] = 0.1f;
-            }
-            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer);
-            cur->sh_down = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size);
-            if (!cur->sh_down) {
-                cur->sh_down = (float *)calloc((size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size, sizeof(float));
-                if (!cur->sh_down) fail("out of memory");
-                for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->shared_expert_intermediate_size; j++) if (i == j) cur->sh_down[i * m->shared_expert_intermediate_size + j] = 0.2f;
-            }
-            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer);
-            cur->shared_expert_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
-            if (!cur->shared_expert_gate) {
-                cur->shared_expert_gate = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-                if (!cur->shared_expert_gate) fail("out of memory");
-                for (int i = 0; i < m->hidden_size; i++) cur->shared_expert_gate[i] = 1.0f;
-            }
             cur->expert_gate_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
             cur->expert_up_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
             cur->expert_down_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
@@ -641,6 +614,34 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
                 cur->la_conv1d = (float *)calloc((size_t)12288 * 1 * 4, sizeof(float));
                 if (!cur->la_conv1d) fail("out of memory");
             }
+        }
+        /* shared expert is present on ALL layer types (full and linear attention). */
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer);
+        cur->sh_gate = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
+        if (!cur->sh_gate) {
+            cur->sh_gate = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
+            if (!cur->sh_gate) fail("out of memory");
+            for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_gate[i * m->hidden_size + j] = 0.25f;
+        }
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer);
+        cur->sh_up = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
+        if (!cur->sh_up) {
+            cur->sh_up = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
+            if (!cur->sh_up) fail("out of memory");
+            for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_up[i * m->hidden_size + j] = 0.1f;
+        }
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer);
+        cur->sh_down = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size);
+        if (!cur->sh_down) {
+            cur->sh_down = (float *)calloc((size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size, sizeof(float));
+            if (!cur->sh_down) fail("out of memory");
+            for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->shared_expert_intermediate_size; j++) if (i == j) cur->sh_down[i * m->shared_expert_intermediate_size + j] = 0.2f;
+        }
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer);
+        cur->shared_expert_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
+        if (!cur->shared_expert_gate) {
+            cur->shared_expert_gate = (float *)calloc((size_t)m->hidden_size, sizeof(float));
+            if (!cur->shared_expert_gate) fail("out of memory");
         }
     }
     free(arena);
@@ -898,7 +899,8 @@ static void configure_parallelism(int requested_threads) {
 #endif
 }
 
-static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps, int *out_tokens) {
+static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
+                      int *out_tokens, float temperature, int top_k) {
     float *hidden = (float *)malloc((size_t)m->hidden_size * sizeof(float));
     if (!hidden) fail("out of memory");
     for (int step = 0; step < steps; step++) {
@@ -950,9 +952,9 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             if (!ffn_in || !ffn_mid || !ffn_out) fail("out of memory");
             if (cur->is_full_attn) {
                 matmul_vec(hidden, cur->mlp_gate_proj, m->hidden_size, m->moe_intermediate_size, ffn_in);
-                for (int i = 0; i < m->moe_intermediate_size; i++) ffn_in[i] = relu(ffn_in[i]);
+                for (int i = 0; i < m->moe_intermediate_size; i++) ffn_in[i] = silu(ffn_in[i]);
                 matmul_vec(hidden, cur->mlp_up_proj, m->hidden_size, m->moe_intermediate_size, ffn_mid);
-                for (int i = 0; i < m->moe_intermediate_size; i++) ffn_mid[i] = relu(ffn_mid[i]);
+                for (int i = 0; i < m->moe_intermediate_size; i++) ffn_mid[i] = silu(ffn_mid[i]);
                 for (int i = 0; i < m->moe_intermediate_size; i++) ffn_in[i] *= ffn_mid[i];
                 matmul_vec(ffn_in, cur->mlp_down_proj, m->moe_intermediate_size, m->hidden_size, ffn_out);
             } else {
@@ -977,9 +979,9 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     float *expert_res = (float *)malloc((size_t)m->hidden_size * sizeof(float));
                     if (!expert_gate || !expert_up || !expert_res) fail("out of memory");
                     matmul_vec(hidden, cur->expert_gate_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_gate);
-                    for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] = relu(expert_gate[i]);
+                    for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] = silu(expert_gate[i]);
                     matmul_vec(hidden, cur->expert_up_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_up);
-                    for (int i = 0; i < m->moe_intermediate_size; i++) expert_up[i] = relu(expert_up[i]);
+                    for (int i = 0; i < m->moe_intermediate_size; i++) expert_up[i] = silu(expert_up[i]);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] *= expert_up[i];
                     matmul_vec(expert_gate, cur->expert_down_proj[expert_idx], m->moe_intermediate_size, m->hidden_size, expert_res);
                     for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += weight * expert_res[i];
@@ -992,23 +994,24 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 free(expert_weights);
             }
 
-            float *shared_in = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
-            float *shared_mid = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
+            float *shared_in = (float *)malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
+            float *shared_mid = (float *)malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
             float *shared_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
             if (!shared_in || !shared_mid || !shared_out) fail("out of memory");
-            matmul_vec(hidden, cur->sh_gate, m->hidden_size, m->shared_expert_intermediate_size, shared_in);
-            {
-                const int gate_dim = m->shared_expert_intermediate_size < m->hidden_size ? m->shared_expert_intermediate_size : m->hidden_size;
-                for (int i = 0; i < m->shared_expert_intermediate_size; i++) {
-                    float gate = cur->shared_expert_gate && i < gate_dim ? cur->shared_expert_gate[i] : 1.0f;
-                    shared_in[i] = silu(shared_in[i] * gate);
-                }
+            /* shared expert gate: gate_scalar = sigmoid(shared_expert_gate . hidden) */
+            float gate_scalar = 1.0f;
+            if (cur->shared_expert_gate) {
+                float dot = 0.0f;
+                for (int i = 0; i < m->hidden_size; i++) dot += cur->shared_expert_gate[i] * hidden[i];
+                gate_scalar = 1.0f / (1.0f + expf(-dot));
             }
+            matmul_vec(hidden, cur->sh_gate, m->hidden_size, m->shared_expert_intermediate_size, shared_in);
+            for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] = silu(shared_in[i]);
             matmul_vec(hidden, cur->sh_up, m->hidden_size, m->shared_expert_intermediate_size, shared_mid);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_mid[i] = silu(shared_mid[i]);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] *= shared_mid[i];
             matmul_vec(shared_in, cur->sh_down, m->shared_expert_intermediate_size, m->hidden_size, shared_out);
-            for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += shared_out[i];
+            for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += gate_scalar * shared_out[i];
             free(shared_in);
             free(shared_mid);
             free(shared_out);
@@ -1030,13 +1033,53 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             }
             logits[vocab] = sum;
         }
-        int best = 0;
-        float best_score = logits[0];
-        for (int vocab = 1; vocab < m->vocab_size; vocab++) {
-            if (logits[vocab] > best_score) {
-                best_score = logits[vocab];
-                best = vocab;
+        int best;
+        if (temperature <= 0.0f) {
+            /* greedy argmax */
+            best = 0;
+            float best_score = logits[0];
+            for (int vocab = 1; vocab < m->vocab_size; vocab++) {
+                if (logits[vocab] > best_score) {
+                    best_score = logits[vocab];
+                    best = vocab;
+                }
             }
+        } else {
+            /* top-k sampling with temperature */
+            int k = (top_k > 0 && top_k < m->vocab_size) ? top_k : m->vocab_size;
+            int *topk_idx = (int *)malloc((size_t)k * sizeof(int));
+            if (!topk_idx) fail("out of memory");
+            /* partial selection of top-k indices */
+            for (int i = 0; i < m->vocab_size; i++) {
+                if (i < k) {
+                    topk_idx[i] = i;
+                } else {
+                    /* find min in current top-k */
+                    int min_pos = 0;
+                    for (int j = 1; j < k; j++) if (logits[topk_idx[j]] < logits[topk_idx[min_pos]]) min_pos = j;
+                    if (logits[i] > logits[topk_idx[min_pos]]) topk_idx[min_pos] = i;
+                }
+            }
+            /* apply temperature and compute softmax over top-k */
+            float maxv = logits[topk_idx[0]];
+            for (int i = 1; i < k; i++) if (logits[topk_idx[i]] > maxv) maxv = logits[topk_idx[i]];
+            float *probs = (float *)malloc((size_t)k * sizeof(float));
+            if (!probs) fail("out of memory");
+            float sum_p = 0.0f;
+            for (int i = 0; i < k; i++) {
+                probs[i] = expf((logits[topk_idx[i]] - maxv) / temperature);
+                sum_p += probs[i];
+            }
+            /* sample */
+            float r = (float)rand() / ((float)RAND_MAX + 1.0f) * sum_p;
+            best = topk_idx[k - 1];
+            float cumsum = 0.0f;
+            for (int i = 0; i < k; i++) {
+                cumsum += probs[i];
+                if (cumsum >= r) { best = topk_idx[i]; break; }
+            }
+            free(probs);
+            free(topk_idx);
         }
         out_tokens[step] = best;
         free(logits);
@@ -1073,7 +1116,7 @@ static int parse_token_ids(const char *text, int *out, int max_ids) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N]\n", prog);
+    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N]\n", prog);
 }
 
 int main(int argc, char **argv) {
@@ -1081,6 +1124,8 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     int steps = 4;
     int threads = 0;
+    float temperature = 0.0f;
+    int top_k = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             snap_dir = argv[++i];
@@ -1094,6 +1139,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: invalid thread count: %s\n", threads_arg);
                 return 1;
             }
+        } else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) {
+            temperature = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) {
+            top_k = atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -1106,6 +1155,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
+    if (temperature > 0.0f) srand((unsigned int)time(NULL));
     configure_parallelism(threads);
     qwen35_model model;
     init_model(&model, snap_dir);
@@ -1115,7 +1165,7 @@ int main(int argc, char **argv) {
     if (n_tokens <= 0) n_tokens = 1;
     int *out = (int *)calloc((size_t)steps, sizeof(int));
     if (!out) fail("out of memory");
-    run_model(&model, tokens, n_tokens, steps, out);
+    run_model(&model, tokens, n_tokens, steps, out, temperature, top_k);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
     }

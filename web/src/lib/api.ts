@@ -4,6 +4,7 @@ export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
+  reasoningContent?: string
 }
 
 interface OpenAIError {
@@ -103,6 +104,7 @@ export interface StreamChatOptions {
   cacheSlot?: number
   signal: AbortSignal
   onDelta: (text: string) => void
+  onReasoningDelta?: (text: string) => void
 }
 
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
@@ -133,12 +135,14 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
     }
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
+    const reasoning = choice?.delta?.reasoning_content
     if (text) options.onDelta(text)
+    if (reasoning && options.onReasoningDelta) options.onReasoningDelta(reasoning)
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }
