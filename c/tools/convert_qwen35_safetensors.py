@@ -33,6 +33,7 @@ LANGUAGE_LAYER_PREFIX = 'model.language_model.layers.'
 LANGUAGE_EMBED_PREFIX = 'model.language_model.embed_tokens.'
 LANGUAGE_NORM_PREFIX = 'model.language_model.norm.'
 LINEAR_ATTN_SCALAR_SUFFIXES = ('.linear_attn.A_log', '.linear_attn.dt_bias')
+MAX_WORKER_POOL_TASK_BYTES = 512 * 1024 * 1024
 
 
 def read_safetensors_file(path):
@@ -669,10 +670,7 @@ def describe_task(task):
     tensor_name = task.get('tensor_name', '<unknown>')
     shape = meta.get('shape', [])
     dtype = meta.get('dtype', '<unknown>')
-    data_offsets = meta.get('data_offsets', [])
-    payload_bytes = None
-    if isinstance(data_offsets, (list, tuple)) and len(data_offsets) == 2:
-        payload_bytes = data_offsets[1] - data_offsets[0]
+    payload_bytes = task_payload_bytes(task)
     try:
         quant_kind = should_quantize(tensor_name)
     except Exception:
@@ -692,6 +690,47 @@ def log_task_start(task, logger):
     if logger is None:
         return
     logger.info('starting %s', describe_task(task))
+
+
+def task_payload_bytes(task, logger=None):
+    meta = task.get('meta', {})
+    data_offsets = meta.get('data_offsets', [])
+    if not isinstance(data_offsets, (list, tuple)) or len(data_offsets) != 2:
+        return None
+    if data_offsets[1] < data_offsets[0]:
+        if logger is not None:
+            logger.warning('ignoring invalid negative payload span while sizing %s for worker-pool execution', task.get('task_id', '<unknown>'))
+        return None
+    return data_offsets[1] - data_offsets[0]
+
+
+def estimate_converted_payload_bytes(task):
+    tensor_name = task.get('tensor_name')
+    meta = task.get('meta', {})
+    shape = meta.get('shape')
+    if tensor_name is None or not isinstance(shape, (list, tuple)):
+        return None
+    try:
+        output_tensor_name = normalize_tensor_name_for_engine(tensor_name)
+        quant_kind = should_quantize(output_tensor_name)
+    except Exception:
+        return None
+    if len(shape) == 2 and quant_kind:
+        out_dim = shape[0]
+        packed_bytes = expected_payload_size('U8', shape, quant_kind=quant_kind)
+        scales_bytes = expected_payload_size('F32', [out_dim])
+        return packed_bytes + scales_bytes
+    return expected_payload_size('F32', shape)
+
+
+def worker_pool_skip_reason(task, max_task_bytes=MAX_WORKER_POOL_TASK_BYTES, logger=None):
+    payload_bytes = task_payload_bytes(task, logger=logger)
+    if payload_bytes is not None and payload_bytes > max_task_bytes:
+        return f'input payload {payload_bytes} bytes exceeds worker-pool threshold {max_task_bytes} bytes'
+    converted_payload_bytes = estimate_converted_payload_bytes(task)
+    if converted_payload_bytes is not None and converted_payload_bytes > max_task_bytes:
+        return f'converted payload {converted_payload_bytes} bytes exceeds worker-pool threshold {max_task_bytes} bytes'
+    return None
 
 
 def convert_task(task, logger=None):
@@ -948,25 +987,36 @@ def process_tasks_sequentially(pending_tasks, logger, completed, state_dir, tota
 
 
 def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, total_tasks, max_retries=3):
-    remaining_tasks = list(pending_tasks)
+    remaining_tasks = []
+    sequential_tasks = []
+    for task in pending_tasks:
+        skip_reason = worker_pool_skip_reason(task, logger=logger)
+        if skip_reason is None:
+            remaining_tasks.append(task)
+            continue
+        logger.info('processing %s sequentially because %s', task['task_id'], skip_reason)
+        sequential_tasks.append(task)
     workers_for_attempt = max(1, workers)
     for attempt in range(max_retries):
         if not remaining_tasks:
-            return
+            break
         try:
             _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
-            return
+            break
         except WorkerPoolFailure as exc:
             remaining_tasks = [task for task in remaining_tasks if task['task_id'] not in completed]
             if not remaining_tasks:
-                return
+                break
             if attempt >= max_retries - 1 or workers_for_attempt <= 1:
                 logger.warning('falling back to sequential conversion for %d task(s) after worker-pool failure', len(remaining_tasks))
                 process_tasks_sequentially(remaining_tasks, logger, completed, state_dir, total_tasks)
-                return
+                break
             logger.exception('worker pool failure details for %s', exc.task['task_id'])
             logger.warning('worker pool failure while processing %s; retrying %d task(s) with %d worker(s) (attempt %d/%d)', exc.task['task_id'], len(remaining_tasks), 1, attempt + 2, max_retries)
             workers_for_attempt = 1
+    if sequential_tasks:
+        logger.info('processing %d oversized task(s) sequentially to avoid worker-pool IPC/memory pressure', len(sequential_tasks))
+        process_tasks_sequentially(sequential_tasks, logger, completed, state_dir, total_tasks)
 
 
 def main():
