@@ -219,6 +219,78 @@ static void write_quantized_model(const char *dir) {
     write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
 }
 
+static void write_model_with_split_index(const char *dir) {
+    make_model_dir(dir);
+    char config_path[1024];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
+    FILE *fp = fopen(config_path, "w");
+    if (!fp) fail("cannot write %s", config_path);
+    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fclose(fp);
+
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_a[1024];
+    char shard_b[1024];
+    char index_path[1024];
+    snprintf(shard_a, sizeof(shard_a), "%s/model-part-a.safetensors", dir);
+    snprintf(shard_b, sizeof(shard_b), "%s/model-part-b.safetensors", dir);
+    snprintf(index_path, sizeof(index_path), "%s/model.safetensors.index.json", dir);
+
+    float embed[16] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f, 1.6f};
+    float norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float lmhead[16] = {0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f};
+    float attn_norm[4] = {1.0f, 1.1f, 1.2f, 1.3f};
+    float ffn_norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float q[16] = {0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f};
+    float k[16] = {0.05f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, 0.05f};
+    float v[16] = {0.02f, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f};
+    float o[16] = {0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f};
+    float gate[16] = {0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f};
+    float up[16] = {0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f};
+    float down[16] = {0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f};
+    tensor part_a[] = {
+        {"model.embed_tokens.weight", embed, 16},
+        {"model.norm.weight", norm, 4},
+        {"lm_head.weight", lmhead, 16},
+    };
+    tensor part_b[] = {
+        {"model.layers.0.input_layernorm.weight", attn_norm, 4},
+        {"model.layers.0.post_attention_layernorm.weight", ffn_norm, 4},
+        {"model.layers.0.self_attn.q_proj.weight", q, 16},
+        {"model.layers.0.self_attn.k_proj.weight", k, 16},
+        {"model.layers.0.self_attn.v_proj.weight", v, 16},
+        {"model.layers.0.self_attn.o_proj.weight", o, 16},
+        {"model.layers.0.mlp.gate_proj.weight", gate, 16},
+        {"model.layers.0.mlp.up_proj.weight", up, 16},
+        {"model.layers.0.mlp.down_proj.weight", down, 16},
+    };
+    write_safetensors_file(shard_a, part_a, sizeof(part_a) / sizeof(part_a[0]));
+    write_safetensors_file(shard_b, part_b, sizeof(part_b) / sizeof(part_b[0]));
+
+    fp = fopen(index_path, "w");
+    if (!fp) fail("cannot write %s", index_path);
+    fprintf(fp,
+            "{\"weight_map\":{\"model.embed_tokens.weight\":\"model-part-a.safetensors\","
+            "\"model.norm.weight\":\"model-part-a.safetensors\","
+            "\"lm_head.weight\":\"model-part-a.safetensors\","
+            "\"model.layers.0.input_layernorm.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.post_attention_layernorm.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.self_attn.q_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.self_attn.k_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.self_attn.v_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.self_attn.o_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.mlp.gate_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.mlp.up_proj.weight\":\"model-part-b.safetensors\","
+            "\"model.layers.0.mlp.down_proj.weight\":\"model-part-b.safetensors\"}}");
+    fclose(fp);
+}
+
 static void matmul_vec(const float *x, const float *w, int in_dim, int out_dim, float *out) {
     for (int out_idx = 0; out_idx < out_dim; out_idx++) {
         float sum = 0.0f;
@@ -357,6 +429,16 @@ int main(void) {
     run_engine(tmp, 4, tokens, 2, actual);
     for (int i = 0; i < 4; i++) {
         if (expected[i] != actual[i]) fail("mismatch at token %d: expected %d got %d", i, expected[i], actual[i]);
+    }
+
+    char split_dir[] = "/tmp/colibri-qwen35-index-XXXXXX";
+    char *split_tmp = mkdtemp(split_dir);
+    if (!split_tmp) fail("mkdtemp failed");
+    write_model_with_split_index(split_tmp);
+    int split_actual[4] = {0, 0, 0, 0};
+    run_engine(split_tmp, 4, tokens, 2, split_actual);
+    for (int i = 0; i < 4; i++) {
+        if (split_actual[i] != expected[i]) fail("split-index model mismatch at token %d: expected %d got %d", i, expected[i], split_actual[i]);
     }
 
     char quant_dir[] = "/tmp/colibri-qwen35-quant-XXXXXX";
