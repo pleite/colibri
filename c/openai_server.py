@@ -314,6 +314,150 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- Qwen3.5 / Ornith tool calling -------------------------------------------------------
+# Qwen3.5 uses a different tool-call format from GLM-5.2:
+#   <tool_call>
+#   <function=function_name>
+#   <parameter=param_name>
+#   param_value
+#   </parameter>
+#   </function>
+#   </tool_call>
+# Tool responses come back wrapped in <tool_response>...</tool_response> inside a user turn.
+_QWEN_TC_RE = re.compile(r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
+                          re.DOTALL)
+_QWEN_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+def parse_tool_calls_qwen(reply, tools=None):
+    """Return (content, tool_calls) for Qwen3.5 <function=>/<parameter=> format."""
+    calls = []
+    for match in _QWEN_TC_RE.finditer(reply):
+        name = match.group(1).strip()
+        body_text = match.group(2)
+        args = {}
+        for pmatch in _QWEN_PARAM_RE.finditer(body_text):
+            key = pmatch.group(1).strip()
+            value = pmatch.group(2).strip()
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            args[key] = value
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    text = _QWEN_TC_RE.sub("", reply)
+    if THINK_CLOSE in text:
+        text = text.split(THINK_CLOSE, 1)[1]
+    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    if calls:
+        sys.stderr.write("[api] qwen tool-calls: %d\n" % len(calls))
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None):
+    """Render the Qwen3.5/Ornith <|im_start|>/<|im_end|> chat template (text-only subset)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    prompt = []
+    first = messages[0] if messages else {}
+    has_system_first = isinstance(first, dict) and first.get("role") in ("system", "developer")
+
+    if tools:
+        # Qwen3.5 tool declaration format matching chat_template.jinja
+        tool_block = "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>"
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+            tool_block += "\n" + json.dumps(clean, ensure_ascii=False)
+        tool_block += "\n</tools>"
+        tool_block += ("\n\nIf you choose to call a function ONLY reply in the following format "
+                       "with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+                       "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+                       "<parameter=example_parameter_2>\nvalue_2\n</parameter>\n"
+                       "</function>\n</tool_call>")
+        if has_system_first:
+            sys_content = content_text(messages[0].get("content"), "messages.0.content").strip()
+            if sys_content:
+                tool_block += "\n\n" + sys_content
+        prompt.append(tool_block + "<|im_end|>\n")
+        messages = messages[1:] if has_system_first else messages
+    elif has_system_first:
+        sys_content = content_text(messages[0].get("content"), "messages.0.content").strip()
+        prompt.append(f"<|im_start|>system\n{sys_content}<|im_end|>\n")
+        messages = messages[1:]
+
+    prev_tool = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role in ("system", "developer"):
+            sys_content = content_text(message.get("content"), f"messages.{index}.content").strip()
+            prompt.append(f"<|im_start|>system\n{sys_content}<|im_end|>\n")
+        elif role == "user":
+            text = content_text(message.get("content"), f"messages.{index}.content")
+            prompt.append(f"<|im_start|>user\n{text}<|im_end|>\n")
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{index}.content").strip() if raw is not None else ""
+            # Preserve reasoning_content if present, else strip any embedded <think> block
+            reasoning = (message.get("reasoning_content") or "").strip()
+            if not reasoning and THINK_CLOSE in text:
+                parts = text.split(THINK_CLOSE, 1)
+                reasoning = parts[0].replace(THINK_OPEN, "").strip()
+                text = parts[1].lstrip("\n")
+            think_block = f"<think>\n{reasoning}\n</think>\n\n" if reasoning else "<think>\n\n</think>\n\n"
+            prompt.append(f"<|im_start|>assistant\n{think_block}{text}")
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                prompt.append("\n<tool_call>\n<function=" + (fn.get("name") or "") + ">\n")
+                for key, value in (args or {}).items():
+                    prompt.append(f"<parameter={key}>\n"
+                                  + (value if isinstance(value, str)
+                                     else json.dumps(value, ensure_ascii=False))
+                                  + "\n</parameter>\n")
+                prompt.append("</function>\n</tool_call>")
+            prompt.append("<|im_end|>\n")
+        elif role == "tool":
+            if not prev_tool:
+                prompt.append("<|im_start|>user")
+            prompt.append("\n<tool_response>\n"
+                          + content_text(message.get("content"), f"messages.{index}.content")
+                          + "\n</tool_response>")
+            next_role = messages[index + 1].get("role") if index + 1 < len(messages) else None
+            if next_role != "tool":
+                prompt.append("<|im_end|>\n")
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+        prev_tool = (role == "tool")
+
+    if enable_thinking:
+        prompt.append("<|im_start|>assistant\n<think>\n")
+    else:
+        prompt.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    return "".join(prompt)
+
+
+def split_thinking(text):
+    """Split model output into (reasoning_content, content) by stripping <think>...</think>."""
+    if THINK_CLOSE in text:
+        before, after = text.split(THINK_CLOSE, 1)
+        reasoning = before.replace(THINK_OPEN, "").lstrip("\n")
+        content = after.lstrip("\n")
+        return reasoning, content
+    # No closing tag: the model was told not to think, strip any stray open tag
+    return "", text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -436,7 +580,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1):
+                 kv_slots=1, model_family="glm"):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -446,6 +590,7 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.model_family = model_family
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -472,7 +617,8 @@ class APIHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not origin or ("*" not in self.server.cors_origins and origin not in self.server.cors_origins):
             return
-        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
+        safe_origin = "".join(c for c in origin if c.isprintable() and c not in "\r\n\0")
+        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else safe_origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Expose-Headers",
@@ -536,8 +682,11 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self.require_auth()
             body = self.read_json()
-            self.check_model(body)
             path = urlsplit(self.path).path
+            if path == "/v1/embeddings":
+                self.embeddings(body, request_id)
+                return
+            self.check_model(body)
             if path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
@@ -559,7 +708,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def generation(self, body, prompt, request_id, chat):
+    def generation(self, body, prompt, request_id, chat, enable_thinking=False):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
         cache_slot = body.get("cache_slot", 0)
@@ -577,6 +726,10 @@ class APIHandler(BaseHTTPRequestHandler):
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
+        is_qwen = self.server.model_family == "qwen35"
+        _parse_tools = parse_tool_calls_qwen if is_qwen else parse_tool_calls
+        # Determine the tool-call start marker for streaming suppression
+        tc_start_marker = "<tool_call>" if is_qwen else BOX_START
 
         with self.server.scheduler.admit(self.client_disconnected) as queue_wait:
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
@@ -587,16 +740,22 @@ class APIHandler(BaseHTTPRequestHandler):
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = _parse_tools(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
                     choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
+                elif chat:
+                    reasoning, content = split_thinking(text)
+                    message = {"role": "assistant", "content": content, "refusal": None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    choice = {"index": 0, "message": message, "logprobs": None,
+                              "finish_reason": length_finish}
                 else:
-                    choice = ({"index": 0, "message": {"role": "assistant", "content": text,
-                               "refusal": None}, "logprobs": None, "finish_reason": length_finish} if chat else
-                              {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
+                    choice = {"index": 0, "text": text, "logprobs": None,
+                              "finish_reason": length_finish}
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
                     request_id, queue_headers)
@@ -655,11 +814,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 event([{"index": 0, "delta": {"role": "assistant", "content": ""},
                         "logprobs": None, "finish_reason": None}])
 
-            def emit(text):
+            def emit_content(text):
                 choice = ({"index": 0, "delta": {"content": text}, "logprobs": None,
                            "finish_reason": None} if chat else
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
+
+            def emit_reasoning(text):
+                event([{"index": 0, "delta": {"reasoning_content": text},
+                        "logprobs": None, "finish_reason": None}])
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
@@ -668,7 +831,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # <tool_call> split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = len(tc_start_marker) - 1
                 raw = []
                 def emit_tools(chunk):
                     raw.append(chunk)
@@ -677,33 +840,87 @@ class APIHandler(BaseHTTPRequestHandler):
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(tc_start_marker)
                     if cut >= 0:
                         if cut:
-                            emit(sp["buf"][:cut])
+                            emit_content(sp["buf"][:cut])
                         sp["buf"] = ""
                         sp["tool"] = True
                         return
                     flush = max(0, len(sp["buf"]) - hold)
                     if flush:
-                        emit(sp["buf"][:flush])
+                        emit_content(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_tools, cache_slot)
                 if not sp["tool"] and sp["buf"]:
-                    emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                    emit_content(sp["buf"])             # no tool call happened: flush held tail
+                _content, calls = _parse_tools("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
                              "arguments": tc["function"]["arguments"]}}]},
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+            elif chat and enable_thinking:
+                # Stream reasoning_content for <think> blocks then content after </think>
+                ts = {"in_think": False, "seen_close": False, "buf": ""}
+                hold = max(len(THINK_OPEN), len(THINK_CLOSE)) - 1
+                raw = []
+                def emit_thinking(chunk):
+                    if dbg_echo:
+                        sys.stderr.write(chunk); sys.stderr.flush()
+                    raw.append(chunk)
+                    ts["buf"] += chunk
+                    while True:
+                        if ts["seen_close"]:
+                            # Past the thinking block: emit as content
+                            emit_content(ts["buf"])
+                            ts["buf"] = ""
+                            break
+                        if not ts["in_think"]:
+                            idx = ts["buf"].find(THINK_OPEN)
+                            if idx >= 0:
+                                # Emit text before <think> as content, enter reasoning mode
+                                if idx:
+                                    emit_content(ts["buf"][:idx])
+                                ts["buf"] = ts["buf"][idx + len(THINK_OPEN):]
+                                ts["in_think"] = True
+                                continue
+                            # No <think> yet: hold back enough to catch a split tag
+                            flush = max(0, len(ts["buf"]) - hold)
+                            if flush:
+                                emit_content(ts["buf"][:flush])
+                                ts["buf"] = ts["buf"][flush:]
+                            break
+                        else:
+                            idx = ts["buf"].find(THINK_CLOSE)
+                            if idx >= 0:
+                                if idx:
+                                    emit_reasoning(ts["buf"][:idx])
+                                ts["buf"] = ts["buf"][idx + len(THINK_CLOSE):].lstrip("\n")
+                                ts["in_think"] = False
+                                ts["seen_close"] = True
+                                continue
+                            flush = max(0, len(ts["buf"]) - hold)
+                            if flush:
+                                emit_reasoning(ts["buf"][:flush])
+                                ts["buf"] = ts["buf"][flush:]
+                            break
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, emit_thinking, cache_slot)
+                # Flush any remaining buffer
+                if ts["buf"]:
+                    if ts["seen_close"] or not ts["in_think"]:
+                        emit_content(ts["buf"])
+                    else:
+                        emit_reasoning(ts["buf"])
+                finish = "length" if stats["length_limited"] else "stop"
             else:
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    emit(chunk)
+                    emit_content(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot)
                 finish = "length" if stats["length_limited"] else "stop"
@@ -740,6 +957,11 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"prompt_tokens": prompt, "completion_tokens": completion,
                 "total_tokens": prompt + completion}
 
+    def embeddings(self, body, request_id):
+        """Stub /v1/embeddings endpoint. Returns 501 until a dedicated embedding engine is wired."""
+        raise APIError(501, "Embeddings are not yet supported by this colibri engine.",
+                       None, "embeddings_not_supported", "server_error")
+
     def chat_completion(self, body, request_id):
         reasoning_effort = body.get("reasoning_effort")
         efforts = (None, "none", "minimal", "low", "medium", "high", "xhigh")
@@ -756,8 +978,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools)
-        self.generation(body, prompt, request_id, True)
+        is_qwen = self.server.model_family == "qwen35"
+        render = render_chat_qwen if is_qwen else render_chat
+        prompt = render(body.get("messages"), enable_thinking, reasoning_effort, tools)
+        self.generation(body, prompt, request_id, True, enable_thinking)
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
@@ -782,10 +1006,16 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
     engine_path = detect_engine_for_model(model, engine)
+    # Detect model family to select the correct chat template and tool-call format
+    try:
+        config_payload = json.loads((Path(model) / "config.json").read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        config_payload = {}
+    model_family = detect_model_family(config_payload) if isinstance(config_payload, dict) else "glm"
     runtime = Engine(engine_path,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots)
+                       max_queue, queue_timeout, kv_slots, model_family)
     print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())

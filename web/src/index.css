@@ -86,3 +86,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 @media (max-width: 560px) { .sidebar { grid-template-columns: 1fr; }.brand-row, .sidebar-foot { grid-column: auto; }.empty-state h2 { font-size: 36px; }.message-list { width: calc(100% - 28px); }.composer-foot > span { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
+.reasoning-panel { margin-bottom: 8px; }
+.reasoning-toggle { display: inline-flex; align-items: center; gap: 5px; background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: #7f8c91; font-size: 11px; font-weight: 600; letter-spacing: .05em; cursor: pointer; text-transform: uppercase; transition: color .15s, border-color .15s; }
+.reasoning-toggle:hover { color: var(--primary); border-color: rgba(78,214,165,.35); }
+.reasoning-body { margin: 6px 0 0; padding: 10px 12px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; color: #7f8c91; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow-y: auto; }
