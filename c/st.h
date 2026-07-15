@@ -90,6 +90,77 @@ static int st_open_fd(shards *S, const char *path) {
     return fd;
 }
 
+static char *st_join_path(const char *dir, const char *name) {
+    if (!name || !*name) return NULL;
+    if (name[0] == '/') {
+        return strdup(name);
+    }
+    size_t n = strlen(dir) + 1 + strlen(name) + 1;
+    char *out = (char *)malloc(n);
+    if (!out) { fprintf(stderr, "out of memory\n"); exit(1); }
+    snprintf(out, n, "%s/%s", dir, name);
+    return out;
+}
+
+static int st_collect_index_paths(const char *snap_dir, char files[ST_MAX_SHARDS][1024], int *nf) {
+    char index_path[4096];
+    snprintf(index_path, sizeof(index_path), "%s/model.safetensors.index.json", snap_dir);
+    FILE *fp = fopen(index_path, "rb");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) { fclose(fp); fprintf(stderr, "out of memory\n"); exit(1); }
+    if (fread(buf, 1, (size_t)size, fp) != (size_t)size) { fclose(fp); free(buf); fprintf(stderr, "cannot read index %s\n", index_path); exit(1); }
+    fclose(fp);
+    buf[size] = '\0';
+    char *arena = NULL;
+    jval *root = json_parse(buf, &arena);
+    free(buf);
+    if (!root || root->t != J_OBJ) {
+        return 0;
+    }
+    jval *weight_map = json_get(root, "weight_map");
+    if (!weight_map || weight_map->t != J_OBJ || weight_map->len <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < weight_map->len; i++) {
+        if (!weight_map->kids[i] || weight_map->kids[i]->t != J_STR || !weight_map->kids[i]->str) {
+            continue;
+        }
+        char *path = st_join_path(snap_dir, weight_map->kids[i]->str);
+        if (!path) continue;
+        int already_present = 0;
+        for (int j = 0; j < *nf; j++) {
+            if (!strcmp(files[j], path)) {
+                already_present = 1;
+                break;
+            }
+        }
+        if (!already_present) {
+            if (*nf >= ST_MAX_SHARDS) { free(path); fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            snprintf(files[*nf], 1024, "%s", path);
+            (*nf)++;
+        }
+        free(path);
+    }
+    return *nf > 0;
+}
+
+static void st_sort_paths(char files[ST_MAX_SHARDS][1024], int nf) {
+    for (int a = 0; a < nf; a++) {
+        for (int b = a + 1; b < nf; b++) {
+            if (strcmp(files[a], files[b]) > 0) {
+                char tmp[1024];
+                strcpy(tmp, files[a]);
+                strcpy(files[a], files[b]);
+                strcpy(files[b], tmp);
+            }
+        }
+    }
+}
+
 /* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
  * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
 static int st_direct_fd(shards *S, int fd) {
@@ -103,18 +174,19 @@ static void st_init(shards *S, const char *snap_dir) {
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
-    DIR *d = opendir(snap_dir); struct dirent *e;
-    if (!d) { perror(snap_dir); exit(1); }
-    while ((e = readdir(d))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
-            snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
+    if (!st_collect_index_paths(snap_dir, files, &nf)) {
+        DIR *d = opendir(snap_dir); struct dirent *e;
+        if (!d) { perror(snap_dir); exit(1); }
+        while ((e = readdir(d))) {
+            const char *dot = strrchr(e->d_name, '.');
+            if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+                if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+                snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
+            }
         }
+        closedir(d);
     }
-    closedir(d);
-    for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
-        if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
+    st_sort_paths(files, nf);
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
