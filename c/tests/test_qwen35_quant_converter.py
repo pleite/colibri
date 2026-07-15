@@ -583,6 +583,53 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertTrue(mock_convert.called)
             self.assertIn('falling back to sequential conversion', stream.getvalue())
 
+    def test_converter_processes_oversized_tasks_sequentially_without_worker_pool(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            state_dir = tmpdir / 'state'
+            state_dir.mkdir()
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            task = {
+                'task_id': 'model.safetensors:model.norm.weight',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'model.norm.weight',
+                'meta': {
+                    'dtype': 'BF16',
+                    'shape': [module.MAX_WORKER_POOL_TASK_BYTES // 4 + 1],
+                    'data_offsets': [0, module.MAX_WORKER_POOL_TASK_BYTES // 2],
+                },
+                'source_path': tmpdir / 'model.safetensors',
+            }
+
+            logger = logging.getLogger('test.converter.oversized')
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            handler.setLevel(logging.INFO)
+            logger.addHandler(handler)
+            try:
+                with patch.object(module.concurrent.futures, 'ProcessPoolExecutor') as mock_executor, \
+                     patch.object(module, 'convert_task', return_value=[('model.norm.weight', b'payload', 'F32', [1])]) as mock_convert:
+                    completed = {}
+                    module.process_pending_tasks(
+                        [task],
+                        workers=4,
+                        logger=logger,
+                        completed=completed,
+                        state_dir=state_dir,
+                        total_tasks=1,
+                    )
+            finally:
+                logger.handlers.clear()
+
+            self.assertIn(task['task_id'], completed)
+            mock_executor.assert_not_called()
+            self.assertTrue(mock_convert.called)
+            self.assertIn('processing 1 oversized task(s) sequentially', stream.getvalue())
+
     def test_converter_logs_failures_to_log_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
