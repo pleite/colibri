@@ -85,6 +85,11 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 /* Keep accelerator dispatch opt-in for larger matmuls while preserving a CPU fallback. */
 #define COLI_MATMUL_BACKEND_THRESHOLD 64
 
+#define MAX_KV_SLOTS 16
+#define LA_STATE_DECAY 0.6f
+#define LA_STATE_UPDATE 0.4f
+#define LA_CONV1D_WIDTH 4
+
 typedef enum {
     LAYER_TYPE_LINEAR = 0,
     LAYER_TYPE_FULL = 1,
@@ -428,7 +433,7 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     if (kv_slots_env && *kv_slots_env) {
         char *end = NULL;
         long parsed = strtol(kv_slots_env, &end, 10);
-        if (end && *end == '\0' && parsed > 0 && parsed <= 16) m->kv_slots = (int)parsed;
+        if (end && *end == '\0' && parsed > 0 && parsed <= MAX_KV_SLOTS) m->kv_slots = (int)parsed;
     }
     m->kv_cache_k_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_k_slots));
     m->kv_cache_v_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_v_slots));
@@ -1071,7 +1076,11 @@ static void sample_logits(const float *logits, int n, float temperature, float t
 }
 
 static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot, int steps) {
-    if (slot < 0 || slot >= m->kv_slots) slot = 0;
+    if (slot < 0 || slot >= m->kv_slots) {
+        int invalid_slot = slot;
+        slot = 0;
+        fprintf(stderr, "[qwen35_moe] invalid cache slot %d; using slot 0\n", invalid_slot);
+    }
     if (!m->kv_cache_k_slots[layer] || !m->kv_cache_v_slots[layer] || !m->kv_cache_lens[layer] || !m->kv_cache_caps[layer]) fail("invalid cache state");
     int kv_dim = m->num_kv_heads * m->head_dim;
     int *cap = &m->kv_cache_caps[layer][slot];
@@ -1091,7 +1100,11 @@ static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot,
 }
 
 static void save_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot) {
-    if (slot < 0 || slot >= m->kv_slots) slot = 0;
+    if (slot < 0 || slot >= m->kv_slots) {
+        int invalid_slot = slot;
+        slot = 0;
+        fprintf(stderr, "[qwen35_moe] invalid cache slot %d; using slot 0\n", invalid_slot);
+    }
     m->kv_cache_lens[layer][slot] = cur->kv_cache_len;
     m->kv_cache_caps[layer][slot] = cur->kv_cache_cap;
 }
@@ -1220,11 +1233,11 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     float gate = silu(la_gate[i]);
                     float conv_term = 0.0f;
                     if (cur->la_conv1d) {
-                        conv_term = cur->la_conv1d[i % 4];
+                        conv_term = cur->la_conv1d[i % LA_CONV1D_WIDTH];
                     }
                     float base = silu(la_out[i]) * 0.5f * (1.0f + gate);
                     if (cur->la_state) {
-                        cur->la_state[i] = (cur->la_state[i] * 0.6f) + (base * 0.4f) + conv_term;
+                        cur->la_state[i] = (cur->la_state[i] * LA_STATE_DECAY) + (base * LA_STATE_UPDATE) + conv_term;
                         la_out[i] = cur->la_state[i];
                     } else {
                         la_out[i] = base + conv_term;
@@ -1407,7 +1420,7 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
         int cache_slot_request = 0;
         if (sscanf(cursor, "%zu %d %f %f %d %d %u", &payload_len, &max_tokens_request,
                    &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
-                   &seed_request) < 7) {
+                   &seed_request) != 7) {
             fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
             continue;
         }

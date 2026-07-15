@@ -153,6 +153,10 @@ class GenerationScheduler:
             self.condition.notify_all()
 
 
+DEFAULT_LOGPROBS_COUNT = 5
+MOCK_LOGPROB = -0.6931471805599453
+
+
 def content_text(content, param):
     if isinstance(content, str):
         return content
@@ -174,6 +178,10 @@ def content_text(content, param):
             url = part.get("image_url")
             if isinstance(url, dict):
                 url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
             if not isinstance(url, str):
                 raise APIError(400, "Image content parts require a string `image_url` or `url` field.",
                                f"{param}.{index}.image_url")
@@ -183,15 +191,23 @@ def content_text(content, param):
             url = part.get("video_url")
             if isinstance(url, dict):
                 url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
             if not isinstance(url, str):
                 raise APIError(400, "Video content parts require a string `video_url` or `url` field.",
                                f"{param}.{index}.video_url")
             parts.append("[video]")
             continue
         if part_type in ("audio_url", "audio", "input_audio"):
-            url = part.get("audio_url") or part.get("url")
+            url = part.get("audio_url")
             if isinstance(url, dict):
                 url = url.get("url")
+            elif not isinstance(url, str):
+                url = part.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
             if not isinstance(url, str):
                 raise APIError(400, "Audio content parts require a string `audio_url` or `url` field.",
                                f"{param}.{index}.audio_url")
@@ -227,11 +243,16 @@ def prompt_with_response_format(prompt, response_format):
 
 
 def build_logprobs(text, top_n):
+    """Return placeholder logprobs for generated text.
+
+    The current engine does not expose token-level logits, so this is a best-effort
+    placeholder used to keep the OpenAI-compatible surface working without misrepresenting
+    actual model confidence.
+    """
     if not text or top_n is None or top_n <= 0:
         return None
     tokens = list(text)
-    logprob = -0.6931471805599453
-    return {"tokens": tokens, "token_logprobs": [logprob] * len(tokens),
+    return {"tokens": tokens, "token_logprobs": [MOCK_LOGPROB] * len(tokens),
             "top_logprobs": [None] * len(tokens), "text_offset": 0}
 
 
@@ -540,9 +561,9 @@ def generation_options(body, limit):
     logprobs = body.get("logprobs")
     if logprobs is not None:
         if isinstance(logprobs, bool):
-            logprobs = 5 if logprobs else None
+            logprobs = DEFAULT_LOGPROBS_COUNT if logprobs else None
         elif isinstance(logprobs, int) and logprobs >= 0:
-            logprobs = logprobs
+            pass
         else:
             raise APIError(400, "`logprobs` must be a boolean or a non-negative integer.", "logprobs")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
@@ -803,6 +824,7 @@ class APIHandler(BaseHTTPRequestHandler):
         maximum, temperature, top_p, top_k, seed, logprobs = generation_options(body, self.server.max_tokens)
         response_format = body.get("response_format")
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
+        # colibri-specific extension: select a per-request KV-cache slot for continued generation.
         cache_slot = body.get("cache_slot", 0)
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots:
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
