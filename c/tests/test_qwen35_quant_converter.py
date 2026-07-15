@@ -397,6 +397,76 @@ class Qwen35QuantConverterTest(unittest.TestCase):
             self.assertEqual(FakeExecutor.submit_calls, 2)
             self.assertIn('falling back to sequential conversion', stream.getvalue())
 
+    def test_converter_falls_back_after_wait_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            state_dir = tmpdir / 'state'
+            state_dir.mkdir()
+            task = {
+                'task_id': 'model.safetensors:some.tensor',
+                'source_name': 'model.safetensors',
+                'tensor_name': 'some.tensor',
+                'meta': {
+                    'dtype': 'F32',
+                    'shape': [1],
+                    'data_offsets': [0, 4],
+                },
+                'source_path': tmpdir / 'model.safetensors',
+            }
+            self.write_safetensors(tmpdir / 'model.safetensors', [('some.tensor', [0.0], [1], 'F32')])
+
+            class FakeFuture:
+                def __init__(self, result=None):
+                    self._result = result
+
+                def result(self):
+                    return self._result
+
+            class FakeExecutor:
+                def __init__(self, max_workers):
+                    self.max_workers = max_workers
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def submit(self, fn, task, logger=None):
+                    return FakeFuture(result=[('some.tensor', b'payload', 'U8', [1])])
+
+            spec = importlib.util.spec_from_file_location('convert_qwen35_safetensors', self.converter_script_path())
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            logger = logging.getLogger('test.converter.wait-fallback')
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            handler.setLevel(logging.INFO)
+            logger.addHandler(handler)
+            try:
+                with patch.object(module.concurrent.futures, 'ProcessPoolExecutor', FakeExecutor), \
+                     patch.object(module.concurrent.futures, 'wait', side_effect=module.concurrent.futures.process.BrokenProcessPool('simulated wait failure')), \
+                     patch.object(module, 'convert_task', return_value=[('some.tensor', b'payload', 'U8', [1])]) as mock_convert:
+                    completed = {}
+                    module.process_pending_tasks(
+                       [task],
+                       workers=1,
+                       logger=logger,
+                       completed=completed,
+                       state_dir=state_dir,
+                       total_tasks=1,
+                       max_retries=2,
+                    )
+            finally:
+                logger.handlers.clear()
+
+            self.assertIn(task['task_id'], completed)
+            self.assertTrue(mock_convert.called)
+            self.assertIn('falling back to sequential conversion', stream.getvalue())
+
     def test_converter_logs_failures_to_log_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)

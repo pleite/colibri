@@ -786,7 +786,13 @@ def _process_task_batch(pending_tasks, workers, logger, completed, state_dir, to
                     raise WorkerPoolFailure(task, exc) from exc
                 raise
             if len(futures) >= max(1, workers * 2):
-                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                try:
+                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                except Exception as exc:
+                    if _is_retryable_worker_error(exc):
+                        task_for_failure = next(iter(futures.values()), task)
+                        raise WorkerPoolFailure(task_for_failure, exc) from exc
+                    raise
                 for completed_future in done:
                     task_result = futures.pop(completed_future)
                     try:
@@ -797,7 +803,15 @@ def _process_task_batch(pending_tasks, workers, logger, completed, state_dir, to
                         raise
                     handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks)
         while futures:
-            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            try:
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            except Exception as exc:
+                if _is_retryable_worker_error(exc):
+                    task_for_failure = next(iter(futures.values()), None)
+                    if task_for_failure is None:
+                        raise
+                    raise WorkerPoolFailure(task_for_failure, exc) from exc
+                raise
             for completed_future in done:
                 task_result = futures.pop(completed_future)
                 try:
