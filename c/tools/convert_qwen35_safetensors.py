@@ -553,9 +553,45 @@ def cleanup_task_state_artifacts(state_dir, task_id):
     state_path.unlink(missing_ok=True)
 
 
+def describe_task(task):
+    meta = task.get('meta', {})
+    tensor_name = task.get('tensor_name', '<unknown>')
+    shape = meta.get('shape', [])
+    dtype = meta.get('dtype', '<unknown>')
+    data_offsets = meta.get('data_offsets', [])
+    payload_bytes = None
+    if isinstance(data_offsets, (list, tuple)) and len(data_offsets) == 2:
+        payload_bytes = data_offsets[1] - data_offsets[0]
+    try:
+        quant_kind = should_quantize(tensor_name)
+    except Exception:
+        quant_kind = '<error>'
+    return 'task_id=%s source=%s tensor=%s dtype=%s shape=%s payload_bytes=%s quant_kind=%s' % (
+        task.get('task_id', '<unknown>'),
+        task.get('source_name', '<unknown>'),
+        tensor_name,
+        dtype,
+        shape,
+        payload_bytes if payload_bytes is not None else '<unknown>',
+        quant_kind or '<none>',
+    )
+
+
+def log_task_start(task, logger):
+    if logger is None:
+        return
+    logger.info('starting %s', describe_task(task))
+
+
 def convert_task(task, logger=None):
+    log_task_start(task, logger)
     payload = read_safetensors_tensor_payload(task['source_path'], task['meta'])
+    if logger is not None:
+        logger.info('read %d-byte payload for %s', len(payload), describe_task(task))
     output_tensors = convert_tensor_payload(task['tensor_name'], task['meta'], payload, logger=logger)
+    if logger is not None:
+        for name, payload_data, dtype, shape in output_tensors:
+            logger.debug('prepared %s (%s, shape=%s, payload_bytes=%d)', name, dtype, shape, len(payload_data))
     return output_tensors
 
 
@@ -773,6 +809,19 @@ def _process_task_batch(pending_tasks, workers, logger, completed, state_dir, to
                 handle_completed_task(completed, state_dir, logger, task_result, output_tensors, total_tasks)
 
 
+def process_tasks_sequentially(pending_tasks, logger, completed, state_dir, total_tasks):
+    for index, task in enumerate(pending_tasks, 1):
+        if task['task_id'] in completed:
+            continue
+        logger.info('sequential fallback %d/%d for %s', index, len(pending_tasks), task['task_id'])
+        try:
+            output_tensors = convert_task(task, logger=logger)
+        except Exception:
+            logger.exception('sequential task conversion failed for %s', task['task_id'])
+            raise
+        handle_completed_task(completed, state_dir, logger, task, output_tensors, total_tasks)
+
+
 def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, total_tasks, max_retries=3):
     remaining_tasks = list(pending_tasks)
     workers_for_attempt = max(1, workers)
@@ -783,13 +832,15 @@ def process_pending_tasks(pending_tasks, workers, logger, completed, state_dir, 
             _process_task_batch(remaining_tasks, workers_for_attempt, logger, completed, state_dir, total_tasks)
             return
         except WorkerPoolFailure as exc:
-            if attempt >= max_retries - 1:
-                raise
             remaining_tasks = [task for task in remaining_tasks if task['task_id'] not in completed]
             if not remaining_tasks:
                 return
-            logger.warning('worker pool failure while processing %s; retrying %d task(s) with %d worker(s) (attempt %d/%d)', exc.task['task_id'], len(remaining_tasks), 1, attempt + 2, max_retries)
+            if attempt >= max_retries - 1 or workers_for_attempt <= 1:
+                logger.warning('falling back to sequential conversion for %d task(s) after worker-pool failure', len(remaining_tasks))
+                process_tasks_sequentially(remaining_tasks, logger, completed, state_dir, total_tasks)
+                return
             logger.exception('worker pool failure details for %s', exc.task['task_id'])
+            logger.warning('worker pool failure while processing %s; retrying %d task(s) with %d worker(s) (attempt %d/%d)', exc.task['task_id'], len(remaining_tasks), 1, attempt + 2, max_retries)
             workers_for_attempt = 1
 
 
