@@ -379,21 +379,22 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             free(scale_vals);
             return buf;
         }
+        /* Ornith int8 layout: payload/scale rows are doubled, while the logical tensor
+         * has half as many rows (packed bytes are exactly 2x logical elements). */
         if ((packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0) {
             size_t logical_out_dim = out_dim / 2;
             if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
                 size_t logical_in_dim = nelems / logical_out_dim;
-                size_t logical_nelems = logical_out_dim * logical_in_dim;
-                if (packed_bytes == out_dim * logical_in_dim && logical_nelems == nelems) {
+                if (packed_bytes == out_dim * logical_in_dim) {
                     uint8_t *raw = (uint8_t *)malloc(packed_bytes);
                     if (!raw) fail("out of memory");
                     st_read_raw(&m->shards, t->name, raw, 0);
-                    float *scale_vals = (float *)calloc(out_dim, sizeof(float));
+                    float *scale_vals = (float *)calloc(logical_out_dim, sizeof(float));
                     if (!scale_vals) fail("out of memory");
                     if (scale) {
-                        st_read_f32(&m->shards, scale->name, scale_vals, 0);
+                        st_read_slice_f32(&m->shards, scale->name, 0, (int64_t)logical_out_dim, scale_vals, 0);
                     } else {
-                        for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+                        for (size_t row = 0; row < logical_out_dim; row++) scale_vals[row] = 1.0f;
                     }
                     for (size_t row = 0; row < logical_out_dim; row++) {
                         for (size_t col = 0; col < logical_in_dim; col++) {
