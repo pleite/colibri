@@ -399,18 +399,18 @@ static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out,
     const size_t kv_elems = (size_t)kv_out * (size_t)hidden_size;
     const size_t packed_elems = q_elems + 2 * kv_elems;
     float *packed = load_tensor_f32(m, name, packed_elems);
-    float *q_buf = (float *)malloc(q_elems * sizeof(float));
+    float *q_buf = malloc(q_elems * sizeof(float));
     if (!q_buf) {
         free(packed);
         fail("out of memory allocating q_proj buffer");
     }
-    float *k_buf = (float *)malloc(kv_elems * sizeof(float));
+    float *k_buf = malloc(kv_elems * sizeof(float));
     if (!k_buf) {
         free(q_buf);
         free(packed);
         fail("out of memory allocating k_proj buffer");
     }
-    float *v_buf = (float *)malloc(kv_elems * sizeof(float));
+    float *v_buf = malloc(kv_elems * sizeof(float));
     if (!v_buf) {
         free(q_buf);
         free(k_buf);

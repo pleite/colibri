@@ -132,15 +132,20 @@ static void make_model_dir(const char *dir) {
     if (mkdir(dir, 0777) != 0 && errno != EEXIST) fail("mkdir %s", dir);
 }
 
-static void write_model(const char *dir) {
-    make_model_dir(dir);
+static void write_model_config(const char *dir) {
     char config_path[1024];
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
+    fputs("{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}", fp);
     fclose(fp);
+}
 
+static void write_model(const char *dir) {
+    make_model_dir(dir);
+    write_model_config(dir);
+
+    FILE *fp;
     char tokenizer_path[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
     fp = fopen(tokenizer_path, "w");
@@ -182,13 +187,9 @@ static void write_model(const char *dir) {
 
 static void write_quantized_model(const char *dir) {
     make_model_dir(dir);
-    char config_path[1024];
-    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
-    FILE *fp = fopen(config_path, "w");
-    if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
-    fclose(fp);
+    write_model_config(dir);
 
+    FILE *fp;
     char tokenizer_path[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
     fp = fopen(tokenizer_path, "w");
@@ -221,13 +222,9 @@ static void write_quantized_model(const char *dir) {
 
 static void write_quantized_model_with_language_model_prefixes(const char *dir) {
     make_model_dir(dir);
-    char config_path[1024];
-    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
-    FILE *fp = fopen(config_path, "w");
-    if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
-    fclose(fp);
+    write_model_config(dir);
 
+    FILE *fp;
     char tokenizer_path[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
     fp = fopen(tokenizer_path, "w");
@@ -259,13 +256,9 @@ static void write_quantized_model_with_language_model_prefixes(const char *dir) 
 
 static void write_model_with_packed_qkv(const char *dir) {
     make_model_dir(dir);
-    char config_path[1024];
-    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
-    FILE *fp = fopen(config_path, "w");
-    if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
-    fclose(fp);
+    write_model_config(dir);
 
+    FILE *fp;
     char tokenizer_path[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
     fp = fopen(tokenizer_path, "w");
@@ -316,13 +309,9 @@ static void write_model_with_packed_qkv(const char *dir) {
 
 static void write_model_with_split_index(const char *dir) {
     make_model_dir(dir);
-    char config_path[1024];
-    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
-    FILE *fp = fopen(config_path, "w");
-    if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
-    fclose(fp);
+    write_model_config(dir);
 
+    FILE *fp;
     char tokenizer_path[1024];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
     fp = fopen(tokenizer_path, "w");
