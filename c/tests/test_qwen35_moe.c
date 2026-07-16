@@ -138,7 +138,7 @@ static void write_model(const char *dir) {
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
     fclose(fp);
 
     char tokenizer_path[1024];
@@ -186,7 +186,7 @@ static void write_quantized_model(const char *dir) {
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
     fclose(fp);
 
     char tokenizer_path[1024];
@@ -225,7 +225,7 @@ static void write_quantized_model_with_language_model_prefixes(const char *dir) 
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
     fclose(fp);
 
     char tokenizer_path[1024];
@@ -257,13 +257,70 @@ static void write_quantized_model_with_language_model_prefixes(const char *dir) 
     write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
 }
 
+static void write_model_with_packed_qkv(const char *dir) {
+    make_model_dir(dir);
+    char config_path[1024];
+    snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
+    FILE *fp = fopen(config_path, "w");
+    if (!fp) fail("cannot write %s", config_path);
+    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
+    fclose(fp);
+
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_path[1024];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+
+    float embed[16] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f, 1.6f};
+    float norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float lmhead[16] = {0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f};
+    float attn_norm[4] = {1.0f, 1.1f, 1.2f, 1.3f};
+    float ffn_norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float qkv[48] = {
+        0.1f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.1f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.1f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.1f,
+        0.05f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.05f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.05f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.05f,
+        0.02f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.02f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.02f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.02f,
+    };
+    float o[16] = {0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.0f, 0.0f, 0.0f, 0.0f, 0.3f};
+    float gate[16] = {0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f, 0.0f, 0.0f, 0.0f, 0.0f, 0.1f};
+    float up[16] = {0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.2f};
+    float down[16] = {0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 0.0f, 0.0f, 0.0f, 0.4f};
+    raw_tensor tensors[] = {
+        {"model.embed_tokens.weight", embed, 16, sizeof(embed), "F32"},
+        {"model.norm.weight", norm, 4, sizeof(norm), "F32"},
+        {"lm_head.weight", lmhead, 16, sizeof(lmhead), "F32"},
+        {"model.layers.0.input_layernorm.weight", attn_norm, 4, sizeof(attn_norm), "F32"},
+        {"model.layers.0.post_attention_layernorm.weight", ffn_norm, 4, sizeof(ffn_norm), "F32"},
+        {"model.layers.0.self_attn.qkv.weight", qkv, 48, sizeof(qkv), "F32"},
+        {"model.layers.0.self_attn.o_proj.weight", o, 16, sizeof(o), "F32"},
+        {"model.layers.0.mlp.gate_proj.weight", gate, 16, sizeof(gate), "F32"},
+        {"model.layers.0.mlp.up_proj.weight", up, 16, sizeof(up), "F32"},
+        {"model.layers.0.mlp.down_proj.weight", down, 16, sizeof(down), "F32"},
+    };
+    write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+}
+
 static void write_model_with_split_index(const char *dir) {
     make_model_dir(dir);
     char config_path[1024];
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fprintf(fp, "{\"vocab_size\":4,\"hidden_size\":4,\"num_hidden_layers\":1,\"num_experts\":2,\"num_experts_per_tok\":1}");
+    fprintf(fp, "{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}");
     fclose(fp);
 
     char tokenizer_path[1024];
@@ -477,6 +534,16 @@ int main(void) {
     run_engine(split_tmp, 4, tokens, 2, split_actual);
     for (int i = 0; i < 4; i++) {
         if (split_actual[i] != expected[i]) fail("split-index model mismatch at token %d: expected %d got %d", i, expected[i], split_actual[i]);
+    }
+
+    char packed_dir[] = "/tmp/colibri-qwen35-packed-XXXXXX";
+    char *packed_tmp = mkdtemp(packed_dir);
+    if (!packed_tmp) fail("mkdtemp failed");
+    write_model_with_packed_qkv(packed_tmp);
+    int packed_actual[4] = {0, 0, 0, 0};
+    run_engine(packed_tmp, 4, tokens, 2, packed_actual);
+    for (int i = 0; i < 4; i++) {
+        if (packed_actual[i] != expected[i]) fail("packed-qkv model mismatch at token %d: expected %d got %d", i, expected[i], packed_actual[i]);
     }
 
     char quant_dir[] = "/tmp/colibri-qwen35-quant-XXXXXX";

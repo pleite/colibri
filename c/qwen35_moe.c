@@ -393,6 +393,40 @@ static float *load_optional_tensor_f32(qwen35_model *m, const char *name, size_t
     return load_tensor_f32(m, name, nelems);
 }
 
+static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out, int kv_out, int hidden_size, float **q_proj, float **k_proj, float **v_proj) {
+    if (!tensor_exists(m, name)) return false;
+    const size_t q_elems = (size_t)q_out * (size_t)hidden_size;
+    const size_t kv_elems = (size_t)kv_out * (size_t)hidden_size;
+    const size_t packed_elems = q_elems + 2 * kv_elems;
+    float *packed = load_tensor_f32(m, name, packed_elems);
+    float *q_buf = (float *)malloc(q_elems * sizeof(float));
+    if (!q_buf) {
+        free(packed);
+        fail("out of memory allocating q_proj buffer");
+    }
+    float *k_buf = (float *)malloc(kv_elems * sizeof(float));
+    if (!k_buf) {
+        free(q_buf);
+        free(packed);
+        fail("out of memory allocating k_proj buffer");
+    }
+    float *v_buf = (float *)malloc(kv_elems * sizeof(float));
+    if (!v_buf) {
+        free(q_buf);
+        free(k_buf);
+        free(packed);
+        fail("out of memory allocating v_proj buffer");
+    }
+    memcpy(q_buf, packed, q_elems * sizeof(float));
+    memcpy(k_buf, packed + q_elems, kv_elems * sizeof(float));
+    memcpy(v_buf, packed + q_elems + kv_elems, kv_elems * sizeof(float));
+    free(packed);
+    *q_proj = q_buf;
+    *k_proj = k_buf;
+    *v_proj = v_buf;
+    return true;
+}
+
 static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermediate_size, int shared_expert_intermediate_size, int num_experts, int num_attention_heads, int num_kv_heads, int head_dim) {
     memset(layer, 0, sizeof(*layer));
     layer->in_ln = (float *)calloc((size_t)hidden_size, sizeof(float));
@@ -601,26 +635,29 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             }
             const int q_out = m->num_attention_heads * m->head_dim;
             const int kv_out = m->num_kv_heads * m->head_dim;
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
-            cur->q_proj = load_optional_tensor_f32(m, name, (size_t)q_out * (size_t)m->hidden_size);
-            if (!cur->q_proj) {
-                cur->q_proj = (float *)calloc((size_t)q_out * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->q_proj) fail("out of memory");
-                for (int i = 0; i < q_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->q_proj[i * m->hidden_size + j] = 1.0f;
-            }
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
-            cur->k_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
-            if (!cur->k_proj) {
-                cur->k_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->k_proj) fail("out of memory");
-                for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->k_proj[i * m->hidden_size + j] = 0.25f;
-            }
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
-            cur->v_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
-            if (!cur->v_proj) {
-                cur->v_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->v_proj) fail("out of memory");
-                for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->v_proj[i * m->hidden_size + j] = 0.125f;
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.qkv.weight", layer);
+            if (!load_packed_qkv_tensor(m, name, q_out, kv_out, m->hidden_size, &cur->q_proj, &cur->k_proj, &cur->v_proj)) {
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
+                cur->q_proj = load_optional_tensor_f32(m, name, (size_t)q_out * (size_t)m->hidden_size);
+                if (!cur->q_proj) {
+                    cur->q_proj = (float *)calloc((size_t)q_out * (size_t)m->hidden_size, sizeof(float));
+                    if (!cur->q_proj) fail("out of memory");
+                    for (int i = 0; i < q_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->q_proj[i * m->hidden_size + j] = 1.0f;
+                }
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
+                cur->k_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
+                if (!cur->k_proj) {
+                    cur->k_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
+                    if (!cur->k_proj) fail("out of memory");
+                    for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->k_proj[i * m->hidden_size + j] = 0.25f;
+                }
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
+                cur->v_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
+                if (!cur->v_proj) {
+                    cur->v_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
+                    if (!cur->v_proj) fail("out of memory");
+                    for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->v_proj[i * m->hidden_size + j] = 0.125f;
+                }
             }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
             cur->o_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)q_out);
