@@ -99,6 +99,12 @@ typedef enum {
     LAYER_TYPE_FULL = 1,
 } layer_type_t;
 
+typedef enum {
+    QWEN_EXPERT_STATE_UNLOADED = 0,
+    QWEN_EXPERT_STATE_RESIDENT = 1,
+    QWEN_EXPERT_STATE_PINNED = 2,
+} qwen_expert_state_t;
+
 typedef struct {
     float *in_ln;
     float *post_ln;
@@ -120,6 +126,7 @@ typedef struct {
     float **expert_gate_proj;
     float **expert_up_proj;
     float **expert_down_proj;
+    int *expert_state;
     float *la_in_proj_a;
     float *la_in_proj_b;
     float *la_in_proj_qkv;
@@ -812,23 +819,12 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             cur->expert_gate_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             cur->expert_up_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             cur->expert_down_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
+            cur->expert_state = (int *)qwen_calloc((size_t)m->num_experts, sizeof(int), "expert state table");
             for (int expert = 0; expert < m->num_experts; expert++) {
-                char expert_name[1024];
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert);
-                cur->expert_gate_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-                if (!cur->expert_gate_proj[expert]) {
-                    cur->expert_gate_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
-                }
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert);
-                cur->expert_up_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-                if (!cur->expert_up_proj[expert]) {
-                    cur->expert_up_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
-                }
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert);
-                cur->expert_down_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
-                if (!cur->expert_down_proj[expert]) {
-                    cur->expert_down_proj[expert] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
-                }
+                cur->expert_gate_proj[expert] = NULL;
+                cur->expert_up_proj[expert] = NULL;
+                cur->expert_down_proj[expert] = NULL;
+                cur->expert_state[expert] = QWEN_EXPERT_STATE_UNLOADED;
             }
         } else {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer);
@@ -955,6 +951,7 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
         }
         free(layer->expert_down_proj);
     }
+    free(layer->expert_state);
 }
 
 static void free_model(qwen35_model *m) {
@@ -1180,7 +1177,7 @@ static void apply_rope(float *values, int head_dim, int position, float theta, f
     }
 }
 
-static void sample_logits(const float *logits, int n, float temperature, float top_p, int top_k, int *out_token) {
+static void sample_logits(const float *logits, int n, float temperature, float top_p, float min_p, int top_k, int *out_token) {
     if (n <= 0) return;
     if (temperature <= 0.0f) {
         int best = 0;
@@ -1199,6 +1196,8 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     int *kept = NULL;
     float *keep_scores = NULL;
     float *probs = NULL;
+    int *filtered_indices = NULL;
+    float *filtered_probs = NULL;
     int best = 0;
     indices = (int *)qwen_malloc((size_t)n * sizeof(int));
     values = (float *)qwen_malloc((size_t)n * sizeof(float));
@@ -1251,6 +1250,47 @@ static void sample_logits(const float *logits, int n, float temperature, float t
         probs[i] = expf((keep_scores[i] - maxv) / temperature);
         sum += probs[i];
     }
+    if (min_p > 0.0f) {
+        filtered_indices = (int *)qwen_malloc((size_t)keep * sizeof(int));
+        filtered_probs = (float *)qwen_malloc((size_t)keep * sizeof(float));
+        if (!filtered_indices || !filtered_probs) {
+            free(filtered_indices);
+            free(filtered_probs);
+            free(probs);
+            free(keep_scores);
+            free(kept);
+            free(values);
+            free(indices);
+            fail("out of memory");
+        }
+        float max_prob = 0.0f;
+        for (int i = 0; i < keep; i++) {
+            if (probs[i] > max_prob) {
+                max_prob = probs[i];
+            }
+        }
+        float threshold = max_prob * min_p;
+        int filtered_count = 0;
+        for (int i = 0; i < keep; i++) {
+            if (probs[i] >= threshold) {
+                filtered_indices[filtered_count] = kept[i];
+                filtered_probs[filtered_count] = probs[i];
+                filtered_count++;
+            }
+        }
+        if (filtered_count == 0) {
+            filtered_indices[0] = kept[0];
+            filtered_probs[0] = probs[0];
+            filtered_count = 1;
+        }
+        free(kept);
+        free(probs);
+        keep = filtered_count;
+        kept = filtered_indices;
+        probs = filtered_probs;
+        sum = 0.0f;
+        for (int i = 0; i < keep; i++) sum += probs[i];
+    }
     if (top_p > 0.0f && top_p < 1.0f) {
         float target = sum * top_p;
         float cumulative = 0.0f;
@@ -1285,6 +1325,40 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     free(kept);
     free(values);
     free(indices);
+}
+
+static bool expert_tables_ready(const QLayer *cur) {
+    return cur != NULL && cur->expert_state != NULL && cur->expert_gate_proj != NULL &&
+           cur->expert_up_proj != NULL && cur->expert_down_proj != NULL;
+}
+
+static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_idx) {
+    if (!expert_tables_ready(cur)) {
+        return;
+    }
+    if (expert_idx < 0 || expert_idx >= m->num_experts) {
+        return;
+    }
+    if (cur->expert_state[expert_idx] != QWEN_EXPERT_STATE_UNLOADED) {
+        return;
+    }
+    char expert_name[1024];
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert_idx);
+    cur->expert_gate_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+    if (!cur->expert_gate_proj[expert_idx]) {
+        cur->expert_gate_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
+    }
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert_idx);
+    cur->expert_up_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+    if (!cur->expert_up_proj[expert_idx]) {
+        cur->expert_up_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
+    }
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert_idx);
+    cur->expert_down_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
+    if (!cur->expert_down_proj[expert_idx]) {
+        cur->expert_down_proj[expert_idx] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
+    }
+    cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
 }
 
 static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot, int steps) {
@@ -1333,7 +1407,7 @@ static void configure_parallelism(int requested_threads) {
 }
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
-                      int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed,
+                      int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
                       int cache_slot) {
     float *hidden = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
     for (int layer = 0; layer < m->num_layers; layer++) {
@@ -1484,7 +1558,8 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 for (int expert_slot = 0; expert_slot < m->experts_per_tok; expert_slot++) {
                     int expert_idx = expert_indices[expert_slot];
                     float weight = expert_weights[expert_slot];
-                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx]) continue;
+                    ensure_expert(m, cur, layer, expert_idx);
+                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx] || !cur->expert_up_proj[expert_idx] || !cur->expert_down_proj[expert_idx]) continue;
                     float *expert_gate = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_up = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_res = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
@@ -1554,7 +1629,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 }
             }
         } else {
-            sample_logits(logits, m->vocab_size, temperature, top_p, top_k, &best);
+            sample_logits(logits, m->vocab_size, temperature, top_p, min_p, top_k, &best);
         }
         out_tokens[step] = best;
         free(logits);
@@ -1601,11 +1676,11 @@ static int read_exact(FILE *fp, unsigned char *buf, size_t len) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
+            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
             prog);
 }
 
-static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
+static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed) {
     printf("\x01\x01READY\x01\x01\n");
     printf("STAT 0 0.00 0.0 0.00\n");
     fflush(stdout);
@@ -1622,15 +1697,20 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
         int max_tokens_request = max_tokens;
         float temperature_request = temperature;
         float top_p_request = top_p;
+        float min_p_request = min_p;
         int top_k_request = top_k;
         unsigned int seed_request = seed;
         char *cursor = header + 9;
         int cache_slot_request = 0;
-        if (sscanf(cursor, "%zu %d %f %f %d %d %u", &payload_len, &max_tokens_request,
-                   &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
-                   &seed_request) != 7) {
+        int parsed = sscanf(cursor, "%zu %d %f %f %d %d %u %f", &payload_len, &max_tokens_request,
+                            &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
+                            &seed_request, &min_p_request);
+        if (parsed < 7) {
             fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
             continue;
+        }
+        if (parsed < 8) {
+            min_p_request = 0.0f;
         }
         if (payload_len > 0) {
             unsigned char *payload = (unsigned char *)qwen_malloc(payload_len + 1, "server payload buffer");
@@ -1654,7 +1734,7 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             }
             int n_tokens = parse_token_ids(prompt_text, tokens, max_tokens_request);
             if (n_tokens <= 0) n_tokens = 1;
-            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, top_k_request, seed, cache_slot_request);
+            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, min_p_request, top_k_request, seed, cache_slot_request);
             for (int i = 0; i < max_tokens_request; i++) {
                 if (i > 0) fputc(' ', stdout);
                 fprintf(stdout, "%d", out[i]);
@@ -1680,6 +1760,7 @@ int main(int argc, char **argv) {
     int threads = 0;
     float temperature = 0.0f;
     float top_p = 0.0f;
+    float min_p = 0.0f;
     int top_k = 0;
     unsigned int seed = 0;
     bool debug_enabled = false;
@@ -1702,6 +1783,8 @@ int main(int argc, char **argv) {
             top_k = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) {
             top_p = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) {
+            min_p = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--debug") || !strcmp(argv[i], "--verbose")) {
@@ -1730,7 +1813,7 @@ int main(int argc, char **argv) {
     qwen35_model model;
     init_model(&model, snap_dir);
     if (getenv("SERVE")) {
-        run_server(&model, steps, temperature, top_p, top_k, seed);
+        run_server(&model, steps, temperature, top_p, min_p, top_k, seed);
         free_model(&model);
         return 0;
     }
@@ -1738,7 +1821,7 @@ int main(int argc, char **argv) {
     int n_tokens = parse_token_ids(prompt ? prompt : "0", tokens, steps);
     if (n_tokens <= 0) n_tokens = 1;
     int *out = (int *)qwen_calloc((size_t)steps, sizeof(int));
-    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed, 0);
+    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, min_p, top_k, seed, 0);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
     }

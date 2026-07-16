@@ -23,15 +23,22 @@ APU_VRAM_THRESHOLD_BYTES = 4 * GB
 
 def _cfg_value(cfg, *keys, default=None):
     """Return the first non-missing config value, preserving 0/False."""
+    if not isinstance(cfg, dict):
+        return default
+    text_config = cfg.get("text_config")
+    nested_cfg = text_config if isinstance(text_config, dict) else None
     for key in keys:
-        value = cfg.get(key)
-        if value is None or value == "":
-            continue
-        if isinstance(value, (list, tuple, set, dict)):
-            if len(value) > 0:
-                return value
-            continue
-        return value
+        for scope in (cfg, nested_cfg):
+            if scope is None:
+                continue
+            value = scope.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, (list, tuple, set, dict)):
+                if len(value) > 0:
+                    return value
+                continue
+            return value
     return default
 
 
@@ -45,17 +52,30 @@ def _cfg_int(cfg, *keys, default=0):
 def detect_model_family(config):
     if not isinstance(config, dict):
         return "generic"
-    architecture_candidates = []
-    architectures = config.get("architectures")
-    if isinstance(architectures, str):
-        architecture_candidates.append(architectures)
-    elif isinstance(architectures, (list, tuple, set)):
-        architecture_candidates.extend(str(item) for item in architectures if item is not None)
-    model_type = str(config.get("model_type") or config.get("architecture") or "")
-    architecture_text = " ".join([model_type] + architecture_candidates).lower()
-    if "qwen3.5" in architecture_text or "qwen3" in architecture_text or "qwen" in architecture_text:
+
+    def collect_architecture_text(node, texts):
+        if not isinstance(node, dict):
+            return
+        architecture_candidates = []
+        architectures = node.get("architectures")
+        if isinstance(architectures, str):
+            architecture_candidates.append(architectures)
+        elif isinstance(architectures, (list, tuple, set)):
+            architecture_candidates.extend(str(item) for item in architectures if item is not None)
+        model_type = str(node.get("model_type") or node.get("architecture") or "")
+        architecture_text = " ".join([model_type] + architecture_candidates).lower()
+        if architecture_text:
+            texts.append(architecture_text)
+        nested = node.get("text_config")
+        if isinstance(nested, dict):
+            collect_architecture_text(nested, texts)
+
+    architecture_texts = []
+    collect_architecture_text(config, architecture_texts)
+    combined_text = " ".join(architecture_texts).lower()
+    if "qwen3.5" in combined_text or "qwen3" in combined_text or "qwen" in combined_text:
         return "qwen35"
-    if "glm" in architecture_text:
+    if "glm" in combined_text:
         return "glm"
     return "generic"
 

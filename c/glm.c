@@ -77,6 +77,7 @@ typedef struct {
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
 #ifdef COLI_CUDA
@@ -91,7 +92,6 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;
 }
-
 typedef struct {
     float *in_ln, *post_ln;
     /* MLA (densa, quantizzata) */
@@ -609,18 +609,17 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
-/* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
+/* sceglie il formato da `bits`: >=16 f32, 5..8 int8, 3..4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=malloc((int64_t)O*I); t->s=falloc(O); }
     else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
-    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
+    else { fprintf(stderr,"unsupported quantization bits=%d (int4/int8 only)\n", bits); exit(1); }
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
     else if(t->fmt==1) quantize_rows(w, t->q8, t->s, t->O, t->I, bits);
-    else if(t->fmt==3) pack_int2(w, t->q4, t->s, t->O, t->I, bits);
     else pack_int4(w, t->q4, t->s, t->O, t->I, bits);
 }
 
@@ -721,7 +720,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
+        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : -1;  /* int8 / int4 dai byte */
+        if(fmt<0){ fprintf(stderr,"unsupported quantized tensor bytes=%lld for %s (int4/int8 only)\n", (long long)nb, name); exit(1); }
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
@@ -894,12 +894,9 @@ static void embed_row(Model *m, int tok, float *x){
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
-    if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
-        for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
-            if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
-        return; }
-    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
-    for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+    const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
+    for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
+        if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
 }
 
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
@@ -1095,11 +1092,9 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
-    if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
-        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
-        if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
-    const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
-    for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
+    const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+    for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
+    if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); }
 }
 /* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
 static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
@@ -1108,11 +1103,9 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
-        else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
+        else { const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
-        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
-            for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         y[j]=(float)a;
     }
 }

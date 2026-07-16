@@ -7,6 +7,10 @@ This is a **new engine**, not a modification of `glm.c`. The Qwen3.5 architectur
 differs from GLM-5.2 in attention mechanism, routing, MTP placement, and weight
 layout — all of which require a separate implementation.
 
+For a consolidated list of the missing work needed to bring Qwen3.5 and the
+other backends up to the level of the CPU/GLM baseline, see
+`docs/plans/2026-07-16_backend-parity-gap-list.md`.
+
 ## Current status (2026-07-15)
 
 The repository now has a real `c/qwen35_moe.c` engine binary, safetensors
