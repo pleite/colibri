@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "parallelism.h"
 
@@ -44,7 +45,30 @@ struct ColiCudaTensor {
     uint64_t cache_hash;
 };
 
-static const size_t k_stub_memory_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+enum {
+    COLI_RUNTIME_BACKEND_CPU = 1,
+    COLI_RUNTIME_BACKEND_NPU = 2,
+    COLI_RUNTIME_BACKEND_VULKAN = 4,
+    COLI_RUNTIME_BACKEND_CUDA = 8,
+};
+
+static int host_memory_info(size_t *free_bytes, size_t *total_bytes) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    if ((size_t)pages > SIZE_MAX / (size_t)page_size) return 0;
+    const size_t total = (size_t)pages * (size_t)page_size;
+    if (total_bytes) *total_bytes = total;
+#ifdef _SC_AVPHYS_PAGES
+    long avail_pages = sysconf(_SC_AVPHYS_PAGES);
+    if (avail_pages <= 0) avail_pages = pages;
+#else
+    long avail_pages = pages;
+#endif
+    if ((size_t)avail_pages > SIZE_MAX / (size_t)page_size) return 0;
+    if (free_bytes) *free_bytes = (size_t)avail_pages * (size_t)page_size;
+    return 1;
+}
 
 static int g_initialized = 0;
 static int g_devices[COLI_RUNTIME_MAX_DEVICES];
@@ -58,21 +82,21 @@ static int g_backend_mask = 0;
 
 static int backend_bit_for_name(const char *name) {
     if (!name || !*name) return 0;
-    if (!strcmp(name, "cpu")) return 1;
+    if (!strcmp(name, "cpu")) return COLI_RUNTIME_BACKEND_CPU;
 #ifdef COLI_ENABLE_NPU
-    if (!strcmp(name, "npu")) return 2;
+    if (!strcmp(name, "npu")) return COLI_RUNTIME_BACKEND_NPU;
 #endif
 #ifdef COLI_ENABLE_VULKAN
-    if (!strcmp(name, "vulkan")) return 4;
+    if (!strcmp(name, "vulkan")) return COLI_RUNTIME_BACKEND_VULKAN;
 #endif
 #if defined(COLI_CUDA)
     /* CUDA and ROCm share the same runtime dispatch slot because the build-time
      * mapping selects the appropriate implementation via the same coli_cuda_*
      * ABI entry points. */
-    if (!strcmp(name, "cuda")) return 8;
+    if (!strcmp(name, "cuda")) return COLI_RUNTIME_BACKEND_CUDA;
 #endif
 #if defined(COLI_ROCM)
-    if (!strcmp(name, "rocm")) return 8;
+    if (!strcmp(name, "rocm")) return COLI_RUNTIME_BACKEND_CUDA;
 #endif
     return 0;
 }
@@ -340,14 +364,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         if (!coli_npu_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         float *chunk_out = (float *)calloc((size_t)S * (size_t)output_chunk_size, sizeof(float));
         if (!chunk_out) {
             coli_npu_tensor_free(tensor);
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         const int ok = coli_npu_matmul(&tensor, chunk_out, x, slice_weights_buf, slice_scales_buf, fmt, S, I, output_chunk_size, device);
         if (ok) {
@@ -359,11 +383,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         coli_npu_tensor_free(tensor);
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return ok;
+        if (!ok) {
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
+        }
+        return 1;
 #else
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return 0;
+        return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
 #endif
     }
 
@@ -373,14 +400,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         if (!coli_vulkan_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         float *chunk_out = (float *)calloc((size_t)S * (size_t)output_chunk_size, sizeof(float));
         if (!chunk_out) {
             coli_vulkan_tensor_free(tensor);
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         const int ok = coli_vulkan_matmul(&tensor, chunk_out, x, slice_weights_buf, slice_scales_buf, fmt, S, I, output_chunk_size, device);
         if (ok) {
@@ -392,11 +419,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         coli_vulkan_tensor_free(tensor);
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return ok;
+        if (!ok) {
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
+        }
+        return 1;
 #else
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return 0;
+        return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
 #endif
     }
 
@@ -406,14 +436,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         if (!coli_rocm_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         float *chunk_out = (float *)calloc((size_t)S * (size_t)output_chunk_size, sizeof(float));
         if (!chunk_out) {
             coli_rocm_tensor_free(tensor);
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         const int ok = coli_rocm_matmul(&tensor, chunk_out, x, slice_weights_buf, slice_scales_buf, fmt, S, I, output_chunk_size, device);
         if (ok) {
@@ -425,20 +455,23 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         coli_rocm_tensor_free(tensor);
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return ok;
+        if (!ok) {
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
+        }
+        return 1;
 #elif defined(COLI_CUDA) && !defined(COLI_ENABLE_VULKAN)
         ColiCudaTensor *tensor = NULL;
         if (!coli_cuda_tensor_upload(&tensor, slice_weights_buf, slice_scales_buf, fmt, I, output_chunk_size, device)) {
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         float *chunk_out = (float *)calloc((size_t)S * (size_t)output_chunk_size, sizeof(float));
         if (!chunk_out) {
             coli_cuda_tensor_free(tensor);
             free(slice_weights_buf);
             free(slice_scales_buf);
-            return 0;
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
         }
         const int ok = coli_cuda_matmul(&tensor, chunk_out, x, slice_weights_buf, slice_scales_buf, fmt, S, I, output_chunk_size, device);
         if (ok) {
@@ -450,11 +483,14 @@ static int dispatch_chunk(float *y, const float *x, const void *weights, const f
         coli_cuda_tensor_free(tensor);
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return ok;
+        if (!ok) {
+            return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
+        }
+        return 1;
 #else
         free(slice_weights_buf);
         free(slice_scales_buf);
-        return 0;
+        return dispatch_chunk(y, x, weights, scales, fmt, S, I, O, 0, start, output_chunk_size, device);
 #endif
     }
 
@@ -543,9 +579,7 @@ int coli_runtime_device_at(int index) {
 
 int coli_runtime_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     (void)device;
-    if (free_bytes) *free_bytes = k_stub_memory_bytes;
-    if (total_bytes) *total_bytes = k_stub_memory_bytes;
-    return 1;
+    return host_memory_info(free_bytes, total_bytes);
 }
 
 void coli_runtime_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
@@ -621,18 +655,23 @@ int coli_runtime_matmul(ColiCudaTensor **tensor,
     }
 
     int lane_ids[4] = {0, 0, 0, 0};
-    int lane_count = 1;
-    lane_ids[0] = 0;
-    if (g_backend_mask & 2) {
+    int lane_count = 0;
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_CPU) {
+        lane_ids[lane_count++] = 0;
+    }
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_NPU) {
         lane_ids[lane_count++] = 1;
     }
-    if (g_backend_mask & 4) {
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_VULKAN) {
         lane_ids[lane_count++] = 2;
     }
-    if (g_backend_mask & 8) {
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_CUDA) {
         lane_ids[lane_count++] = 3;
     }
-    if (lane_count <= 0) lane_count = 1;
+    if (lane_count <= 0) {
+        lane_ids[0] = 0;
+        lane_count = 1;
+    }
 
     const int base = O / lane_count;
     const int extra = O % lane_count;

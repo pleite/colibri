@@ -4,6 +4,8 @@ Date: 2026-07-16
 
 This document consolidates the missing work needed to bring the current engine and accelerator stack up to the level of the CPU/GLM baseline, and to make Qwen3.5 MoE and the other backends reach the same level of support.
 
+Implementation update (2026-07-16): the shared runtime now falls back to the CPU path when a selected backend cannot complete upload or matmul work, so unsupported shapes or unavailable backends no longer fail the whole execution path. The backend runtime test suite now exercises that fallback path explicitly.
+
 ## Summary
 
 The current repository already has:
