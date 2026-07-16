@@ -12,6 +12,12 @@ extern "C" {
 
 typedef struct ColiCudaTensor ColiCudaTensor;
 
+/* Backend mask bits returned by coli_runtime_backend_mask(). */
+#define COLI_RUNTIME_BACKEND_CPU_BIT    1
+#define COLI_RUNTIME_BACKEND_NPU_BIT    2
+#define COLI_RUNTIME_BACKEND_VULKAN_BIT 4
+#define COLI_RUNTIME_BACKEND_CUDA_BIT   8
+
 /* Operation roles ("sensors") let the caller describe the shape/behaviour of a
  * matmul so the scheduler can steer it toward the most suitable backend when
  * several are active simultaneously:
