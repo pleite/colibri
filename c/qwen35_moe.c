@@ -144,6 +144,10 @@ typedef struct {
     int num_attention_heads;
     int num_kv_heads;
     int head_dim;
+    int linear_num_key_heads;
+    int linear_key_head_dim;
+    int linear_num_value_heads;
+    int linear_value_head_dim;
     bool has_router;
     char *snap_dir;
     shards shards;
@@ -487,6 +491,10 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     m->num_attention_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_attention_heads", 1);
     m->num_kv_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_key_value_heads", 1);
     m->head_dim = parse_int_field_with_fallback(text_cfg, cfg, "head_dim", m->hidden_size);
+    m->linear_num_key_heads = parse_int_field_with_fallback(text_cfg, cfg, "linear_num_key_heads", m->num_kv_heads);
+    m->linear_key_head_dim = parse_int_field_with_fallback(text_cfg, cfg, "linear_key_head_dim", m->head_dim);
+    m->linear_num_value_heads = parse_int_field_with_fallback(text_cfg, cfg, "linear_num_value_heads", m->num_kv_heads);
+    m->linear_value_head_dim = parse_int_field_with_fallback(text_cfg, cfg, "linear_value_head_dim", m->head_dim);
     m->rope_theta = parse_float_field(text_cfg, "rope_theta", 10000.0f);
     m->partial_rotary_factor = parse_float_field(text_cfg, "partial_rotary_factor", 0.25f);
     m->use_rope = m->rope_theta > 0.0f && m->partial_rotary_factor > 0.0f && m->head_dim > 1;
@@ -672,60 +680,60 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             }
         } else {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer);
-            cur->la_in_proj_a = load_optional_tensor_f32(m, name, (size_t)128 * (size_t)m->hidden_size);
+            cur->la_in_proj_a = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_a) {
-                cur->la_in_proj_a = (float *)calloc((size_t)128 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_a = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_a) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", layer);
-            cur->la_in_proj_b = load_optional_tensor_f32(m, name, (size_t)128 * (size_t)m->hidden_size);
+            cur->la_in_proj_b = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_b) {
-                cur->la_in_proj_b = (float *)calloc((size_t)128 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_b = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_b) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer);
-            cur->la_in_proj_qkv = load_optional_tensor_f32(m, name, (size_t)12288 * (size_t)m->hidden_size);
+            cur->la_in_proj_qkv = load_optional_tensor_f32(m, name, (size_t)3 * (size_t)m->hidden_size * (size_t)m->hidden_size);
             if (!cur->la_in_proj_qkv) {
-                cur->la_in_proj_qkv = (float *)calloc((size_t)12288 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_qkv = (float *)calloc((size_t)3 * (size_t)m->hidden_size * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_qkv) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", layer);
-            cur->la_in_proj_z = load_optional_tensor_f32(m, name, (size_t)8192 * (size_t)m->hidden_size);
+            cur->la_in_proj_z = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim * (size_t)m->hidden_size);
             if (!cur->la_in_proj_z) {
-                cur->la_in_proj_z = (float *)calloc((size_t)8192 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_z = (float *)calloc((size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_z) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", layer);
-            cur->la_out_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)8192);
+            cur->la_out_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim);
             if (!cur->la_out_proj) {
-                cur->la_out_proj = (float *)calloc((size_t)m->hidden_size * (size_t)8192, sizeof(float));
+                cur->la_out_proj = (float *)calloc((size_t)m->hidden_size * (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim, sizeof(float));
                 if (!cur->la_out_proj) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", layer);
-            cur->la_norm = load_optional_tensor_f32(m, name, 128);
+            cur->la_norm = load_optional_tensor_f32(m, name, (size_t)m->linear_key_head_dim);
             if (!cur->la_norm) {
-                cur->la_norm = (float *)calloc(128, sizeof(float));
+                cur->la_norm = (float *)calloc((size_t)m->linear_key_head_dim, sizeof(float));
                 if (!cur->la_norm) fail("out of memory");
-                for (int i = 0; i < 128; i++) cur->la_norm[i] = 1.0f;
+                for (int i = 0; i < m->linear_key_head_dim; i++) cur->la_norm[i] = 1.0f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log.weight", layer);
-            cur->la_A_log = load_optional_tensor_f32(m, name, 128);
+            cur->la_A_log = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads);
             if (!cur->la_A_log) {
-                cur->la_A_log = (float *)calloc(128, sizeof(float));
+                cur->la_A_log = (float *)calloc((size_t)m->linear_num_value_heads, sizeof(float));
                 if (!cur->la_A_log) fail("out of memory");
-                for (int i = 0; i < 128; i++) cur->la_A_log[i] = 0.1f;
+                for (int i = 0; i < m->linear_num_value_heads; i++) cur->la_A_log[i] = 0.1f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias.weight", layer);
-            cur->la_dt_bias = load_optional_tensor_f32(m, name, 128);
+            cur->la_dt_bias = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads);
             if (!cur->la_dt_bias) {
-                cur->la_dt_bias = (float *)calloc(128, sizeof(float));
+                cur->la_dt_bias = (float *)calloc((size_t)m->linear_num_value_heads, sizeof(float));
                 if (!cur->la_dt_bias) fail("out of memory");
-                for (int i = 0; i < 128; i++) cur->la_dt_bias[i] = 0.01f;
+                for (int i = 0; i < m->linear_num_value_heads; i++) cur->la_dt_bias[i] = 0.01f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", layer);
-            cur->la_conv1d = load_optional_tensor_f32(m, name, (size_t)12288 * 1 * 4);
+            cur->la_conv1d = load_optional_tensor_f32(m, name, (size_t)3 * (size_t)m->hidden_size * 1 * 4);
             if (!cur->la_conv1d) {
-                cur->la_conv1d = (float *)calloc((size_t)12288 * 1 * 4, sizeof(float));
+                cur->la_conv1d = (float *)calloc((size_t)3 * (size_t)m->hidden_size * 1 * 4, sizeof(float));
                 if (!cur->la_conv1d) fail("out of memory");
             }
         }
