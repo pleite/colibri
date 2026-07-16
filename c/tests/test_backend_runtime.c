@@ -10,6 +10,7 @@ static int close_enough(float a, float b) {
 
 int main(void) {
     if (setenv("COLI_RUNTIME_ENGINES", "cpu", 1) != 0) {
+        /* 77 is used here as a lightweight skip signal for the local harness. */
         return 77;
     }
     if (setenv("COLI_RUNTIME_DISABLE_ENGINES", "npu,vulkan,rocm,cuda", 1) != 0) {
@@ -55,6 +56,38 @@ int main(void) {
     }
 
     coli_runtime_tensor_free(tensor);
+    coli_runtime_shutdown();
+
+    if (setenv("COLI_RUNTIME_ENGINES", "npu", 1) != 0) {
+        return 77;
+    }
+    if (setenv("COLI_RUNTIME_DISABLE_ENGINES", "cpu,vulkan,rocm,cuda", 1) != 0) {
+        return 77;
+    }
+    if (!coli_runtime_init(devices, 1)) {
+        return 77;
+    }
+
+    float fallback_x[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float fallback_weights[] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+    };
+    float fallback_scales[] = {1.0f, 1.25f};
+    float fallback_out[2] = {0.0f, 0.0f};
+    ColiCudaTensor *fallback_tensor = NULL;
+    if (!coli_runtime_tensor_upload(&fallback_tensor, fallback_weights, fallback_scales, 0, 4, 2, 0)) {
+        return 1;
+    }
+    if (!coli_runtime_matmul(&fallback_tensor, fallback_out, fallback_x, fallback_weights, fallback_scales, 0, 1, 4, 2, 0)) {
+        return 1;
+    }
+    if (!close_enough(fallback_out[0], 30.0f) || !close_enough(fallback_out[1], 70.0f)) {
+        fprintf(stderr, "unexpected fallback output: %.5f %.5f\n", fallback_out[0], fallback_out[1]);
+        return 1;
+    }
+
+    coli_runtime_tensor_free(fallback_tensor);
     coli_runtime_shutdown();
     return 0;
 }

@@ -45,10 +45,16 @@ struct ColiCudaTensor {
     size_t scale_bytes;
 };
 
+/*
+ * Return host memory availability in bytes for the backend capability report.
+ * Returns 1 on success and 0 on failure. When provided, free_bytes and
+ * total_bytes hold the available and total host memory, respectively.
+ */
 static int host_memory_info(size_t *free_bytes, size_t *total_bytes) {
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     if (pages <= 0 || page_size <= 0) return 0;
+    if ((size_t)pages > SIZE_MAX / (size_t)page_size) return 0;
     const size_t total = (size_t)pages * (size_t)page_size;
     if (total_bytes) *total_bytes = total;
 #ifdef _SC_AVPHYS_PAGES
@@ -57,6 +63,7 @@ static int host_memory_info(size_t *free_bytes, size_t *total_bytes) {
 #else
     long avail_pages = pages;
 #endif
+    if ((size_t)avail_pages > SIZE_MAX / (size_t)page_size) return 0;
     if (free_bytes) *free_bytes = (size_t)avail_pages * (size_t)page_size;
     return 1;
 }
