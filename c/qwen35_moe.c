@@ -215,6 +215,8 @@ static bool model_debug_enabled(void) {
     return enabled;
 }
 
+static const float SCALE_LAYOUT_EPSILON = 1e-6f;
+
 static void model_debug(const char *fmt, ...) {
     if (!model_debug_enabled()) return;
     va_list ap;
@@ -381,7 +383,8 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
         }
         /* Ornith int8 layout: payload/scale rows are doubled, while the logical tensor
          * has half as many rows (packed bytes are exactly 2x logical elements). */
-        if ((packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0) {
+        bool has_expanded_int8_payload = (packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0;
+        if (has_expanded_int8_payload) {
             size_t logical_out_dim = out_dim / 2;
             if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
                 size_t logical_in_dim = nelems / logical_out_dim;
@@ -396,7 +399,7 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     } else {
                         for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
                     }
-                    bool interleaved_rows = false; /* default: consecutive rows from the first half */
+                    bool interleaved_rows;
                     if (scale) {
                         size_t split_matches = 0;
                         size_t interleaved_matches = 0;
@@ -410,10 +413,12 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                                 free(scale_vals);
                                 fail("tensor %s has invalid expanded scale layout (row=%zu out=%zu)", name, row, out_dim);
                             }
-                            if (fabsf(scale_vals[split_left] - scale_vals[split_right]) < 1e-6f) split_matches++;
-                            if (fabsf(scale_vals[interleaved_left] - scale_vals[interleaved_right]) < 1e-6f) interleaved_matches++;
+                            if (fabsf(scale_vals[split_left] - scale_vals[split_right]) < SCALE_LAYOUT_EPSILON) split_matches++;
+                            if (fabsf(scale_vals[interleaved_left] - scale_vals[interleaved_right]) < SCALE_LAYOUT_EPSILON) interleaved_matches++;
                         }
                         interleaved_rows = interleaved_matches > split_matches;
+                    } else {
+                        interleaved_rows = false; /* default: consecutive rows from the first half */
                     }
                     for (size_t row = 0; row < logical_out_dim; row++) {
                         size_t src_row = interleaved_rows ? (row * 2) : row;
@@ -436,7 +441,10 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     }
                     free(raw);
                     free(scale_vals);
-                    model_debug("load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout", name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "consecutive");
+                    model_debug(
+                        "load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout",
+                        name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "consecutive"
+                    );
                     return buf;
                 }
             }
