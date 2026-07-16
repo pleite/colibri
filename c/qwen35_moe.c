@@ -409,6 +409,11 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     for (size_t row = 0; row < logical_out_dim; row++) {
                         size_t src_row = interleaved_rows ? (row * 2) : row;
                         size_t scale_row = interleaved_rows ? (row * 2) : row;
+                        if (src_row >= out_dim || scale_row >= out_dim) {
+                            free(raw);
+                            free(scale_vals);
+                            fail("tensor %s has invalid expanded row mapping (src=%zu scale=%zu out=%zu)", name, src_row, scale_row, out_dim);
+                        }
                         for (size_t col = 0; col < logical_in_dim; col++) {
                             int8_t value = (int8_t)raw[src_row * logical_in_dim + col];
                             buf[row * logical_in_dim + col] = (float)value * scale_vals[scale_row];
@@ -416,7 +421,7 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     }
                     free(raw);
                     free(scale_vals);
-                    model_debug("load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout", name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "first-half");
+                    model_debug("load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout", name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "consecutive");
                     return buf;
                 }
             }
