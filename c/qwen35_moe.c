@@ -215,6 +215,8 @@ static bool model_debug_enabled(void) {
     return enabled;
 }
 
+/* Scale tensors are float32 and are expected to match exactly for duplicated rows;
+ * this small epsilon only absorbs float parsing noise. */
 static const float SCALE_LAYOUT_EPSILON = 1e-6f;
 
 static void model_debug(const char *fmt, ...) {
@@ -383,8 +385,8 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
         }
         /* Ornith int8 layout: payload/scale rows are doubled, while the logical tensor
          * has half as many rows (packed bytes are exactly 2x logical elements). */
-        bool has_expanded_int8_payload = (packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0;
-        if (has_expanded_int8_payload) {
+        bool has_ornith_doubled_int8_payload = (packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0;
+        if (has_ornith_doubled_int8_payload) {
             size_t logical_out_dim = out_dim / 2;
             if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
                 size_t logical_in_dim = nelems / logical_out_dim;
@@ -416,9 +418,9 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                             if (fabsf(scale_vals[split_left] - scale_vals[split_right]) < SCALE_LAYOUT_EPSILON) split_matches++;
                             if (fabsf(scale_vals[interleaved_left] - scale_vals[interleaved_right]) < SCALE_LAYOUT_EPSILON) interleaved_matches++;
                         }
-                        interleaved_rows = interleaved_matches > split_matches;
+                        interleaved_rows = interleaved_matches > split_matches; /* ties intentionally fall back to consecutive layout */
                     } else {
-                        interleaved_rows = false; /* default: consecutive rows from the first half */
+                        interleaved_rows = false; /* without scales, prefer consecutive first-half rows (most conservative) */
                     }
                     for (size_t row = 0; row < logical_out_dim; row++) {
                         size_t src_row = interleaved_rows ? (row * 2) : row;
