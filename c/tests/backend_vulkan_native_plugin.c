@@ -32,6 +32,12 @@ typedef struct {
     int inner;
 } ColiPushConstants;
 
+static void release_weights(float *weights_f32, int fmt) {
+    if (fmt != 0) {
+        free(weights_f32);
+    }
+}
+
 static void cpu_matmul(float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O) {
     const float *weights_f32 = (const float *)weights;
     const int8_t *weights_i8 = (const int8_t *)weights;
@@ -338,16 +344,16 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
     }
 
     float *weights_t = (float *)calloc((size_t)I * (size_t)O, sizeof(float));
-    if (!weights_t) { free(weights_f32); return 0; }
+    if (!weights_t) { release_weights(weights_f32, fmt); return 0; }
     for (int o = 0; o < O; ++o) {
         for (int i = 0; i < I; ++i) {
             weights_t[(size_t)i * (size_t)O + o] = weights_f32[(size_t)o * (size_t)I + i];
         }
     }
 
-    if (!create_buffer(ctx, a_bytes, &ctx->buffers[0], &ctx->memories[0])) { free(weights_t); free(weights_f32); return 0; }
-    if (!create_buffer(ctx, b_bytes, &ctx->buffers[1], &ctx->memories[1])) { free(weights_t); free(weights_f32); return 0; }
-    if (!create_buffer(ctx, c_bytes, &ctx->buffers[2], &ctx->memories[2])) { free(weights_t); free(weights_f32); return 0; }
+    if (!create_buffer(ctx, a_bytes, &ctx->buffers[0], &ctx->memories[0])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
+    if (!create_buffer(ctx, b_bytes, &ctx->buffers[1], &ctx->memories[1])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
+    if (!create_buffer(ctx, c_bytes, &ctx->buffers[2], &ctx->memories[2])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
 
     void *mapped_a = NULL;
     void *mapped_b = NULL;
@@ -358,7 +364,7 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
         vkUnmapMemory(ctx->device, ctx->memories[0]);
         vkUnmapMemory(ctx->device, ctx->memories[1]);
         vkUnmapMemory(ctx->device, ctx->memories[2]);
-        free(weights_t); free(weights_f32); return 0;
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     memcpy(mapped_a, x, a_bytes);
     memcpy(mapped_b, weights_t, b_bytes);
@@ -386,7 +392,7 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(ctx->command_buffer, &begin) != VK_SUCCESS) {
-        free(weights_t); free(weights_f32); return 0;
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
     vkCmdBindDescriptorSets(ctx->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline_layout, 0, 1, &ctx->descriptor_set, 0, NULL);
@@ -396,7 +402,7 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
     const uint32_t group_y = (S + 15) / 16;
     vkCmdDispatch(ctx->command_buffer, group_x, group_y, 1);
     if (vkEndCommandBuffer(ctx->command_buffer) != VK_SUCCESS) {
-        free(weights_t); free(weights_f32); return 0;
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
 
     VkSubmitInfo submit = {0};
@@ -407,15 +413,15 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
     VkFenceCreateInfo fence_info = {0};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (vkCreateFence(ctx->device, &fence_info, NULL, &fence) != VK_SUCCESS) {
-        free(weights_t); free(weights_f32); return 0;
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     int ok = (vkQueueSubmit(ctx->queue, 1, &submit, fence) == VK_SUCCESS && vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
     vkDestroyFence(ctx->device, fence, NULL);
-    if (!ok) { free(weights_t); free(weights_f32); return 0; }
+    if (!ok) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
 
     void *mapped_out = NULL;
     if (vkMapMemory(ctx->device, ctx->memories[2], 0, c_bytes, 0, &mapped_out) != VK_SUCCESS) {
-        free(weights_t); free(weights_f32); return 0;
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     memcpy(y, mapped_out, c_bytes);
     vkUnmapMemory(ctx->device, ctx->memories[2]);
@@ -435,7 +441,7 @@ static int run_vulkan_matmul(ColiVulkanNativeContext *ctx, const void *weights, 
         ctx->memories[i] = VK_NULL_HANDLE;
     }
     free(weights_t);
-    free(weights_f32);
+    release_weights(weights_f32, fmt);
     return 1;
 }
 

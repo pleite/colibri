@@ -273,6 +273,7 @@ void coli_cuda_shutdown(void) {
         dlclose(g_native_handle);
     }
     g_native_handle = NULL;
+    free(g_native_plugin_path);
     g_native_plugin_path = NULL;
     g_native_init = NULL;
     g_native_shutdown = NULL;
