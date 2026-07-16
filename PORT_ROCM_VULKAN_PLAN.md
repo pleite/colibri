@@ -8,6 +8,10 @@ All accelerator code follows the same pattern as the CUDA backend: a thin
 abstraction layer in `c/backend_*.{hip,c}` exports the same `coli_cuda_*` API,
 so `glm.c` and the rest of the engine stay unchanged across backends.
 
+For a consolidated list of the missing work needed to bring the accelerator
+stack up to the level of the CPU/GLM baseline, see
+`docs/plans/2026-07-16_backend-parity-gap-list.md`.
+
 ## Current status (2026-07-15)
 
 The repository now contains ROCm/HIP backend sources (`c/backend_rocm.hip`), a
