@@ -7,6 +7,30 @@ This document is the single authoritative reference for the colibrì backend and
 
 ---
 
+## Implementation Status (updated by the Qwen3.5 backend-parity PR)
+
+The following gap items are now **implemented** and covered by `cd c && make check`:
+
+| # | Gap item | Status | Where |
+|---|----------|--------|-------|
+| 1 | Qwen3.5 quantized tensor storage (INT8/INT4/F32 dequant-on-use) | ✅ Done | `c/qwen35_moe.c` (`QTensor`, `qwen_cpu_qmatmul`, `load_qtensor`, `matmul_qt`) |
+| 4 | Wire Qwen3.5 to the backend runtime | ✅ Done | `matmul_qt` routes to `coli_runtime_matmul_ex` when an accelerator lane is active |
+| 5a | Backend correctness tests | ✅ Done | `c/tests/test_backend_parallel.c`, INT8↔F32 token-exact test in `c/tests/test_qwen35_moe.c` |
+| 6 | Planner / doctor / server reporting | ✅ Done | `resource_plan.py` (`backend="parallel"`), `doctor.py` (`accelerator.parallel`), `openai_server.py` (Jinja templates) |
+| — | Parallel + role-aware multi-backend scheduler | ✅ Done (new) | `c/backend_runtime.c/.h` (`coli_op_role`, pthreads lanes, role affinity) |
+
+Partially addressed / still hardware-gated (cannot be compiled or validated in a CPU-only CI sandbox — no GPU/NPU toolchains):
+
+| # | Gap item | Status |
+|---|----------|--------|
+| 2 | Vulkan SPIR-V `quant_matmul` shader | ⏳ Still a CPU fallback; runtime lane + role wiring is in place so a real kernel can drop in |
+| 3 | NPU (XDNA) XRT kernels | ⏳ Still a CPU shim; lane + role wiring in place |
+
+See **[docs/backend-parity-implementation.md](../backend-parity-implementation.md)** for the full design of the quantized storage, the parallel role-aware scheduler, and the server/planner/doctor changes delivered here.
+
+---
+
+
 ## Format Decision
 
 **Only three tensor formats are needed:**

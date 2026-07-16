@@ -144,6 +144,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.selection", "pass",
                              f"selected backend: {selected_backend}",
                              detected=accelerator.get("detected", {})))
+        if accelerator.get("parallel"):
+            engines = accelerator.get("parallel_backends", [])
+            checks.append(_check("accelerator.parallel", "pass",
+                                 f"parallel scheduler active across: {', '.join(engines) or 'cpu'} (+cpu fallback)",
+                                 engines=engines,
+                                 role_affinity=accelerator.get("role_affinity", {})))
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
         disk = plan["tiers"]["disk"]

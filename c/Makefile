@@ -67,7 +67,7 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 BACKEND_OBJ :=
 BACKEND_OBJ += backend_runtime.o
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE) tests/test_backend_parallel$(EXE)
 NPU_BACKEND_CFLAGS =
 NPU_BACKEND_TEST_OBJ = backend_npu.o
 NPU_BACKEND_RUNTIME_TEST_OBJ =
@@ -252,6 +252,16 @@ tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
 tests/test_backend_runtime$(EXE): tests/test_backend_runtime.c backend_runtime.o
 	$(CC) $(CFLAGS) $< backend_runtime.o $(NPU_BACKEND_RUNTIME_TEST_OBJ) $(VULKAN_BACKEND_RUNTIME_TEST_OBJ) -o $@ $(LDFLAGS)
 
+# Multi-lane parallel scheduler test: always builds the runtime + NPU shim with
+# -DCOLI_ENABLE_NPU so two lanes (cpu + npu) exercise the parallel/role paths,
+# regardless of the top-level NPU= setting. Dedicated objects keep the default
+# build objects untouched.
+tests/backend_runtime_npu.o: backend_runtime.c backend_runtime.h parallelism.h
+	$(CC) $(CFLAGS) -DCOLI_ENABLE_NPU -c backend_runtime.c -o $@
+
+tests/test_backend_parallel$(EXE): tests/test_backend_parallel.c tests/backend_runtime_npu.o backend_npu.o
+	$(CC) $(CFLAGS) -DCOLI_ENABLE_NPU $< tests/backend_runtime_npu.o backend_npu.o -o $@ $(LDFLAGS)
+
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -270,7 +280,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_runtime.o backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_runtime.o backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) tests/backend_runtime_npu.o $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all glm qwen35_moe_build cuda-test rocm-test npu-test vulkan-test portable test-c test-python test check clean

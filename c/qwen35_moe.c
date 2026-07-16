@@ -69,6 +69,7 @@ int coli_npu_compat_tensor_device(const ColiCudaTensor *tensor);
 
 #include "json.h"
 #include "st.h"
+#include "backend_runtime.h"
 
 #if !defined(COLI_VULKAN) && !defined(COLI_ROCM) && !defined(COLI_NPU) && !defined(COLI_CUDA)
 typedef struct ColiCudaTensor ColiCudaTensor;
@@ -105,27 +106,42 @@ typedef enum {
     QWEN_EXPERT_STATE_PINNED = 2,
 } qwen_expert_state_t;
 
+/* Quantized tensor container (dequant-on-use). Mirrors GLM's QT layout so
+ * Qwen3.5 stores weights in the same INT8/INT4/F32 formats instead of expanding
+ * everything to F32 in memory. fmt: 0=F32, 1=INT8, 2=INT4. For fmt!=0 `data`
+ * holds the packed payload ([O,I] int8 or [O,ceil(I/2)] int4) and `scales` the
+ * per-output-row F32 scale. The matmul dequantizes on the fly, so a weight that
+ * used to occupy 4 bytes/param now costs 1 byte (int8) or 0.5 byte (int4). */
+typedef struct {
+    int fmt;
+    int O;
+    int I;
+    void *data;
+    float *scales;
+    ColiCudaTensor *handle; /* backend-runtime cache handle (resident tensors) */
+} QTensor;
+
 typedef struct {
     float *in_ln;
     float *post_ln;
     bool is_full_attn;
     float *q_norm;
     float *k_norm;
-    float *q_proj;
-    float *k_proj;
-    float *v_proj;
-    float *o_proj;
-    float *router;
-    float *sh_gate;
-    float *sh_up;
-    float *sh_down;
+    QTensor q_proj;
+    QTensor k_proj;
+    QTensor v_proj;
+    QTensor o_proj;
+    QTensor router;
+    QTensor sh_gate;
+    QTensor sh_up;
+    QTensor sh_down;
     float *shared_expert_gate;
-    float *mlp_gate_proj;
-    float *mlp_up_proj;
-    float *mlp_down_proj;
-    float **expert_gate_proj;
-    float **expert_up_proj;
-    float **expert_down_proj;
+    QTensor mlp_gate_proj;
+    QTensor mlp_up_proj;
+    QTensor mlp_down_proj;
+    QTensor *expert_gate_proj;
+    QTensor *expert_up_proj;
+    QTensor *expert_down_proj;
     int *expert_state;
     float *la_in_proj_a;
     float *la_in_proj_b;
@@ -407,6 +423,101 @@ static int tensor_exists(qwen35_model *m, const char *name) {
     return find_tensor(m, name) != NULL;
 }
 
+/* ---- Quantized tensor helpers (dequant-on-use) --------------------------- */
+
+static inline float *qt_f32(QTensor *q) { return (float *)q->data; }
+
+/* Allocate an F32 (fmt 0) QTensor of shape [O, I]. Used for missing/synthetic
+ * tensors and for weights that are not stored in a standard quantized layout. */
+static QTensor qt_alloc_f32(int O, int I, const char *what) {
+    QTensor q;
+    q.fmt = 0;
+    q.O = O;
+    q.I = I;
+    q.scales = NULL;
+    q.handle = NULL;
+    q.data = qwen_calloc((size_t)O * (size_t)I, sizeof(float), what);
+    return q;
+}
+
+static void qt_free(QTensor *q) {
+    if (!q) return;
+    if (q->handle) {
+        coli_runtime_tensor_free(q->handle);
+        q->handle = NULL;
+    }
+    free(q->data);
+    q->data = NULL;
+    free(q->scales);
+    q->scales = NULL;
+    q->fmt = q->O = q->I = 0;
+}
+
+/* CPU dequant-on-use matmul: y[o] = scale[o] * sum_i x[i] * dequant(w[o,i]).
+ * The integer accumulation with a single trailing scale multiply matches the
+ * backend runtime's host_matmul exactly, and for fmt 0 it is bit-identical to
+ * matmul_vec (so F32 models remain token-exact). No F32 expansion or weight copy
+ * is performed, which is where the memory savings come from. */
+static void qwen_cpu_qmatmul(float *out, const float *x, const void *weights,
+                             const float *scales, int fmt, int I, int O) {
+    const float *wf = (const float *)weights;
+    const int8_t *wi8 = (const int8_t *)weights;
+    const uint8_t *wp = (const uint8_t *)weights;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int o = 0; o < O; o++) {
+        const float row_scale = (scales && fmt != 0) ? scales[o] : 1.0f;
+        float acc = 0.0f;
+        if (fmt == 0) {
+            const float *row = wf + (size_t)o * (size_t)I;
+            for (int i = 0; i < I; i++) acc += x[i] * row[i];
+        } else if (fmt == 1) {
+            const int8_t *row = wi8 + (size_t)o * (size_t)I;
+            for (int i = 0; i < I; i++) acc += x[i] * (float)row[i];
+        } else { /* fmt == 2: INT4 nibble-packed */
+            const size_t stride = (size_t)((I + 1) / 2);
+            const uint8_t *row = wp + (size_t)o * stride;
+            for (int i = 0; i < I; i++) {
+                const int nib = (i & 1) ? (row[i >> 1] >> 4) & 0x0f : row[i >> 1] & 0x0f;
+                acc += x[i] * (float)(nib - 8);
+            }
+        }
+        out[o] = acc * row_scale;
+    }
+}
+
+/* Returns non-zero when a real accelerator lane (NPU/Vulkan/GPU) is active, so
+ * the role-aware runtime scheduler should be used. On a CPU-only build we stay
+ * on the in-place dequant path to avoid the runtime's weight-copy overhead. */
+static int qwen_accelerator_active(void) {
+#if COLI_HAS_BACKEND
+    int mask = coli_runtime_backend_mask();
+    return (mask & ~COLI_RUNTIME_BACKEND_CPU_BIT) != 0;
+#else
+    return 0;
+#endif
+}
+
+/* Role-aware quantized matmul. When an accelerator is present the work is routed
+ * through the parallel role-aware runtime (which offloads and can split the
+ * output across CPU/NPU/GPU lanes); otherwise it runs the in-place CPU dequant
+ * kernel. `x` is a single token (S=1). */
+static void matmul_qt(QTensor *w, const float *x, float *out, coli_op_role role) {
+    if (w->I <= 0 || w->O <= 0) return;
+#if COLI_HAS_BACKEND
+    if (qwen_accelerator_active()) {
+        if (coli_runtime_matmul_ex(&w->handle, out, x, w->data, w->scales,
+                                   w->fmt, 1, w->I, w->O, 0, role)) {
+            return;
+        }
+    }
+#else
+    (void)role;
+#endif
+    qwen_cpu_qmatmul(out, x, w->data, w->scales, w->fmt, w->I, w->O);
+}
+
 static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) {
     model_debug("load_tensor_f32: tensor=%s expected_nelems=%zu", name, nelems);
     float *buf = (float *)qwen_calloc(nelems, sizeof(float), "tensor buffer");
@@ -555,7 +666,86 @@ static float *load_optional_tensor_f32(qwen35_model *m, const char *name, size_t
     return load_tensor_f32(m, name, nelems);
 }
 
-static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out, int kv_out, int hidden_size, float **q_proj, float **k_proj, float **v_proj) {
+/* Load a weight into a QTensor, preserving the native quantized payload
+ * (INT8 -> fmt 1, INT4 -> fmt 2) when it is stored in a standard row-major
+ * packed layout with matching per-output-row scales. This keeps the compact
+ * representation resident (1 byte/elem for INT8, 0.5 byte/elem for INT4) instead
+ * of expanding to F32, which is the source of the memory savings. Irregular
+ * quantized layouts (e.g. the Ornith doubled/expanded int8 payloads), missing
+ * scales, and genuine F32 tensors fall back to a dequantized fmt 0 buffer using
+ * the existing, well-tested load_tensor_f32 decoder. */
+static QTensor load_qtensor(qwen35_model *m, const char *name, int O, int I, bool *found) {
+    QTensor q;
+    q.fmt = 0;
+    q.O = O;
+    q.I = I;
+    q.data = NULL;
+    q.scales = NULL;
+    q.handle = NULL;
+    const size_t nelems = (size_t)O * (size_t)I;
+    st_tensor *t = find_tensor(m, name);
+    if (!t) {
+        if (found) *found = false;
+        q.data = qwen_calloc(nelems, sizeof(float), "qtensor zero");
+        return q;
+    }
+    if (found) *found = true;
+    if (t->dtype == 3) {
+        st_tensor *scale = find_scale_tensor(m, name);
+        const size_t out_dim = scale ? (size_t)scale->numel : 0;
+        const size_t packed_bytes = (size_t)t->nbytes;
+        const size_t bytes_per_row_int4 = ((size_t)I + 1) / 2;
+        if (scale && out_dim == (size_t)O) {
+            if (packed_bytes == nelems) {
+                /* standard INT8: one signed byte per element */
+                uint8_t *raw = (uint8_t *)qwen_malloc(packed_bytes, "qtensor int8 payload");
+                st_read_raw(&m->shards, t->name, raw, 0);
+                float *sc = (float *)qwen_calloc(out_dim, sizeof(float), "qtensor scales");
+                st_read_f32(&m->shards, scale->name, sc, 0);
+                q.fmt = 1;
+                q.data = raw;
+                q.scales = sc;
+                return q;
+            }
+            if (packed_bytes == out_dim * bytes_per_row_int4) {
+                /* standard INT4: two nibbles per byte, biased by 8 */
+                uint8_t *raw = (uint8_t *)qwen_malloc(packed_bytes, "qtensor int4 payload");
+                st_read_raw(&m->shards, t->name, raw, 0);
+                float *sc = (float *)qwen_calloc(out_dim, sizeof(float), "qtensor scales");
+                st_read_f32(&m->shards, scale->name, sc, 0);
+                q.fmt = 2;
+                q.data = raw;
+                q.scales = sc;
+                return q;
+            }
+        }
+        /* irregular / unsupported quantized layout: dequantize to F32 */
+        q.fmt = 0;
+        q.data = load_tensor_f32(m, name, nelems);
+        return q;
+    }
+    /* genuine F32 tensor */
+    q.fmt = 0;
+    q.data = load_tensor_f32(m, name, nelems);
+    return q;
+}
+
+/* Load a QTensor into `dst`, overriding it only when the tensor is present in
+ * the checkpoint. When absent, the identity/default QTensor already installed by
+ * init_layer_defaults is kept, preserving the historical missing-weight
+ * behavior. */
+static void load_qtensor_into(qwen35_model *m, const char *name, int O, int I, QTensor *dst) {
+    bool found = false;
+    QTensor q = load_qtensor(m, name, O, I, &found);
+    if (found) {
+        qt_free(dst);
+        *dst = q;
+    } else {
+        qt_free(&q);
+    }
+}
+
+static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out, int kv_out, int hidden_size, QTensor *q_proj, QTensor *k_proj, QTensor *v_proj) {
     if (!tensor_exists(m, name)) return false;
     const size_t q_elems = (size_t)q_out * (size_t)hidden_size;
     const size_t kv_elems = (size_t)kv_out * (size_t)hidden_size;
@@ -568,9 +758,12 @@ static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out,
     memcpy(k_buf, packed + q_elems, kv_elems * sizeof(float));
     memcpy(v_buf, packed + q_elems + kv_elems, kv_elems * sizeof(float));
     free(packed);
-    *q_proj = q_buf;
-    *k_proj = k_buf;
-    *v_proj = v_buf;
+    qt_free(q_proj);
+    qt_free(k_proj);
+    qt_free(v_proj);
+    q_proj->fmt = 0; q_proj->O = q_out; q_proj->I = hidden_size; q_proj->data = q_buf; q_proj->scales = NULL; q_proj->handle = NULL;
+    k_proj->fmt = 0; k_proj->O = kv_out; k_proj->I = hidden_size; k_proj->data = k_buf; k_proj->scales = NULL; k_proj->handle = NULL;
+    v_proj->fmt = 0; v_proj->O = kv_out; v_proj->I = hidden_size; v_proj->data = v_buf; v_proj->scales = NULL; v_proj->handle = NULL;
     return true;
 }
 
@@ -585,62 +778,62 @@ static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermed
     layer->la_state = (float *)qwen_calloc((size_t)hidden_size, sizeof(float), "linear attention state");
     const int q_out = num_attention_heads * head_dim;
     const int kv_out = num_kv_heads * head_dim;
-    layer->q_proj = (float *)qwen_calloc((size_t)q_out * (size_t)hidden_size, sizeof(float), "q_proj defaults");
-    layer->k_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float), "k_proj defaults");
-    layer->v_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float), "v_proj defaults");
-    layer->o_proj = (float *)qwen_calloc((size_t)hidden_size * (size_t)q_out, sizeof(float), "o_proj defaults");
-    layer->mlp_gate_proj = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "mlp gate defaults");
-    layer->mlp_up_proj = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "mlp up defaults");
-    layer->mlp_down_proj = (float *)qwen_calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float), "mlp down defaults");
-    layer->router = (float *)qwen_calloc((size_t)num_experts * (size_t)hidden_size, sizeof(float), "router defaults");
-    layer->sh_gate = (float *)qwen_calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float), "shared gate defaults");
-    layer->sh_up = (float *)qwen_calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float), "shared up defaults");
-    layer->sh_down = (float *)qwen_calloc((size_t)hidden_size * (size_t)shared_expert_intermediate_size, sizeof(float), "shared down defaults");
+    layer->q_proj = qt_alloc_f32(q_out, hidden_size, "q_proj defaults");
+    layer->k_proj = qt_alloc_f32(kv_out, hidden_size, "k_proj defaults");
+    layer->v_proj = qt_alloc_f32(kv_out, hidden_size, "v_proj defaults");
+    layer->o_proj = qt_alloc_f32(hidden_size, q_out, "o_proj defaults");
+    layer->mlp_gate_proj = qt_alloc_f32(moe_intermediate_size, hidden_size, "mlp gate defaults");
+    layer->mlp_up_proj = qt_alloc_f32(moe_intermediate_size, hidden_size, "mlp up defaults");
+    layer->mlp_down_proj = qt_alloc_f32(hidden_size, moe_intermediate_size, "mlp down defaults");
+    layer->router = qt_alloc_f32(num_experts, hidden_size, "router defaults");
+    layer->sh_gate = qt_alloc_f32(shared_expert_intermediate_size, hidden_size, "shared gate defaults");
+    layer->sh_up = qt_alloc_f32(shared_expert_intermediate_size, hidden_size, "shared up defaults");
+    layer->sh_down = qt_alloc_f32(hidden_size, shared_expert_intermediate_size, "shared down defaults");
     for (int i = 0; i < q_out; i++) {
         for (int j = 0; j < hidden_size; j++) {
-            if (i == j) layer->q_proj[i * hidden_size + j] = 1.0f;
+            if (i == j) qt_f32(&layer->q_proj)[i * hidden_size + j] = 1.0f;
         }
     }
     for (int i = 0; i < kv_out; i++) {
         for (int j = 0; j < hidden_size; j++) {
-            if (i == j) layer->k_proj[i * hidden_size + j] = 0.25f;
-            if (i == j) layer->v_proj[i * hidden_size + j] = 0.125f;
+            if (i == j) qt_f32(&layer->k_proj)[i * hidden_size + j] = 0.25f;
+            if (i == j) qt_f32(&layer->v_proj)[i * hidden_size + j] = 0.125f;
         }
     }
     for (int i = 0; i < hidden_size; i++) {
         for (int j = 0; j < q_out; j++) {
-            if (i == j) layer->o_proj[i * q_out + j] = 0.5f;
+            if (i == j) qt_f32(&layer->o_proj)[i * q_out + j] = 0.5f;
         }
     }
     for (int i = 0; i < moe_intermediate_size; i++) {
         for (int j = 0; j < hidden_size; j++) {
-            if (i == j) layer->mlp_gate_proj[i * hidden_size + j] = 0.5f;
-            if (i == j) layer->mlp_up_proj[i * hidden_size + j] = 0.25f;
+            if (i == j) qt_f32(&layer->mlp_gate_proj)[i * hidden_size + j] = 0.5f;
+            if (i == j) qt_f32(&layer->mlp_up_proj)[i * hidden_size + j] = 0.25f;
         }
     }
     for (int i = 0; i < hidden_size; i++) {
         for (int j = 0; j < moe_intermediate_size; j++) {
-            if (i == j) layer->mlp_down_proj[i * moe_intermediate_size + j] = 0.75f;
+            if (i == j) qt_f32(&layer->mlp_down_proj)[i * moe_intermediate_size + j] = 0.75f;
         }
     }
     for (int i = 0; i < shared_expert_intermediate_size; i++) {
         for (int j = 0; j < hidden_size; j++) {
-            if (i == j) layer->sh_gate[i * hidden_size + j] = 0.25f;
-            if (i == j) layer->sh_up[i * hidden_size + j] = 0.1f;
+            if (i == j) qt_f32(&layer->sh_gate)[i * hidden_size + j] = 0.25f;
+            if (i == j) qt_f32(&layer->sh_up)[i * hidden_size + j] = 0.1f;
         }
     }
     for (int i = 0; i < hidden_size; i++) {
         for (int j = 0; j < shared_expert_intermediate_size; j++) {
-            if (i == j) layer->sh_down[i * shared_expert_intermediate_size + j] = 0.2f;
+            if (i == j) qt_f32(&layer->sh_down)[i * shared_expert_intermediate_size + j] = 0.2f;
         }
     }
-    layer->expert_gate_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
-    layer->expert_up_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
-    layer->expert_down_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
+    layer->expert_gate_proj = (QTensor *)qwen_calloc((size_t)num_experts, sizeof(QTensor), "expert table");
+    layer->expert_up_proj = (QTensor *)qwen_calloc((size_t)num_experts, sizeof(QTensor), "expert table");
+    layer->expert_down_proj = (QTensor *)qwen_calloc((size_t)num_experts, sizeof(QTensor), "expert table");
     for (int expert = 0; expert < num_experts; expert++) {
-        layer->expert_gate_proj[expert] = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "expert gate defaults");
-        layer->expert_up_proj[expert] = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "expert up defaults");
-        layer->expert_down_proj[expert] = (float *)qwen_calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float), "expert down defaults");
+        layer->expert_gate_proj[expert] = qt_alloc_f32(moe_intermediate_size, hidden_size, "expert gate defaults");
+        layer->expert_up_proj[expert] = qt_alloc_f32(moe_intermediate_size, hidden_size, "expert up defaults");
+        layer->expert_down_proj[expert] = qt_alloc_f32(hidden_size, moe_intermediate_size, "expert down defaults");
     }
 }
 
@@ -771,59 +964,41 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.qkv.weight", layer);
             if (!load_packed_qkv_tensor(m, name, q_out, kv_out, m->hidden_size, &cur->q_proj, &cur->k_proj, &cur->v_proj)) {
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
-                cur->q_proj = load_optional_tensor_f32(m, name, (size_t)q_out * (size_t)m->hidden_size);
-                if (!cur->q_proj) {
-                    cur->q_proj = (float *)qwen_calloc((size_t)q_out * (size_t)m->hidden_size, sizeof(float), "q_proj defaults");
-                    for (int i = 0; i < q_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->q_proj[i * m->hidden_size + j] = 1.0f;
-                }
+                load_qtensor_into(m, name, q_out, m->hidden_size, &cur->q_proj);
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
-                cur->k_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
-                if (!cur->k_proj) {
-                    cur->k_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float), "k_proj defaults");
-                    for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->k_proj[i * m->hidden_size + j] = 0.25f;
-                }
+                load_qtensor_into(m, name, kv_out, m->hidden_size, &cur->k_proj);
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
-                cur->v_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
-                if (!cur->v_proj) {
-                    cur->v_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float), "v_proj defaults");
-                    for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->v_proj[i * m->hidden_size + j] = 0.125f;
-                }
+                load_qtensor_into(m, name, kv_out, m->hidden_size, &cur->v_proj);
             }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
-            cur->o_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)q_out);
-            if (!cur->o_proj) {
-                cur->o_proj = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)q_out, sizeof(float), "o_proj defaults");
-                for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < q_out; j++) if (i == j) cur->o_proj[i * q_out + j] = 0.5f;
-            }
+            load_qtensor_into(m, name, m->hidden_size, q_out, &cur->o_proj);
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer);
-            cur->router = load_optional_tensor_f32(m, name, (size_t)m->num_experts * (size_t)m->hidden_size);
-            if (cur->router) m->has_router = true;
+            {
+                bool router_found = false;
+                QTensor router_q = load_qtensor(m, name, m->num_experts, m->hidden_size, &router_found);
+                if (router_found) {
+                    qt_free(&cur->router);
+                    cur->router = router_q;
+                    m->has_router = true;
+                } else {
+                    qt_free(&router_q);
+                }
+            }
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
-            cur->mlp_gate_proj = load_optional_tensor_f32(m, name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-            if (!cur->mlp_gate_proj) {
-                cur->mlp_gate_proj = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "mlp gate defaults");
-                for (int i = 0; i < m->moe_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->mlp_gate_proj[i * m->hidden_size + j] = 0.5f;
-            }
+            load_qtensor_into(m, name, m->moe_intermediate_size, m->hidden_size, &cur->mlp_gate_proj);
             snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
-            cur->mlp_up_proj = load_optional_tensor_f32(m, name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-            if (!cur->mlp_up_proj) {
-                cur->mlp_up_proj = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "mlp up defaults");
-                for (int i = 0; i < m->moe_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->mlp_up_proj[i * m->hidden_size + j] = 0.25f;
-            }
+            load_qtensor_into(m, name, m->moe_intermediate_size, m->hidden_size, &cur->mlp_up_proj);
             snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
-            cur->mlp_down_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
-            if (!cur->mlp_down_proj) {
-                cur->mlp_down_proj = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "mlp down defaults");
-                for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->moe_intermediate_size; j++) if (i == j) cur->mlp_down_proj[i * m->moe_intermediate_size + j] = 0.75f;
+            load_qtensor_into(m, name, m->hidden_size, m->moe_intermediate_size, &cur->mlp_down_proj);
+            /* Experts stream in lazily; free the defaults installed above and
+             * mark every expert slot unloaded until first use. */
+            for (int expert = 0; expert < m->num_experts; expert++) {
+                qt_free(&cur->expert_gate_proj[expert]);
+                qt_free(&cur->expert_up_proj[expert]);
+                qt_free(&cur->expert_down_proj[expert]);
             }
-            cur->expert_gate_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
-            cur->expert_up_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
-            cur->expert_down_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             cur->expert_state = (int *)qwen_calloc((size_t)m->num_experts, sizeof(int), "expert state table");
             for (int expert = 0; expert < m->num_experts; expert++) {
-                cur->expert_gate_proj[expert] = NULL;
-                cur->expert_up_proj[expert] = NULL;
-                cur->expert_down_proj[expert] = NULL;
                 cur->expert_state[expert] = QWEN_EXPERT_STATE_UNLOADED;
             }
         } else {
@@ -878,23 +1053,11 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         }
         /* shared expert is present on ALL layer types (full and linear attention). */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer);
-        cur->sh_gate = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
-        if (!cur->sh_gate) {
-            cur->sh_gate = (float *)qwen_calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-            for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_gate[i * m->hidden_size + j] = 0.25f;
-        }
+        load_qtensor_into(m, name, m->shared_expert_intermediate_size, m->hidden_size, &cur->sh_gate);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer);
-        cur->sh_up = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
-        if (!cur->sh_up) {
-            cur->sh_up = (float *)qwen_calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-            for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_up[i * m->hidden_size + j] = 0.1f;
-        }
+        load_qtensor_into(m, name, m->shared_expert_intermediate_size, m->hidden_size, &cur->sh_up);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer);
-        cur->sh_down = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size);
-        if (!cur->sh_down) {
-            cur->sh_down = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size, sizeof(float));
-            for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->shared_expert_intermediate_size; j++) if (i == j) cur->sh_down[i * m->shared_expert_intermediate_size + j] = 0.2f;
-        }
+        load_qtensor_into(m, name, m->hidden_size, m->shared_expert_intermediate_size, &cur->sh_down);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer);
         cur->shared_expert_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
         if (!cur->shared_expert_gate) {
@@ -909,18 +1072,18 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->post_ln);
     free(layer->q_norm);
     free(layer->k_norm);
-    free(layer->q_proj);
-    free(layer->k_proj);
-    free(layer->v_proj);
-    free(layer->o_proj);
-    free(layer->router);
-    free(layer->sh_gate);
-    free(layer->sh_up);
-    free(layer->sh_down);
+    qt_free(&layer->q_proj);
+    qt_free(&layer->k_proj);
+    qt_free(&layer->v_proj);
+    qt_free(&layer->o_proj);
+    qt_free(&layer->router);
+    qt_free(&layer->sh_gate);
+    qt_free(&layer->sh_up);
+    qt_free(&layer->sh_down);
     free(layer->shared_expert_gate);
-    free(layer->mlp_gate_proj);
-    free(layer->mlp_up_proj);
-    free(layer->mlp_down_proj);
+    qt_free(&layer->mlp_gate_proj);
+    qt_free(&layer->mlp_up_proj);
+    qt_free(&layer->mlp_down_proj);
     free(layer->la_in_proj_a);
     free(layer->la_in_proj_b);
     free(layer->la_in_proj_qkv);
@@ -935,19 +1098,19 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
     free(layer->kv_cache_v);
     if (layer->expert_gate_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            free(layer->expert_gate_proj[expert]);
+            qt_free(&layer->expert_gate_proj[expert]);
         }
         free(layer->expert_gate_proj);
     }
     if (layer->expert_up_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            free(layer->expert_up_proj[expert]);
+            qt_free(&layer->expert_up_proj[expert]);
         }
         free(layer->expert_up_proj);
     }
     if (layer->expert_down_proj) {
         for (int expert = 0; expert < m->num_experts; expert++) {
-            free(layer->expert_down_proj[expert]);
+            qt_free(&layer->expert_down_proj[expert]);
         }
         free(layer->expert_down_proj);
     }
@@ -1344,20 +1507,11 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     }
     char expert_name[1024];
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert_idx);
-    cur->expert_gate_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-    if (!cur->expert_gate_proj[expert_idx]) {
-        cur->expert_gate_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
-    }
+    cur->expert_gate_proj[expert_idx] = load_qtensor(m, expert_name, m->moe_intermediate_size, m->hidden_size, NULL);
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert_idx);
-    cur->expert_up_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-    if (!cur->expert_up_proj[expert_idx]) {
-        cur->expert_up_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
-    }
+    cur->expert_up_proj[expert_idx] = load_qtensor(m, expert_name, m->moe_intermediate_size, m->hidden_size, NULL);
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert_idx);
-    cur->expert_down_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
-    if (!cur->expert_down_proj[expert_idx]) {
-        cur->expert_down_proj[expert_idx] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
-    }
+    cur->expert_down_proj[expert_idx] = load_qtensor(m, expert_name, m->hidden_size, m->moe_intermediate_size, NULL);
     cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
 }
 
@@ -1437,9 +1591,9 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 float *attn = (float *)qwen_malloc((size_t)q_dim * sizeof(float));
                 float *post = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
                 if (!q_out || !k_out || !v_out || !attn || !post) fail("out of memory");
-                matmul_vec(hidden, cur->q_proj, m->hidden_size, q_dim, q_out);
-                matmul_vec(hidden, cur->k_proj, m->hidden_size, kv_dim, k_out);
-                matmul_vec(hidden, cur->v_proj, m->hidden_size, kv_dim, v_out);
+                matmul_qt(&cur->q_proj, hidden, q_out, COLI_OP_ROLE_ATTENTION);
+                matmul_qt(&cur->k_proj, hidden, k_out, COLI_OP_ROLE_ATTENTION);
+                matmul_qt(&cur->v_proj, hidden, v_out, COLI_OP_ROLE_ATTENTION);
                 for (int head = 0; head < m->num_attention_heads; head++) {
                     for (int dim = 0; dim < m->head_dim; dim++) {
                         int index = head * m->head_dim + dim;
@@ -1498,7 +1652,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     }
                     free(scores);
                 }
-                matmul_vec(attn, cur->o_proj, q_dim, m->hidden_size, post);
+                matmul_qt(&cur->o_proj, attn, post, COLI_OP_ROLE_ATTENTION);
                 layer_norm_inplace(hidden, cur->in_ln, m->hidden_size);
                 for (int i = 0; i < m->hidden_size; i++) hidden[i] += residual[i] + post[i];
                 free(q_out);
@@ -1537,19 +1691,19 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             float *ffn_out = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
             if (!ffn_in || !ffn_mid || !ffn_out) fail("out of memory");
             if (cur->is_full_attn) {
-                matmul_vec(hidden, cur->mlp_gate_proj, m->hidden_size, m->moe_intermediate_size, ffn_in);
+                matmul_qt(&cur->mlp_gate_proj, hidden, ffn_in, COLI_OP_ROLE_DENSE);
                 for (int i = 0; i < m->moe_intermediate_size; i++) ffn_in[i] = silu(ffn_in[i]);
-                matmul_vec(hidden, cur->mlp_up_proj, m->hidden_size, m->moe_intermediate_size, ffn_mid);
+                matmul_qt(&cur->mlp_up_proj, hidden, ffn_mid, COLI_OP_ROLE_DENSE);
                 for (int i = 0; i < m->moe_intermediate_size; i++) ffn_mid[i] = silu(ffn_mid[i]);
                 for (int i = 0; i < m->moe_intermediate_size; i++) ffn_in[i] *= ffn_mid[i];
-                matmul_vec(ffn_in, cur->mlp_down_proj, m->moe_intermediate_size, m->hidden_size, ffn_out);
+                matmul_qt(&cur->mlp_down_proj, ffn_in, ffn_out, COLI_OP_ROLE_DENSE);
             } else {
                 for (int i = 0; i < m->hidden_size; i++) ffn_out[i] = 0.0f;
             }
 
-            if (cur->is_full_attn && m->has_router && cur->router) {
+            if (cur->is_full_attn && m->has_router && cur->router.data) {
                 float *router_logits = (float *)qwen_malloc((size_t)m->num_experts * sizeof(float));
-                matmul_vec(hidden, cur->router, m->hidden_size, m->num_experts, router_logits);
+                matmul_qt(&cur->router, hidden, router_logits, COLI_OP_ROLE_SMALL);
                 softmax(router_logits, m->num_experts);
                 int *expert_indices = (int *)qwen_malloc((size_t)m->experts_per_tok * sizeof(int));
                 float *expert_weights = (float *)qwen_malloc((size_t)m->experts_per_tok * sizeof(float));
@@ -1559,17 +1713,17 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                     int expert_idx = expert_indices[expert_slot];
                     float weight = expert_weights[expert_slot];
                     ensure_expert(m, cur, layer, expert_idx);
-                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx] || !cur->expert_up_proj[expert_idx] || !cur->expert_down_proj[expert_idx]) continue;
+                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx].data || !cur->expert_up_proj[expert_idx].data || !cur->expert_down_proj[expert_idx].data) continue;
                     float *expert_gate = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_up = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_res = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
                     if (!expert_gate || !expert_up || !expert_res) fail("out of memory");
-                    matmul_vec(hidden, cur->expert_gate_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_gate);
+                    matmul_qt(&cur->expert_gate_proj[expert_idx], hidden, expert_gate, COLI_OP_ROLE_ROUTED_EXPERT);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] = silu(expert_gate[i]);
-                    matmul_vec(hidden, cur->expert_up_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_up);
+                    matmul_qt(&cur->expert_up_proj[expert_idx], hidden, expert_up, COLI_OP_ROLE_ROUTED_EXPERT);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_up[i] = silu(expert_up[i]);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] *= expert_up[i];
-                    matmul_vec(expert_gate, cur->expert_down_proj[expert_idx], m->moe_intermediate_size, m->hidden_size, expert_res);
+                    matmul_qt(&cur->expert_down_proj[expert_idx], expert_gate, expert_res, COLI_OP_ROLE_ROUTED_EXPERT);
                     for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += weight * expert_res[i];
                     free(expert_gate);
                     free(expert_up);
@@ -1591,12 +1745,12 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 for (int i = 0; i < m->hidden_size; i++) dot += cur->shared_expert_gate[i] * hidden[i];
                 gate_scalar = 1.0f / (1.0f + expf(-dot));
             }
-            matmul_vec(hidden, cur->sh_gate, m->hidden_size, m->shared_expert_intermediate_size, shared_in);
+            matmul_qt(&cur->sh_gate, hidden, shared_in, COLI_OP_ROLE_SHARED_EXPERT);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] = silu(shared_in[i]);
-            matmul_vec(hidden, cur->sh_up, m->hidden_size, m->shared_expert_intermediate_size, shared_mid);
+            matmul_qt(&cur->sh_up, hidden, shared_mid, COLI_OP_ROLE_SHARED_EXPERT);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_mid[i] = silu(shared_mid[i]);
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) shared_in[i] *= shared_mid[i];
-            matmul_vec(shared_in, cur->sh_down, m->shared_expert_intermediate_size, m->hidden_size, shared_out);
+            matmul_qt(&cur->sh_down, shared_in, shared_out, COLI_OP_ROLE_SHARED_EXPERT);
             for (int i = 0; i < m->hidden_size; i++) ffn_out[i] += gate_scalar * shared_out[i];
             free(shared_in);
             free(shared_mid);

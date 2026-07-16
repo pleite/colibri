@@ -541,6 +541,63 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(prompt)
 
 
+def load_jinja_chat_template(model_dir):
+    """Return the source of a model's `chat_template.jinja`, or None if absent.
+
+    Qwen3.5/GLM checkpoints ship a HuggingFace-style Jinja chat template. When
+    present (and jinja2 is installed) the server can render prompts with the
+    model's own template instead of the built-in text-subset renderers, which is
+    important for exact fidelity with agent harnesses such as Hermes that rely on
+    the canonical formatting.
+    """
+    if not model_dir:
+        return None
+    try:
+        path = Path(model_dir) / "chat_template.jinja"
+        if path.is_file():
+            return path.read_text()
+    except OSError:
+        return None
+    return None
+
+
+def render_chat_jinja(template_source, messages, enable_thinking=False,
+                      reasoning_effort=None, tools=None, response_format=None):
+    """Render a chat prompt using the model's own Jinja chat template.
+
+    jinja2 is an optional dependency: it is imported lazily so the server stays
+    dependency-free unless a Jinja template is actually configured. The variables
+    exposed (messages, tools, add_generation_prompt, enable_thinking) mirror the
+    HuggingFace `apply_chat_template` contract so upstream templates render
+    unchanged.
+    """
+    try:
+        from jinja2 import Environment
+        from jinja2.exceptions import TemplateError
+    except ImportError as exc:  # pragma: no cover - exercised only without jinja2
+        raise APIError(500, "Jinja chat templates require the optional `jinja2` package. "
+                       "Install it with: pip install jinja2",
+                       None, "jinja2_missing", "server_error") from exc
+    if not isinstance(messages, list):
+        raise APIError(400, "`messages` must be an array.", "messages")
+    env = Environment(trim_blocks=True, lstrip_blocks=True, autoescape=False)
+    env.filters.setdefault("tojson", lambda value, **_: json.dumps(value))
+    try:
+        template = env.from_string(template_source)
+        rendered = template.render(
+            messages=messages,
+            tools=tools,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            response_format=response_format,
+        )
+    except TemplateError as exc:
+        raise APIError(400, f"Chat template rendering failed: {exc}", "messages",
+                       "template_error") from exc
+    return prompt_with_response_format(rendered, response_format)
+
+
 def split_thinking(text):
     """Split model output into (reasoning_content, content) by stripping <think>...</think>."""
     if THINK_CLOSE in text:
@@ -696,7 +753,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1, model_family="glm"):
+                 kv_slots=1, model_family="glm", chat_template=None):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -707,6 +764,7 @@ class APIServer(ThreadingHTTPServer):
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
         self.model_family = model_family
+        self.chat_template = chat_template
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1102,10 +1160,17 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        is_qwen = self.server.model_family == "qwen35"
-        render = render_chat_qwen if is_qwen else render_chat
-        prompt = render(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                       response_format=body.get("response_format"))
+        # A model-provided Jinja chat template (opt-in via COLI_JINJA_CHAT=1) takes
+        # precedence over the built-in text renderers for exact-template fidelity.
+        if self.server.chat_template and os.environ.get("COLI_JINJA_CHAT", "0") == "1":
+            prompt = render_chat_jinja(self.server.chat_template, body.get("messages"),
+                                       enable_thinking, reasoning_effort, tools,
+                                       response_format=body.get("response_format"))
+        else:
+            is_qwen = self.server.model_family == "qwen35"
+            render = render_chat_qwen if is_qwen else render_chat
+            prompt = render(body.get("messages"), enable_thinking, reasoning_effort, tools,
+                           response_format=body.get("response_format"))
         self.generation(body, prompt, request_id, True, enable_thinking)
 
     def completion(self, body, request_id):
@@ -1138,10 +1203,11 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     except (OSError, json.JSONDecodeError, TypeError):
         config_payload = {}
     model_family = detect_model_family(config_payload) if isinstance(config_payload, dict) else "glm"
+    chat_template = load_jinja_chat_template(model)
     runtime = Engine(engine_path,model,cap,max_tokens,env,kv_slots)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     server = APIServer((host, port), runtime, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots, model_family)
+                       max_queue, queue_timeout, kv_slots, model_family, chat_template)
     print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())

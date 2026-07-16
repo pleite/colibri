@@ -13,6 +13,22 @@ from pathlib import Path
 
 GB = 1_000_000_000
 SUPPORTED_BACKENDS = ("cuda", "rocm", "vulkan", "npu")
+# Operator roles understood by the C backend runtime (see backend_runtime.h
+# coli_op_role). Each role can be steered to a preferred device class so the
+# parallel scheduler can run backends simultaneously.
+OP_ROLES = ("attention", "shared_expert", "routed_expert", "dense", "small")
+# Default per-role device-class preference for parallel execution. NPUs are
+# preferred for the latency-sensitive, low-arithmetic-intensity "sensor" paths
+# (attention projections, the router, and the small always-on shared expert),
+# while GPUs take the throughput-bound routed experts and dense MLP. CPU is the
+# universal fallback and is always retained as a lane.
+DEFAULT_ROLE_AFFINITY = {
+    "attention": ("npu", "gpu", "cpu"),
+    "small": ("npu", "cpu"),
+    "shared_expert": ("npu", "gpu", "cpu"),
+    "routed_expert": ("gpu", "cpu"),
+    "dense": ("gpu", "cpu"),
+}
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 LAYER_RE = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
 # ROCm APU heuristic: integrated GPUs (e.g. Strix Halo Radeon 890M) report
@@ -304,7 +320,7 @@ def discover_accelerators():
 
 def _select_backend(backend, accelerators):
     choices = SUPPORTED_BACKENDS
-    if backend and backend not in (*choices, "auto", "cpu"):
+    if backend and backend not in (*choices, "auto", "cpu", "parallel"):
         raise ValueError(f"unsupported accelerator backend: {backend}")
     if backend in choices:
         return backend
@@ -314,6 +330,62 @@ def _select_backend(backend, accelerators):
         if accelerators.get(name):
             return name
     return "cpu"
+
+
+def _device_class(backend):
+    """Return the coarse device class for a backend name.
+
+    Returns one of ``"gpu"``, ``"npu"`` or ``"cpu"``. Examples:
+    ``"cuda"`` -> ``"gpu"``, ``"npu"`` -> ``"npu"``, ``"cpu"`` -> ``"cpu"``.
+    """
+    if backend in ("cuda", "rocm", "vulkan"):
+        return "gpu"
+    if backend == "npu":
+        return "npu"
+    return "cpu"
+
+
+def _select_parallel_backends(accelerators):
+    """Return the ordered list of detected backends to run simultaneously.
+
+    Preference order keeps a single GPU backend (the fastest detected of
+    cuda/rocm/vulkan) plus the NPU when present, so we do not try to drive two
+    GPU stacks at once. CPU is always available as an implicit lane and is not
+    listed here.
+    """
+    engines = []
+    for name in ("cuda", "rocm", "vulkan"):
+        if accelerators.get(name):
+            engines.append(name)
+            break
+    if accelerators.get("npu"):
+        engines.append("npu")
+    return engines
+
+
+def _role_affinity_for(engines, affinity=None):
+    """Resolve each op-role to a concrete backend given the active engines.
+
+    `engines` is the list of active accelerator backends (device classes derived
+    via _device_class). The first preferred class that maps to an active engine
+    wins; otherwise the role falls back to CPU.
+    """
+    affinity = affinity or DEFAULT_ROLE_AFFINITY
+    class_to_engine = {}
+    for engine in engines:
+        class_to_engine.setdefault(_device_class(engine), engine)
+    resolved = {}
+    for role in OP_ROLES:
+        chosen = "cpu"
+        for cls in affinity.get(role, ("cpu",)):
+            if cls == "cpu":
+                chosen = "cpu"
+                break
+            if cls in class_to_engine:
+                chosen = class_to_engine[cls]
+                break
+        resolved[role] = chosen
+    return resolved
 
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
@@ -334,6 +406,14 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     for key in ("cuda", "rocm", "vulkan", "npu"):
         accelerators.setdefault(key, [])
     selected_backend = _select_backend(backend, accelerators)
+    parallel_requested = backend == "parallel"
+    parallel_backends = _select_parallel_backends(accelerators) if parallel_requested else []
+    role_affinity = _role_affinity_for(parallel_backends) if parallel_backends else {}
+    if parallel_requested:
+        # The VRAM tier still describes a single primary GPU backend; pick the
+        # first GPU engine (falling back to whatever _select_backend found).
+        primary = next((e for e in parallel_backends if _device_class(e) == "gpu"), None)
+        selected_backend = primary or (parallel_backends[0] if parallel_backends else "cpu")
     gpus = list(accelerators.get(selected_backend, []))
     if gpu_indices is not None:
         wanted = set(gpu_indices)
@@ -397,11 +477,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     warnings = []
     if layer_warning:
         warnings.append(layer_warning)
-    explicit_backend = backend not in (None, "", "auto", "cpu")
+    explicit_backend = backend not in (None, "", "auto", "cpu", "parallel")
     if cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if explicit_backend and not accelerators.get(backend):
         warnings.append(f"requested backend '{backend}' is not detected on this system")
+    if backend == "parallel" and not parallel_backends:
+        warnings.append("parallel backend requested but no GPU/NPU accelerators were detected; using CPU only")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
     if gpus and vram_budget < requested_vram:
@@ -428,6 +510,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "accelerator": {
             "requested_backend": backend or "auto",
             "selected_backend": selected_backend,
+            "parallel": bool(parallel_backends),
+            "parallel_backends": parallel_backends,
+            "role_affinity": role_affinity,
             "detected": {name: len(devices) for name, devices in accelerators.items()},
         },
         "warnings": warnings,
@@ -440,6 +525,16 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = apply_runtime_environment(result)
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+
+    accel = plan.get("accelerator", {})
+    parallel_backends = accel.get("parallel_backends") or []
+    if parallel_backends:
+        # Enable the C runtime's parallel role-aware scheduler and advertise the
+        # engines it may run simultaneously plus the per-role device affinity.
+        result.setdefault("COLI_RUNTIME_PARALLEL", "1")
+        result.setdefault("COLI_RUNTIME_ENGINES", ",".join(parallel_backends))
+        for role, target in (accel.get("role_affinity") or {}).items():
+            result.setdefault(f"COLI_ROLE_{role.upper()}", target)
 
     vram = plan["tiers"]["vram"]
     devices = [device["index"] for device in vram["devices"]]

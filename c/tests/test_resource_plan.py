@@ -108,6 +108,40 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertNotIn("COLI_GPU", disabled)
         self.assertNotIn("CUDA_EXPERT_GB", disabled)
 
+    def test_parallel_backend_combines_gpu_and_npu_with_role_affinity(self):
+        accelerators = {
+            "cuda": [],
+            "rocm": [{"index": 0, "name": "RX 7900 XTX", "total_bytes": 24 * GB,
+                      "free_bytes": 22 * GB}],
+            "vulkan": [],
+            "npu": [{"index": 0, "name": "XDNA", "total_bytes": 2 * GB, "free_bytes": 2 * GB}],
+        }
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, backend="parallel", accelerators=accelerators)
+        accel = plan["accelerator"]
+        self.assertTrue(accel["parallel"])
+        self.assertEqual(accel["parallel_backends"], ["rocm", "npu"])
+        # NPU-preferred sensor roles land on the NPU; throughput roles on the GPU.
+        self.assertEqual(accel["role_affinity"]["attention"], "npu")
+        self.assertEqual(accel["role_affinity"]["small"], "npu")
+        self.assertEqual(accel["role_affinity"]["routed_expert"], "rocm")
+        self.assertEqual(accel["role_affinity"]["dense"], "rocm")
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_RUNTIME_PARALLEL"], "1")
+        self.assertEqual(env["COLI_RUNTIME_ENGINES"], "rocm,npu")
+        self.assertEqual(env["COLI_ROLE_ATTENTION"], "npu")
+        self.assertEqual(env["COLI_ROLE_ROUTED_EXPERT"], "rocm")
+
+    def test_parallel_backend_without_accelerators_warns_and_falls_back(self):
+        accelerators = {"cuda": [], "rocm": [], "vulkan": [], "npu": []}
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, backend="parallel", accelerators=accelerators)
+        self.assertFalse(plan["accelerator"]["parallel"])
+        self.assertEqual(plan["accelerator"]["parallel_backends"], [])
+        self.assertTrue(any("parallel backend requested" in w for w in plan["warnings"]))
+        env = environment_for_plan(plan)
+        self.assertNotIn("COLI_RUNTIME_PARALLEL", env)
+
     def test_non_cuda_backend_uses_generic_environment(self):
         accelerators = {
             "cuda": [],
