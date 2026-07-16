@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -79,6 +80,37 @@ static ColiCudaTensor **g_tensors = NULL;
 static size_t g_tensor_capacity = 0;
 static size_t g_cache_hits = 0;
 static int g_backend_mask = 0;
+static int g_parallel_enabled = 1;
+
+static int active_lanes(int *lane_ids);
+
+/* Per-role backend affinity weights. Columns follow the lane/backend id order
+ * used by dispatch_chunk: 0=CPU, 1=NPU, 2=Vulkan(GPU), 3=CUDA/ROCm(GPU). Higher
+ * weight = larger share of the output rows for that backend. A zero weight keeps
+ * a backend out of that role entirely (except that the CPU is always retained as
+ * a fallback so a role can never end up with no lane). */
+static const int g_role_affinity[COLI_OP_ROLE_COUNT][4] = {
+    /* AUTO           */ {1, 1, 1, 1},
+    /* ATTENTION      */ {1, 6, 3, 3},
+    /* SHARED_EXPERT  */ {1, 6, 3, 3},
+    /* ROUTED_EXPERT  */ {1, 1, 5, 6},
+    /* DENSE          */ {2, 1, 5, 6},
+    /* SMALL          */ {1, 0, 0, 0},
+};
+
+static const char *backend_name_for_id(int backend_id) {    switch (backend_id) {
+        case 0: return "cpu";
+        case 1: return "npu";
+        case 2: return "vulkan";
+        case 3:
+#if defined(COLI_ROCM)
+            return "rocm";
+#else
+            return "cuda";
+#endif
+        default: return "cpu";
+    }
+}
 
 static int backend_bit_for_name(const char *name) {
     if (!name || !*name) return 0;
@@ -183,6 +215,13 @@ static void configure_parallelism(void) {
     omp_set_dynamic(0);
     omp_set_num_threads(threads);
 #endif
+    g_parallel_enabled = 1;
+    const char *par = getenv("COLI_RUNTIME_PARALLEL");
+    if (par && *par) {
+        if (!strcmp(par, "0") || !strcmp(par, "false") || !strcmp(par, "off")) {
+            g_parallel_enabled = 0;
+        }
+    }
 }
 
 static int valid_fmt(int fmt) {
@@ -248,6 +287,9 @@ static void host_matmul(float *y, const float *x, const void *weights, const flo
     const float *scale = scales;
     const int base = start;
     const int end = start + count;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int o = base; o < end; ++o) {
         const float row_scale = (scale && fmt != 0) ? scale[o] : 1.0f;
         for (int s = 0; s < S; ++s) {
@@ -592,6 +634,31 @@ size_t coli_runtime_cache_hits(void) {
     return g_cache_hits;
 }
 
+int coli_runtime_backend_mask(void) {
+    if (!g_initialized) coli_runtime_init(NULL, 0);
+    return g_backend_mask;
+}
+
+int coli_runtime_parallel_enabled(void) {
+    if (!g_initialized) coli_runtime_init(NULL, 0);
+    return g_parallel_enabled;
+}
+
+int coli_runtime_active_backends(char *buf, size_t buflen) {
+    if (!g_initialized) coli_runtime_init(NULL, 0);
+    int lane_ids[4] = {0, 0, 0, 0};
+    int lane_count = active_lanes(lane_ids);
+    if (buf && buflen > 0) buf[0] = '\0';
+    for (int lane = 0; lane < lane_count; ++lane) {
+        const char *name = backend_name_for_id(lane_ids[lane]);
+        if (buf && buflen > 0) {
+            if (lane > 0) strncat(buf, ",", buflen - strlen(buf) - 1);
+            strncat(buf, name, buflen - strlen(buf) - 1);
+        }
+    }
+    return lane_count;
+}
+
 int coli_runtime_tensor_upload(ColiCudaTensor **tensor,
                                const void *weights, const float *scales,
                                int fmt, int I, int O, int device) {
@@ -638,10 +705,134 @@ int coli_runtime_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Build the ordered list of active lanes (backend ids). Returns lane count. */
+static int active_lanes(int *lane_ids) {
+    int lane_count = 0;
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_CPU) lane_ids[lane_count++] = 0;
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_NPU) lane_ids[lane_count++] = 1;
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_VULKAN) lane_ids[lane_count++] = 2;
+    if (g_backend_mask & COLI_RUNTIME_BACKEND_CUDA) lane_ids[lane_count++] = 3;
+    if (lane_count <= 0) {
+        lane_ids[0] = 0;
+        lane_count = 1;
+    }
+    return lane_count;
+}
+
+/* Partition the O output rows across the active lanes proportionally to the
+ * role affinity weights. The CPU lane always keeps at least one row so a role
+ * can never be left without an executable lane. Remainders are handed to the
+ * highest-weight lane. */
+static void partition_output(int O, coli_op_role role, const int *lane_ids,
+                             int lane_count, int *chunk_sizes) {
+    if (role < 0 || role >= COLI_OP_ROLE_COUNT) role = COLI_OP_ROLE_AUTO;
+    long total_weight = 0;
+    int best_lane = 0;
+    long best_weight = -1;
+    for (int lane = 0; lane < lane_count; ++lane) {
+        int w = g_role_affinity[role][lane_ids[lane]];
+        if (w < 0) w = 0;
+        total_weight += w;
+        if (w > best_weight) {
+            best_weight = w;
+            best_lane = lane;
+        }
+    }
+    if (total_weight <= 0) {
+        /* No lane wants this role: fall back to an even split. */
+        int base = O / lane_count, extra = O % lane_count;
+        for (int lane = 0; lane < lane_count; ++lane)
+            chunk_sizes[lane] = base + (lane < extra ? 1 : 0);
+        return;
+    }
+    int assigned = 0;
+    for (int lane = 0; lane < lane_count; ++lane) {
+        int w = g_role_affinity[role][lane_ids[lane]];
+        if (w < 0) w = 0;
+        long share = ((long)O * w) / total_weight;
+        chunk_sizes[lane] = (int)share;
+        assigned += chunk_sizes[lane];
+    }
+    /* Distribute any leftover rows (from integer rounding) to the best lane. */
+    chunk_sizes[best_lane] += O - assigned;
+}
+
+/* Arguments handed to each parallel lane worker. */
+typedef struct {
+    float *y;
+    const float *x;
+    const void *weights;
+    const float *scales;
+    int fmt, S, I, O;
+    int backend_id;
+    int start;
+    int count;
+    int device;
+    int ok;
+} lane_job;
+
+static void run_lane_job(lane_job *job) {
+    job->ok = dispatch_chunk(job->y, job->x, job->weights, job->scales,
+                             job->fmt, job->S, job->I, job->O,
+                             job->backend_id, job->start, job->count, job->device);
+}
+
+static void *lane_thread_main(void *arg) {
+    run_lane_job((lane_job *)arg);
+    return NULL;
+}
+
+/* Execute every lane job. When parallel dispatch is enabled and more than one
+ * lane is active, the heterogeneous backends run simultaneously on separate
+ * threads (each lane writes a disjoint slice of the output, so no locking is
+ * needed). Falls back to sequential execution when threads cannot be created or
+ * parallelism is disabled. */
+static int run_lanes(lane_job *jobs, int lane_count) {
+    if (lane_count <= 1 || !g_parallel_enabled) {
+        int ok = 1;
+        for (int lane = 0; lane < lane_count; ++lane) {
+            run_lane_job(&jobs[lane]);
+            if (!jobs[lane].ok) ok = 0;
+        }
+        return ok;
+    }
+
+    pthread_t threads[4];
+    int spawned[4] = {0, 0, 0, 0};
+    for (int lane = 0; lane < lane_count; ++lane) {
+        if (jobs[lane].count <= 0) {
+            jobs[lane].ok = 1;
+            continue;
+        }
+        if (pthread_create(&threads[lane], NULL, lane_thread_main, &jobs[lane]) == 0) {
+            spawned[lane] = 1;
+        } else {
+            /* Thread creation failed: run this lane inline. */
+            run_lane_job(&jobs[lane]);
+        }
+    }
+    int ok = 1;
+    for (int lane = 0; lane < lane_count; ++lane) {
+        if (spawned[lane]) pthread_join(threads[lane], NULL);
+        if (!jobs[lane].ok) ok = 0;
+    }
+    return ok;
+}
+
+
 int coli_runtime_matmul(ColiCudaTensor **tensor,
                         float *y, const float *x,
                         const void *weights, const float *scales,
                         int fmt, int S, int I, int O, int device) {
+    return coli_runtime_matmul_ex(tensor, y, x, weights, scales, fmt, S, I, O,
+                                  device, COLI_OP_ROLE_AUTO);
+}
+
+int coli_runtime_matmul_ex(ColiCudaTensor **tensor,
+                        float *y, const float *x,
+                        const void *weights, const float *scales,
+                        int fmt, int S, int I, int O, int device,
+                        coli_op_role role) {
     if (!tensor || !y || !x || S <= 0 || I <= 0 || O <= 0 || !valid_fmt(fmt)) return 0;
     if (!g_initialized && !coli_runtime_init(NULL, 0)) return 0;
     if (!*tensor || (*tensor)->fmt != fmt || (*tensor)->I != I || (*tensor)->O != O || (*tensor)->device != device) {
@@ -655,45 +846,31 @@ int coli_runtime_matmul(ColiCudaTensor **tensor,
     }
 
     int lane_ids[4] = {0, 0, 0, 0};
-    int lane_count = 0;
-    if (g_backend_mask & COLI_RUNTIME_BACKEND_CPU) {
-        lane_ids[lane_count++] = 0;
-    }
-    if (g_backend_mask & COLI_RUNTIME_BACKEND_NPU) {
-        lane_ids[lane_count++] = 1;
-    }
-    if (g_backend_mask & COLI_RUNTIME_BACKEND_VULKAN) {
-        lane_ids[lane_count++] = 2;
-    }
-    if (g_backend_mask & COLI_RUNTIME_BACKEND_CUDA) {
-        lane_ids[lane_count++] = 3;
-    }
-    if (lane_count <= 0) {
-        lane_ids[0] = 0;
-        lane_count = 1;
-    }
+    int lane_count = active_lanes(lane_ids);
 
-    const int base = O / lane_count;
-    const int extra = O % lane_count;
-    int *output_chunk_sizes = (int *)calloc((size_t)lane_count, sizeof(int));
-    if (!output_chunk_sizes) return 0;
+    int output_chunk_sizes[4] = {0, 0, 0, 0};
+    partition_output(O, role, lane_ids, lane_count, output_chunk_sizes);
+
+    lane_job jobs[4];
+    int local_start = 0;
     for (int lane = 0; lane < lane_count; ++lane) {
-        output_chunk_sizes[lane] = base + (lane < extra ? 1 : 0);
+        jobs[lane].y = y;
+        jobs[lane].x = x;
+        jobs[lane].weights = weights;
+        jobs[lane].scales = scales;
+        jobs[lane].fmt = fmt;
+        jobs[lane].S = S;
+        jobs[lane].I = I;
+        jobs[lane].O = O;
+        jobs[lane].backend_id = lane_ids[lane];
+        jobs[lane].start = local_start;
+        jobs[lane].count = output_chunk_sizes[lane];
+        jobs[lane].device = device;
+        jobs[lane].ok = 1;
+        local_start += output_chunk_sizes[lane];
     }
 
-    int dispatch_ok = 1;
-    if (lane_count == 1) {
-        dispatch_ok = dispatch_chunk(y, x, weights, scales, fmt, S, I, O, lane_ids[0], 0, O, device);
-    } else {
-        int local_start = 0;
-        for (int lane = 0; lane < lane_count; ++lane) {
-            if (!dispatch_chunk(y, x, weights, scales, fmt, S, I, O, lane_ids[lane], local_start, output_chunk_sizes[lane], device)) {
-                dispatch_ok = 0;
-            }
-            local_start += output_chunk_sizes[lane];
-        }
-    }
-    free(output_chunk_sizes);
+    int dispatch_ok = run_lanes(jobs, lane_count);
     if (!dispatch_ok) return 0;
 
     free((*tensor)->cache_y);
