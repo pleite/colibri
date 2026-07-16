@@ -144,6 +144,8 @@ typedef struct {
     int num_attention_heads;
     int num_kv_heads;
     int head_dim;
+    int linear_num_key_heads;
+    int linear_key_head_dim;
     bool has_router;
     char *snap_dir;
     shards shards;
@@ -487,6 +489,8 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     m->num_attention_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_attention_heads", 1);
     m->num_kv_heads = parse_int_field_with_fallback(text_cfg, cfg, "num_key_value_heads", 1);
     m->head_dim = parse_int_field_with_fallback(text_cfg, cfg, "head_dim", m->hidden_size);
+    m->linear_num_key_heads = parse_int_field_with_fallback(text_cfg, cfg, "linear_num_key_heads", m->num_kv_heads);
+    m->linear_key_head_dim = parse_int_field_with_fallback(text_cfg, cfg, "linear_key_head_dim", m->head_dim);
     m->rope_theta = parse_float_field(text_cfg, "rope_theta", 10000.0f);
     m->partial_rotary_factor = parse_float_field(text_cfg, "partial_rotary_factor", 0.25f);
     m->use_rope = m->rope_theta > 0.0f && m->partial_rotary_factor > 0.0f && m->head_dim > 1;
@@ -672,15 +676,15 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             }
         } else {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer);
-            cur->la_in_proj_a = load_optional_tensor_f32(m, name, (size_t)128 * (size_t)m->hidden_size);
+            cur->la_in_proj_a = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_a) {
-                cur->la_in_proj_a = (float *)calloc((size_t)128 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_a = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_a) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", layer);
-            cur->la_in_proj_b = load_optional_tensor_f32(m, name, (size_t)128 * (size_t)m->hidden_size);
+            cur->la_in_proj_b = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_b) {
-                cur->la_in_proj_b = (float *)calloc((size_t)128 * (size_t)m->hidden_size, sizeof(float));
+                cur->la_in_proj_b = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
                 if (!cur->la_in_proj_b) fail("out of memory");
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer);
