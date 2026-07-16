@@ -1,121 +1,96 @@
-# Backend and engine parity gaps — colibrì
+# Backend and Engine Parity Gaps — colibrì
 
-Date: 2026-07-16
+**Date:** 2026-07-16
+**Updated:** 2026-07-16 23:00 (post-PR #46, #47 audit)
 
-This document consolidates the missing work needed to bring the current engine and accelerator stack up to the level of the CPU/GLM baseline, and to make Qwen3.5 MoE and the other backends reach the same level of support.
+This document consolidates everything from the previous gap analyses and plan files into a single authoritative reference. It reflects the actual state of `main` after PRs #46 and #47 were merged.
 
-Implementation update (2026-07-16): the shared runtime now falls back to the CPU path when a selected backend cannot complete upload or matmul work, so unsupported shapes or unavailable backends no longer fail the whole execution path. The backend runtime test suite now exercises that fallback path explicitly.
+---
 
-## Summary
+## What Was Implemented (PR #46 + #47)
 
-The current repository already has:
+### PR #46 — Backend runtime fallback semantics
 
-- a CPU fallback path,
-- a GLM-style engine path,
-- a Qwen3.5 MoE scaffold,
-- backend entry points for CUDA, ROCm/HIP, Vulkan, and NPU.
+- `c/backend_runtime.c`: Full shared runtime layer with:
+  - Backend mask resolution via `COLI_RUNTIME_ENGINES` / `COLI_RUNTIME_DISABLE_ENGINES` env vars
+  - Chunked dispatch across multiple backends (lane splitting)
+  - CPU fallback for every backend (NPU, Vulkan, ROCm, CUDA)
+  - Tensor caching with FNV-1a hash (input hash → cached output)
+  - `host_memory_info()` for all backends (real sysconf, not hardcoded stubs)
+- `c/backend_npu.c`: Host-backed shim — `matmul_host()` with OpenMP parallelism, real memory reporting
+- `c/backend_vulkan.c`: Host-backed shim — `matmul_host()` with OpenMP parallelism, Vulkan loader probing, real memory reporting
+- `c/backend_runtime.o`: Compiled and linked
+- `c/tests/test_backend_runtime.c`: Tests for the new runtime
+- `c/tests/test_backend_runtime` (binary): Removed (was a leftover test binary)
+- `c/backend_vulkan.o`: Compiled and linked
 
-What is still missing is the work that turns these into a fully validated, feature-complete, backend-agnostic stack.
+### PR #47 — Qwen3.5 MoE engine hardening
 
-## 1. Shared parity blockers for all backends
+- `c/qwen35_moe.c`: Lazy expert loading (`ensure_expert()`), `min_p` sampling parameter, int2 format removal (only int4/int8 supported now)
+- `c/qwen35_moe`: Updated binary
+- `c/openai_server.py`: Added `min_p` parameter support
+- `c/tests/test_qwen35_moe.c` + binary: Updated tests
+- `c/tests/test_resource_plan.py`: Updated tests
+- `c/resource_plan.py`: Updated resource planning
+- `docs/plans/2026-07-16_backend-parity-gap-list.md`: This file
 
-These are the gaps that must be closed before every backend is truly "up to par" with the CPU/GLM baseline.
+### PR #45 — Original gap analysis (still relevant context)
 
-1. Finish the backend contract end to end
-   - Ensure each backend implements the same runtime contract (`init`, `malloc`, `free`, `copy`, `matmul`, `cleanup`) and provides fallback semantics when a kernel or shape is unsupported.
-   - Keep the engine code backend-agnostic; the same model path should run on CPU, CUDA, ROCm, Vulkan, and NPU without special-case logic.
+- `docs/plans/backend-gap-analysis.md`: Detailed per-backend gap analysis
+- `docs/plans/2026-07-15_engine-capability-audit.md`: Engine feature audit
+- `docs/plans/2026-07-15_copilot-ornith-feature-completeness.md`: Ornith FP8 feature completeness plan
 
-2. Implement the resident low-bit tensor path
-   - Add the FP8/FP6/FP4 resident-format pipeline end to end, including converter metadata, layout rules, runtime capability checks, and backend dispatch points.
-   - This is the main missing piece for making the GPU/NPU backends comparable to the existing int4/int8 stack used by GLM.
+---
 
-3. Add backend-specific correctness and regression tests
-   - Every backend needs correctness tests for the same matmul/weight paths that CPU and GLM already exercise.
-   - Tests should cover CPU fallback, backend success, and graceful fallback on unsupported shapes or missing drivers.
+## Current State Summary
 
-4. Wire planner/doctor/server reporting into each backend
-   - The planner, doctor flow, and runtime diagnostics should report backend availability, capability limits, and fallback reasons in a consistent way.
-   - This is required for operational parity and for turning backend selection into a supported feature rather than a manual experiment.
+### Backends (all four)
 
-## 2. Missing steps for Qwen3.5 MoE
+| Backend | File | Status | What it does |
+|---------|------|--------|--------------|
+| **CPU** | `c/backend_runtime.c` (lane 0) | ✅ Working | Full CPU matmul with OpenMP parallelism |
+| **NPU** | `c/backend_npu.c` | ✅ Host-backed shim | Copies to host memory, uses `matmul_host()` |
+| **Vulkan** | `c/backend_vulkan.c` | ✅ Host-backed shim | Copies to host memory, probes Vulkan loader, uses `matmul_host()` |
+| **ROCm/HIP** | `c/backend_rocm.hip` | ✅ HIP shim | Full HIP implementation with unified memory support for Strix Halo APU |
 
-The Qwen3.5 MoE path is currently a correctness scaffold rather than a production-quality implementation. The missing work is:
+All backends share the `coli_cuda_*` ABI and dispatch through `backend_runtime.c`. When a selected backend fails upload or matmul, the runtime falls back to the CPU path.
 
-1. Replace the skeleton forward pass with a faithful Qwen3.5 implementation
-   - Implement the actual attention path, including RoPE, GQA, and KV-cache behavior.
-   - Make the linear-attention path a real SSM-style block rather than a lightweight placeholder.
+### Engines
 
-2. Finish the core model features that the engine is expected to support
-   - Full attention math and causal masking
-   - Correct linear-attention behavior
-   - KV-cache persistence and reuse
-   - Grammar-constrained decoding
-   - Logits/logprobs output
-   - Embeddings and token-level generation semantics
+| Engine | File | Status |
+|--------|------|--------|
+| **GLM-5.2** | `c/glm.c` | ✅ Complete (int4/int8 resident, expert streaming from disk, LRU cache, profiling) |
+| **Qwen3.5 MoE** | `c/qwen35_moe.c` | ⚠️ Skeleton forward pass (lazy expert loading, basic attention, no GPU backend integration) |
 
-3. Add validation against a reference implementation
-   - Teacher-forcing tests and generation tests should be added against a transformers oracle rather than only synthetic fixtures.
+### Key Gaps
 
-4. Add the multimodal and advanced generation surfaces
-   - Vision, video, and audio handling remain missing.
-   - The chat template should be upgraded from the current text-only subset to the full template behavior expected by the model.
+1. **GPU-native kernels** — NPU and Vulkan backends fall back to CPU `matmul_host()`. ROCm has real HIP kernels but the full execution stack (FP8/FP6/FP4 resident format, kernel dispatch) is not yet integrated.
+2. **Qwen3.5 backend integration** — `qwen35_moe.c` does NOT use the backend runtime. All matmuls are CPU.
+3. **Low-bit resident tensor format** — FP8/FP6/FP4 pipeline not implemented end-to-end.
+4. **Multimodal** — Vision, video, audio completely missing from Qwen3.5 engine.
+5. **Grammar-constrained decoding** — `grammar.h` exists but not integrated.
+6. **Logprobs/embeddings** — Engine discards logits after argmax; embeddings endpoint returns 501.
+7. **KV-cache persistence** — Cache is in-memory only.
 
-## 3. Backend-by-backend gap list
+---
 
-### CPU backend
+## Implementation Priority
 
-- Status: baseline fallback path.
-- Missing steps:
-  - Keep the CPU fallback path as the correctness reference for all other backends.
-  - Add the same low-bit/resident-tensor and planner/doctor reporting hooks that the GPU/NPU backends need.
-  - Ensure CPU remains the default fallback when a backend is unavailable or a shape is unsupported.
+1. **Finish the shared backend contract** — Already mostly done. The runtime fallback semantics are in place.
+2. **Implement low-bit resident tensor path** — FP8/FP6/FP4 pipeline for GPU backends.
+3. **Integrate Qwen3.5 with backend runtime** — Wire `qwen35_moe.c` to use `coli_runtime_matmul()`.
+4. **Add backend-specific correctness tests** — Every backend needs tests for the same paths CPU exercises.
+5. **Wire planner/doctor/server reporting** — Consistent backend availability reporting.
+6. **Qwen3.5 feature completeness** — Full attention math, multimodal, grammar decoding, logprobs.
+7. **Performance tuning** — GPU-native kernels for NPU/Vulkan, ROCm FP8 native arithmetic.
 
-### GLM engine path
+---
 
-- Status: the existing GLM path is the reference implementation for the current engine stack.
-- Missing steps:
-  - Preserve backend-agnostic behavior so the same GLM execution path works across CPU, CUDA, ROCm, Vulkan, and NPU.
-  - Port the GLM-specific quantized/streaming logic into the shared backend abstraction rather than keeping it tied to one backend.
-  - Add backend parity tests so GLM results are validated on every backend, not only the CPU path.
+## Obsolete Files (to remove)
 
-### CUDA backend
-
-- Status: reference backend for GPU execution.
-- Missing steps:
-  - Finish the shared low-bit resident-tensor path for CUDA as part of the common backend contract.
-  - Add the same runtime capability checks, fallback reporting, and regression tests used by ROCm/Vulkan/NPU.
-  - Keep CUDA as the reference path for performance and correctness while the other backends catch up.
-
-### ROCm/HIP backend
-
-- Status: backend abstraction and build support exist, but the full execution stack is still incomplete.
-- Missing steps:
-  - Complete the low-bit resident-tensor path end to end.
-  - Add kernel dispatch points, converter metadata, and runtime gating for FP8/FP6/FP4 formats.
-  - Validate the backend on AMD hardware and ensure correct fallback behavior on unsupported shapes or missing ROCm support.
-
-### Vulkan backend
-
-- Status: a shim exists, but the compute path is not finished.
-- Missing steps:
-  - Implement the full Vulkan compute pipeline: SPIR-V/shader path, descriptor setup, command submission, and synchronization.
-  - Add correctness tests for 8/6/4-bit matmul coverage on Mesa/RADV-style devices.
-  - Finish runtime selection and planner/doctor reporting so Vulkan can be used as a supported fallback.
-
-### NPU backend
-
-- Status: compatibility shim plus capability gating; actual offload is not complete.
-- Missing steps:
-  - Add the real XDNA 2 offload path for fixed-shape subgraphs.
-  - Add device discovery and capability reporting for AMD XDNA 2 and clear CPU/GPU fallback paths.
-  - Add observability and tests for unavailable/degraded NPU modes.
-
-## 4. Practical order of implementation
-
-The highest-value sequence is:
-
-1. Finish the shared backend contract and runtime fallback semantics.
-2. Implement the low-bit resident-tensor path once and wire it into all relevant backends.
-3. Finish Qwen3.5 correctness and core generation features.
-4. Add backend-parity tests and planner/doctor reporting.
-5. Then tackle performance tuning and backend-specific optimization.
+- `PORT_QWEN35_MOE_PLAN.md` — Superseded by this consolidated document
+- `PORT_ROCM_VULKAN_PLAN.md` — Superseded by this consolidated document
+- `docs/plans/2026-07-15_copilot-ornith-feature-completeness.md` — Content absorbed into this doc
+- `docs/plans/2026-07-15_engine-capability-audit.md` — Content absorbed into this doc
+- `docs/plans/backend-gap-analysis.md` — Content absorbed into this doc
+- `docs/plans/2026-07-16_backend-parity-gap-list.md` — This IS the consolidation
