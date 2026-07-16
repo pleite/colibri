@@ -136,7 +136,7 @@
     ],
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
+    "linear_num_key_heads": 64,
     "linear_num_value_heads": 64,
     "linear_value_head_dim": 128,
     "mamba_ssm_dtype": "float32",
