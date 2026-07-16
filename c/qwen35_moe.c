@@ -396,13 +396,22 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     } else {
                         for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
                     }
-                    bool interleaved_rows = false;
+                    bool interleaved_rows = false; /* default: consecutive rows from the first half */
                     if (scale) {
                         size_t split_matches = 0;
                         size_t interleaved_matches = 0;
                         for (size_t row = 0; row < logical_out_dim; row++) {
-                            if (fabsf(scale_vals[row] - scale_vals[row + logical_out_dim]) < 1e-6f) split_matches++;
-                            if (fabsf(scale_vals[row * 2] - scale_vals[row * 2 + 1]) < 1e-6f) interleaved_matches++;
+                            size_t split_left = row;
+                            size_t split_right = row + logical_out_dim;
+                            size_t interleaved_left = row * 2;
+                            size_t interleaved_right = interleaved_left + 1;
+                            if (split_right >= out_dim || interleaved_right >= out_dim) {
+                                free(raw);
+                                free(scale_vals);
+                                fail("tensor %s has invalid expanded scale layout (row=%zu out=%zu)", name, row, out_dim);
+                            }
+                            if (fabsf(scale_vals[split_left] - scale_vals[split_right]) < 1e-6f) split_matches++;
+                            if (fabsf(scale_vals[interleaved_left] - scale_vals[interleaved_right]) < 1e-6f) interleaved_matches++;
                         }
                         interleaved_rows = interleaved_matches > split_matches;
                     }
@@ -415,7 +424,13 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                             fail("tensor %s has invalid expanded row mapping (src=%zu scale=%zu out=%zu)", name, src_row, scale_row, out_dim);
                         }
                         for (size_t col = 0; col < logical_in_dim; col++) {
-                            int8_t value = (int8_t)raw[src_row * logical_in_dim + col];
+                            size_t src_offset = src_row * logical_in_dim + col;
+                            if (src_offset >= packed_bytes) {
+                                free(raw);
+                                free(scale_vals);
+                                fail("tensor %s has invalid expanded payload offset (%zu >= %zu)", name, src_offset, packed_bytes);
+                            }
+                            int8_t value = (int8_t)raw[src_offset];
                             buf[row * logical_in_dim + col] = (float)value * scale_vals[scale_row];
                         }
                     }
