@@ -383,7 +383,8 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             size_t logical_out_dim = out_dim / 2;
             if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
                 size_t logical_in_dim = nelems / logical_out_dim;
-                if (packed_bytes == out_dim * logical_in_dim) {
+                size_t logical_nelems = logical_out_dim * logical_in_dim;
+                if (packed_bytes == out_dim * logical_in_dim && logical_nelems == nelems) {
                     uint8_t *raw = (uint8_t *)malloc(packed_bytes);
                     if (!raw) fail("out of memory");
                     st_read_raw(&m->shards, t->name, raw, 0);
@@ -402,7 +403,7 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     }
                     free(raw);
                     free(scale_vals);
-                    model_debug("load_tensor_f32: tensor=%s accepted expanded int8 payload (%zu bytes -> %zu elems) using first half rows", name, packed_bytes, nelems);
+                    model_debug("load_tensor_f32: tensor=%s accepted expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from the first half of %zu packed rows", name, packed_bytes, nelems, logical_out_dim, out_dim);
                     return buf;
                 }
             }
