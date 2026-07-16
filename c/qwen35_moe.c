@@ -289,7 +289,7 @@ static st_tensor *find_tensor(qwen35_model *m, const char *name) {
 }
 
 static st_tensor *find_scale_tensor(qwen35_model *m, const char *name) {
-    static const char *const suffixes[] = {".qs", ".scale", ".scales", ".weight_scale"};
+    static const char *const suffixes[] = {".weight_scale", ".scale", ".scales", ".qs"};
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
         size_t total = strlen(name) + strlen(suffixes[i]) + 1;
         char *candidate = (char *)malloc(total);
@@ -378,6 +378,34 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             free(raw);
             free(scale_vals);
             return buf;
+        }
+        if ((packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0) {
+            size_t logical_out_dim = out_dim / 2;
+            if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
+                size_t logical_in_dim = nelems / logical_out_dim;
+                if (packed_bytes == out_dim * logical_in_dim) {
+                    uint8_t *raw = (uint8_t *)malloc(packed_bytes);
+                    if (!raw) fail("out of memory");
+                    st_read_raw(&m->shards, t->name, raw, 0);
+                    float *scale_vals = (float *)calloc(out_dim, sizeof(float));
+                    if (!scale_vals) fail("out of memory");
+                    if (scale) {
+                        st_read_f32(&m->shards, scale->name, scale_vals, 0);
+                    } else {
+                        for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+                    }
+                    for (size_t row = 0; row < logical_out_dim; row++) {
+                        for (size_t col = 0; col < logical_in_dim; col++) {
+                            int8_t value = (int8_t)raw[row * logical_in_dim + col];
+                            buf[row * logical_in_dim + col] = (float)value * scale_vals[row];
+                        }
+                    }
+                    free(raw);
+                    free(scale_vals);
+                    model_debug("load_tensor_f32: tensor=%s accepted expanded int8 payload (%zu bytes -> %zu elems) using first half rows", name, packed_bytes, nelems);
+                    return buf;
+                }
+            }
         }
         fail("tensor %s has unsupported packed size %" PRId64 " for %zu elements", name, t->nbytes, nelems);
     }
