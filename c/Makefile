@@ -75,6 +75,10 @@ ifeq ($(NPU),1)
 NPU_BACKEND_RUNTIME_TEST_OBJ = backend_npu.o
 endif
 VULKAN_BACKEND_CFLAGS =
+VULKAN_BACKEND_RUNTIME_TEST_OBJ =
+ifeq ($(VULKAN),1)
+VULKAN_BACKEND_RUNTIME_TEST_OBJ = backend_vulkan.o
+endif
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -246,7 +250,7 @@ tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
 	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $< $(NPU_BACKEND_TEST_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_backend_runtime$(EXE): tests/test_backend_runtime.c backend_runtime.o
-	$(CC) $(CFLAGS) $< backend_runtime.o $(NPU_BACKEND_RUNTIME_TEST_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< backend_runtime.o $(NPU_BACKEND_RUNTIME_TEST_OBJ) $(VULKAN_BACKEND_RUNTIME_TEST_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
