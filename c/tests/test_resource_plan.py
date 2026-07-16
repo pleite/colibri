@@ -180,6 +180,25 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(plan["model"]["layer_count"], 1)
         self.assertGreater(plan["tiers"]["ram"]["cache_slots_per_layer"], 0)
 
+    def test_nested_text_config_is_detected_as_qwen(self):
+        nested_model = self.model / "nested_qwen_model"
+        nested_model.mkdir()
+        (nested_model / "config.json").write_text(json.dumps({
+            "text_config": {
+                "model_type": "qwen3.5",
+                "architectures": ["Qwen3ForCausalLM"],
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "kv_lora_rank": 4,
+            }
+        }))
+        write_shard(nested_model / "model.safetensors", [
+            ("model.layers.0.self_attn.q_proj.weight", 128),
+        ])
+        info = analyze_model(nested_model)
+        self.assertEqual(info["model_family"], "qwen35")
+        self.assertEqual(info["config"]["text_config"]["num_hidden_layers"], 2)
+
     def test_runtime_environment_defaults_to_all_cpu_cores(self):
         env = environment_for_plan(build_plan(self.model, available_memory=16 * GB,
                                               available_disk=1), {})

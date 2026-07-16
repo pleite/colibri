@@ -1180,7 +1180,7 @@ static void apply_rope(float *values, int head_dim, int position, float theta, f
     }
 }
 
-static void sample_logits(const float *logits, int n, float temperature, float top_p, int top_k, int *out_token) {
+static void sample_logits(const float *logits, int n, float temperature, float top_p, float min_p, int top_k, int *out_token) {
     if (n <= 0) return;
     if (temperature <= 0.0f) {
         int best = 0;
@@ -1199,6 +1199,8 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     int *kept = NULL;
     float *keep_scores = NULL;
     float *probs = NULL;
+    int *filtered_indices = NULL;
+    float *filtered_probs = NULL;
     int best = 0;
     indices = (int *)qwen_malloc((size_t)n * sizeof(int));
     values = (float *)qwen_malloc((size_t)n * sizeof(float));
@@ -1250,6 +1252,47 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     for (int i = 0; i < keep; i++) {
         probs[i] = expf((keep_scores[i] - maxv) / temperature);
         sum += probs[i];
+    }
+    if (min_p > 0.0f) {
+        filtered_indices = (int *)qwen_malloc((size_t)keep * sizeof(int));
+        filtered_probs = (float *)qwen_malloc((size_t)keep * sizeof(float));
+        if (!filtered_indices || !filtered_probs) {
+            free(filtered_indices);
+            free(filtered_probs);
+            free(probs);
+            free(keep_scores);
+            free(kept);
+            free(values);
+            free(indices);
+            fail("out of memory");
+        }
+        float max_prob = 0.0f;
+        for (int i = 0; i < keep; i++) {
+            if (probs[i] > max_prob) {
+                max_prob = probs[i];
+            }
+        }
+        float threshold = max_prob * min_p;
+        int filtered_count = 0;
+        for (int i = 0; i < keep; i++) {
+            if (probs[i] >= threshold) {
+                filtered_indices[filtered_count] = kept[i];
+                filtered_probs[filtered_count] = probs[i];
+                filtered_count++;
+            }
+        }
+        if (filtered_count == 0) {
+            filtered_indices[0] = kept[0];
+            filtered_probs[0] = probs[0];
+            filtered_count = 1;
+        }
+        free(kept);
+        free(probs);
+        keep = filtered_count;
+        kept = filtered_indices;
+        probs = filtered_probs;
+        sum = 0.0f;
+        for (int i = 0; i < keep; i++) sum += probs[i];
     }
     if (top_p > 0.0f && top_p < 1.0f) {
         float target = sum * top_p;
@@ -1333,7 +1376,7 @@ static void configure_parallelism(int requested_threads) {
 }
 
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
-                      int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed,
+                      int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
                       int cache_slot) {
     float *hidden = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
     for (int layer = 0; layer < m->num_layers; layer++) {
@@ -1554,7 +1597,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 }
             }
         } else {
-            sample_logits(logits, m->vocab_size, temperature, top_p, top_k, &best);
+            sample_logits(logits, m->vocab_size, temperature, top_p, min_p, top_k, &best);
         }
         out_tokens[step] = best;
         free(logits);
@@ -1601,11 +1644,11 @@ static int read_exact(FILE *fp, unsigned char *buf, size_t len) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
+            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
             prog);
 }
 
-static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
+static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed) {
     printf("\x01\x01READY\x01\x01\n");
     printf("STAT 0 0.00 0.0 0.00\n");
     fflush(stdout);
@@ -1622,15 +1665,20 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
         int max_tokens_request = max_tokens;
         float temperature_request = temperature;
         float top_p_request = top_p;
+        float min_p_request = min_p;
         int top_k_request = top_k;
         unsigned int seed_request = seed;
         char *cursor = header + 9;
         int cache_slot_request = 0;
-        if (sscanf(cursor, "%zu %d %f %f %d %d %u", &payload_len, &max_tokens_request,
-                   &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
-                   &seed_request) != 7) {
+        int parsed = sscanf(cursor, "%zu %d %f %f %d %d %u %f", &payload_len, &max_tokens_request,
+                            &temperature_request, &top_p_request, &cache_slot_request, &top_k_request,
+                            &seed_request, &min_p_request);
+        if (parsed < 7) {
             fprintf(stderr, "[qwen35_moe] malformed prompt header: %s\n", header);
             continue;
+        }
+        if (parsed < 8) {
+            min_p_request = 0.0f;
         }
         if (payload_len > 0) {
             unsigned char *payload = (unsigned char *)qwen_malloc(payload_len + 1, "server payload buffer");
@@ -1654,7 +1702,7 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             }
             int n_tokens = parse_token_ids(prompt_text, tokens, max_tokens_request);
             if (n_tokens <= 0) n_tokens = 1;
-            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, top_k_request, seed, cache_slot_request);
+            run_model(model, tokens, n_tokens, max_tokens_request, out, temperature_request, top_p_request, min_p_request, top_k_request, seed, cache_slot_request);
             for (int i = 0; i < max_tokens_request; i++) {
                 if (i > 0) fputc(' ', stdout);
                 fprintf(stdout, "%d", out[i]);
@@ -1680,6 +1728,7 @@ int main(int argc, char **argv) {
     int threads = 0;
     float temperature = 0.0f;
     float top_p = 0.0f;
+    float min_p = 0.0f;
     int top_k = 0;
     unsigned int seed = 0;
     bool debug_enabled = false;
@@ -1702,6 +1751,8 @@ int main(int argc, char **argv) {
             top_k = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) {
             top_p = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) {
+            min_p = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--debug") || !strcmp(argv[i], "--verbose")) {
@@ -1730,7 +1781,7 @@ int main(int argc, char **argv) {
     qwen35_model model;
     init_model(&model, snap_dir);
     if (getenv("SERVE")) {
-        run_server(&model, steps, temperature, top_p, top_k, seed);
+        run_server(&model, steps, temperature, top_p, min_p, top_k, seed);
         free_model(&model);
         return 0;
     }
@@ -1738,7 +1789,7 @@ int main(int argc, char **argv) {
     int n_tokens = parse_token_ids(prompt ? prompt : "0", tokens, steps);
     if (n_tokens <= 0) n_tokens = 1;
     int *out = (int *)qwen_calloc((size_t)steps, sizeof(int));
-    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed, 0);
+    run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, min_p, top_k, seed, 0);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
     }
