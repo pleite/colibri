@@ -575,7 +575,8 @@ def render_chat_jinja(template_source, messages, enable_thinking=False,
         from jinja2 import Environment
         from jinja2.exceptions import TemplateError
     except ImportError as exc:  # pragma: no cover - exercised only without jinja2
-        raise APIError(500, "Jinja chat templates require the optional `jinja2` package.",
+        raise APIError(500, "Jinja chat templates require the optional `jinja2` package. "
+                       "Install it with: pip install jinja2",
                        None, "jinja2_missing", "server_error") from exc
     if not isinstance(messages, list):
         raise APIError(400, "`messages` must be an array.", "messages")

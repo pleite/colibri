@@ -333,7 +333,11 @@ def _select_backend(backend, accelerators):
 
 
 def _device_class(backend):
-    """Map a concrete backend name to its coarse device class (gpu/npu/cpu)."""
+    """Return the coarse device class for a backend name.
+
+    Returns one of ``"gpu"``, ``"npu"`` or ``"cpu"``. Examples:
+    ``"cuda"`` -> ``"gpu"``, ``"npu"`` -> ``"npu"``, ``"cpu"`` -> ``"cpu"``.
+    """
     if backend in ("cuda", "rocm", "vulkan"):
         return "gpu"
     if backend == "npu":
