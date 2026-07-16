@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "parallelism.h"
 
@@ -24,6 +25,22 @@ struct ColiCudaTensor {
     size_t weight_bytes;
     size_t scale_bytes;
 };
+
+static int host_memory_info(size_t *free_bytes, size_t *total_bytes) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    const size_t total = (size_t)pages * (size_t)page_size;
+    if (total_bytes) *total_bytes = total;
+#ifdef _SC_AVPHYS_PAGES
+    long avail_pages = sysconf(_SC_AVPHYS_PAGES);
+    if (avail_pages <= 0) avail_pages = pages;
+#else
+    long avail_pages = pages;
+#endif
+    if (free_bytes) *free_bytes = (size_t)avail_pages * (size_t)page_size;
+    return 1;
+}
 
 static int g_initialized = 0;
 static int g_devices[COLI_CUDA_MAX_DEVICES];
@@ -195,9 +212,7 @@ int coli_cuda_device_at(int index) {
 
 int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     (void)device;
-    if (free_bytes) *free_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
-    if (total_bytes) *total_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
-    return 1;
+    return host_memory_info(free_bytes, total_bytes);
 }
 
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {

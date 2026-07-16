@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "parallelism.h"
 
@@ -44,7 +45,21 @@ struct ColiCudaTensor {
     uint64_t cache_hash;
 };
 
-static const size_t k_stub_memory_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+static int host_memory_info(size_t *free_bytes, size_t *total_bytes) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    const size_t total = (size_t)pages * (size_t)page_size;
+    if (total_bytes) *total_bytes = total;
+#ifdef _SC_AVPHYS_PAGES
+    long avail_pages = sysconf(_SC_AVPHYS_PAGES);
+    if (avail_pages <= 0) avail_pages = pages;
+#else
+    long avail_pages = pages;
+#endif
+    if (free_bytes) *free_bytes = (size_t)avail_pages * (size_t)page_size;
+    return 1;
+}
 
 static int g_initialized = 0;
 static int g_devices[COLI_RUNTIME_MAX_DEVICES];
@@ -543,9 +558,7 @@ int coli_runtime_device_at(int index) {
 
 int coli_runtime_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     (void)device;
-    if (free_bytes) *free_bytes = k_stub_memory_bytes;
-    if (total_bytes) *total_bytes = k_stub_memory_bytes;
-    return 1;
+    return host_memory_info(free_bytes, total_bytes);
 }
 
 void coli_runtime_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
@@ -621,8 +634,10 @@ int coli_runtime_matmul(ColiCudaTensor **tensor,
     }
 
     int lane_ids[4] = {0, 0, 0, 0};
-    int lane_count = 1;
-    lane_ids[0] = 0;
+    int lane_count = 0;
+    if (g_backend_mask & 1) {
+        lane_ids[lane_count++] = 0;
+    }
     if (g_backend_mask & 2) {
         lane_ids[lane_count++] = 1;
     }
@@ -632,7 +647,10 @@ int coli_runtime_matmul(ColiCudaTensor **tensor,
     if (g_backend_mask & 8) {
         lane_ids[lane_count++] = 3;
     }
-    if (lane_count <= 0) lane_count = 1;
+    if (lane_count <= 0) {
+        lane_ids[0] = 0;
+        lane_count = 1;
+    }
 
     const int base = O / lane_count;
     const int extra = O % lane_count;
