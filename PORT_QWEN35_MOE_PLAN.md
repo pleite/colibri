@@ -159,33 +159,49 @@ c/qwen35_moe.c:
 - MTP head: int8 (required for speculation acceptance)
 - Norms/router: f32 (high precision)
 
-### Q2.2 — Expert Caching
+### Q2.2 — Expert Streaming & Caching
 
 ```
 c/qwen35_moe.c:
-  - LRU cache for experts (same as glm.c)
-  - per-layer slot management
-  - RAM budget planning (resource_plan.py)
+  - define an expert storage abstraction (resident, cached, pinned, streaming)
+  - implement per-layer expert cache slots with LRU/heat-based eviction
+  - load expert weights on demand from safetensors / quantized expert containers
+  - support quantized expert payloads (int4 weights + row scales, int8 fallback)
+  - batch unique experts per layer and step, then run them through the cache/stream path
+  - add hot-store / pinning for frequently reused experts
+  - add hit/miss accounting, residency stats, and cache debug telemetry
+  - add RAM/VRAM budget planning for expert residency (resource_plan.py)
 ```
+
+**Implementation tasks:**
+- Model the expert lifecycle explicitly: resident-in-RAM, cached-in-RAM, pinned-hot, streamed-from-storage, and uploaded-to-backend.
+- Split expert access into three phases: route selection, cache lookup, and on-miss load/activate.
+- Keep the dense path resident and make the expert path the only part that uses streaming/cache policy.
+- Add prefetch and overlap logic so expert loads can happen while the current token/step continues computing.
+- Add a correctness guard so cache hits and stream misses preserve bit-exact output compared with the dense reference path.
 
 **Key differences from glm.c:**
 - 512 experts total (not 21,504)
-- All experts fit in RAM (no disk streaming)
-- Simpler cache management
+- The first implementation can stay RAM-backed and simpler than GLM, but it should still expose the same cache/streaming seams for later disk-backed scaling.
+- Expert streaming should be implemented as a policy layer, not as a rewrite of the full model stack.
 
-### Q2.3 — Parallelism
+### Q2.3 — Parallelism & Multi-Backend Expert Dispatch
 
 ```
 c/qwen35_moe.c:
   - OpenMP parallel matmul (same as glm.c)
-  - GPU backend (ROCm/HIP, Vulkan)
-  - CPU thread pooling
+  - dispatch expert matmuls through the existing backend abstraction (ROCm/HIP, Vulkan, NPU, CUDA)
+  - use CPU for routing/orchestration while offloading eligible matmuls to accelerators
+  - allow multiple backends/devices to be used in parallel when available
+  - keep a CPU fallback path for every expert matmul
 ```
 
 **Parallelism strategy:**
 - OpenMP for matmul (32 cores on Strix Halo)
-- GPU for attention and MoE layers (ROCm/Vulkan)
-- CPU for routing and orchestration
+- Use the existing thin backend layer to route resident and cached experts to CPU, ROCm, Vulkan, NPU, or CUDA as available.
+- For expert-heavy decode/prefill, fan out independent experts across available backends/devices rather than forcing a single backend.
+- Use all backends at once as needed: CPU handles orchestration and small work, accelerators handle large expert matmuls, and the scheduler can overlap cache loads with backend execution.
+- Preserve a graceful fallback path so any backend can be disabled without breaking correctness.
 
 ---
 
