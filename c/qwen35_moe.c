@@ -215,6 +215,10 @@ static bool model_debug_enabled(void) {
     return enabled;
 }
 
+/* Scale tensors are float32 and are expected to match exactly for duplicated rows;
+ * this small epsilon only absorbs float parsing noise. */
+static const float SCALE_LAYOUT_EPSILON = 1e-6f;
+
 static void model_debug(const char *fmt, ...) {
     if (!model_debug_enabled()) return;
     va_list ap;
@@ -289,7 +293,7 @@ static st_tensor *find_tensor(qwen35_model *m, const char *name) {
 }
 
 static st_tensor *find_scale_tensor(qwen35_model *m, const char *name) {
-    static const char *const suffixes[] = {".qs", ".scale", ".scales", ".weight_scale"};
+    static const char *const suffixes[] = {".weight_scale", ".scale", ".scales", ".qs"};
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
         size_t total = strlen(name) + strlen(suffixes[i]) + 1;
         char *candidate = (char *)malloc(total);
@@ -378,6 +382,74 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             free(raw);
             free(scale_vals);
             return buf;
+        }
+        /* Ornith int8 layout: payload/scale rows are doubled, while the logical tensor
+         * has half as many rows (packed bytes are exactly 2x logical elements). */
+        bool has_ornith_doubled_int8_payload = (packed_bytes % 2) == 0 && packed_bytes / 2 == nelems && out_dim > 1 && (out_dim % 2) == 0;
+        if (has_ornith_doubled_int8_payload) {
+            size_t logical_out_dim = out_dim / 2;
+            if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
+                size_t logical_in_dim = nelems / logical_out_dim;
+                if (packed_bytes == out_dim * logical_in_dim) {
+                    uint8_t *raw = (uint8_t *)malloc(packed_bytes);
+                    if (!raw) fail("out of memory");
+                    st_read_raw(&m->shards, t->name, raw, 0);
+                    float *scale_vals = (float *)calloc(out_dim, sizeof(float));
+                    if (!scale_vals) fail("out of memory");
+                    if (scale) {
+                        st_read_f32(&m->shards, scale->name, scale_vals, 0);
+                    } else {
+                        for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+                    }
+                    bool interleaved_rows;
+                    if (scale) {
+                        size_t split_matches = 0;
+                        size_t interleaved_matches = 0;
+                        for (size_t row = 0; row < logical_out_dim; row++) {
+                            size_t split_left = row;
+                            size_t split_right = row + logical_out_dim;
+                            size_t interleaved_left = row * 2;
+                            size_t interleaved_right = interleaved_left + 1;
+                            if (split_right >= out_dim || interleaved_right >= out_dim) {
+                                free(raw);
+                                free(scale_vals);
+                                fail("tensor %s has invalid expanded scale layout (row=%zu out=%zu)", name, row, out_dim);
+                            }
+                            if (fabsf(scale_vals[split_left] - scale_vals[split_right]) < SCALE_LAYOUT_EPSILON) split_matches++;
+                            if (fabsf(scale_vals[interleaved_left] - scale_vals[interleaved_right]) < SCALE_LAYOUT_EPSILON) interleaved_matches++;
+                        }
+                        interleaved_rows = interleaved_matches > split_matches; /* ties intentionally fall back to consecutive layout */
+                    } else {
+                        interleaved_rows = false; /* without scales, prefer consecutive first-half rows (most conservative) */
+                    }
+                    for (size_t row = 0; row < logical_out_dim; row++) {
+                        size_t src_row = interleaved_rows ? (row * 2) : row;
+                        size_t scale_row = interleaved_rows ? (row * 2) : row;
+                        if (src_row >= out_dim || scale_row >= out_dim) {
+                            free(raw);
+                            free(scale_vals);
+                            fail("tensor %s has invalid expanded row mapping (src=%zu scale=%zu out=%zu)", name, src_row, scale_row, out_dim);
+                        }
+                        for (size_t col = 0; col < logical_in_dim; col++) {
+                            size_t src_offset = src_row * logical_in_dim + col;
+                            if (src_offset >= packed_bytes) {
+                                free(raw);
+                                free(scale_vals);
+                                fail("tensor %s has invalid expanded payload offset (%zu >= %zu)", name, src_offset, packed_bytes);
+                            }
+                            int8_t value = (int8_t)raw[src_offset];
+                            buf[row * logical_in_dim + col] = (float)value * scale_vals[scale_row];
+                        }
+                    }
+                    free(raw);
+                    free(scale_vals);
+                    model_debug(
+                        "load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout",
+                        name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "consecutive"
+                    );
+                    return buf;
+                }
+            }
         }
         fail("tensor %s has unsupported packed size %" PRId64 " for %zu elements", name, t->nbytes, nelems);
     }
