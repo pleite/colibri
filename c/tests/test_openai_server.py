@@ -6,7 +6,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
-                           generation_options, read_engine_turn, render_chat, serve)
+                           generation_options, read_engine_turn, render_chat,
+                           render_chat_jinja, load_jinja_chat_template, serve)
 
 
 class FakeEngine:
@@ -58,6 +59,28 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("Hi", prompt)
         self.assertIn("[image]", prompt)
         self.assertIn("[audio]", prompt)
+
+    def test_jinja_chat_template_renders_messages_and_generation_prompt(self):
+        template = (
+            "{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}"
+            "<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        )
+        prompt = render_chat_jinja(template, [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Hi"},
+        ])
+        self.assertIn("<|im_start|>system\nYou are Hermes.<|im_end|>", prompt)
+        self.assertIn("<|im_start|>user\nHi<|im_end|>", prompt)
+        self.assertTrue(prompt.endswith("<|im_start|>assistant\n"))
+
+    def test_jinja_chat_template_reports_render_errors(self):
+        with self.assertRaises(APIError) as ctx:
+            render_chat_jinja("{% for m in messages %}{{ m.missing() }}{% endfor %}",
+                              [{"role": "user", "content": "Hi"}])
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_load_jinja_chat_template_missing_returns_none(self):
+        self.assertIsNone(load_jinja_chat_template("/nonexistent-model-dir"))
 
     def test_renders_thinking_prefix(self):
         self.assertEqual(
