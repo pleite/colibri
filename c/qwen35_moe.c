@@ -12,6 +12,9 @@
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -175,14 +178,22 @@ static void fail(const char *fmt, ...) {
     exit(1);
 }
 
+static void *qwen_malloc_impl(size_t size, const char *what);
+static void *qwen_calloc_impl(size_t nmemb, size_t size, const char *what);
+static void *qwen_realloc_impl(void *ptr, size_t size, const char *what);
+#define qwen_malloc(size, ...) qwen_malloc_impl((size), "allocation")
+#define qwen_calloc(nmemb, size, ...) qwen_calloc_impl((nmemb), (size), "allocation")
+#define qwen_realloc(ptr, size, ...) qwen_realloc_impl((ptr), (size), "allocation")
+static char *qwen_strdup(const char *s);
+static void model_debug(const char *fmt, ...);
+
 static char *read_text_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) fail("cannot open %s", path);
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
     rewind(fp);
-    char *buf = (char *)malloc((size_t)size + 1);
-    if (!buf) fail("out of memory");
+    char *buf = (char *)qwen_malloc((size_t)size + 1, "read_text_file");
     size_t n = fread(buf, 1, (size_t)size, fp);
     fclose(fp);
     buf[n] = '\0';
@@ -205,14 +216,96 @@ static bool parse_bool_env(const char *name) {
     return false;
 }
 
+static bool g_model_debug_enabled = false;
+static bool g_model_debug_initialized = false;
+static size_t g_ram_limit_bytes = 0;
+static size_t g_ram_peak_bytes = 0;
+
+static void set_model_debug_enabled(bool enabled) {
+    g_model_debug_enabled = enabled;
+    g_model_debug_initialized = true;
+}
+
 static bool model_debug_enabled(void) {
-    static bool initialized = false;
-    static bool enabled = false;
-    if (!initialized) {
-        enabled = parse_bool_env("COLI_QWEN_DEBUG");
-        initialized = true;
+    if (!g_model_debug_initialized) {
+        set_model_debug_enabled(parse_bool_env("COLI_QWEN_DEBUG"));
     }
-    return enabled;
+    return g_model_debug_enabled;
+}
+
+static bool parse_ram_limit_mb(const char *value, size_t *out_bytes) {
+    if (!value || !*value) return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (!end || *end != '\0' || errno == ERANGE) return false;
+    if (parsed > (unsigned long long)(SIZE_MAX / (1024ULL * 1024ULL))) return false;
+    *out_bytes = (size_t)(parsed * 1024ULL * 1024ULL);
+    return true;
+}
+
+static void configure_ram_limit(const char *value) {
+    if (!value || !*value) {
+        const char *env_value = getenv("COLI_QWEN_RAM_LIMIT_MB");
+        value = env_value;
+    }
+    if (!value || !*value) return;
+    size_t limit_bytes = 0;
+    if (!parse_ram_limit_mb(value, &limit_bytes)) fail("invalid RAM limit: %s", value);
+    g_ram_limit_bytes = limit_bytes;
+    model_debug("RAM limit enabled: %zu bytes", g_ram_limit_bytes);
+}
+
+static bool reserve_ram(size_t bytes, const char *what) {
+    if (g_ram_limit_bytes == 0) return true;
+    if (g_ram_peak_bytes + bytes > g_ram_limit_bytes) {
+        fprintf(stderr, "[qwen35_moe] RAM limit exceeded while allocating %s (%zu bytes requested, %zu bytes used, %zu bytes limit)\n",
+                what, bytes, g_ram_peak_bytes, g_ram_limit_bytes);
+        return false;
+    }
+    g_ram_peak_bytes += bytes;
+    return true;
+}
+
+static void *qwen_malloc_impl(size_t size, const char *what) {
+    if (!reserve_ram(size, what)) fail("memory limit exceeded while allocating %s", what);
+    void *ptr = malloc(size);
+    if (!ptr) fail("out of memory");
+    return ptr;
+}
+
+static void *qwen_calloc_impl(size_t nmemb, size_t size, const char *what) {
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) fail("allocation size overflow");
+    size_t total = nmemb * size;
+    if (!reserve_ram(total, what)) fail("memory limit exceeded while allocating %s", what);
+    void *ptr = calloc(nmemb, size);
+    if (!ptr) fail("out of memory");
+    return ptr;
+}
+
+static size_t qwen_malloc_usable_size(void *ptr) {
+#if defined(__GLIBC__)
+    return malloc_usable_size(ptr);
+#else
+    (void)ptr;
+    return 0;
+#endif
+}
+
+static void *qwen_realloc_impl(void *ptr, size_t size, const char *what) {
+    size_t old_size = ptr ? qwen_malloc_usable_size(ptr) : 0;
+    size_t delta = size > old_size ? size - old_size : 0;
+    if (delta > 0 && !reserve_ram(delta, what)) fail("memory limit exceeded while reallocating %s", what);
+    void *new_ptr = realloc(ptr, size);
+    if (!new_ptr && size != 0) fail("out of memory");
+    return new_ptr;
+}
+
+static char *qwen_strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *copy = (char *)qwen_malloc(len, "string copy");
+    memcpy(copy, s, len);
+    return copy;
 }
 
 /* Scale tensors are float32 and are expected to match exactly for duplicated rows;
@@ -255,8 +348,7 @@ static bool parse_bool_field(jval *obj, const char *key) {
 
 static char *join_path(const char *dir, const char *name) {
     size_t n = strlen(dir) + 1 + strlen(name) + 1;
-    char *out = (char *)malloc(n);
-    if (!out) fail("out of memory");
+    char *out = (char *)qwen_malloc(n, "join_path");
     snprintf(out, n, "%s/%s", dir, name);
     return out;
 }
@@ -281,8 +373,7 @@ static st_tensor *find_tensor(qwen35_model *m, const char *name) {
         if (strncmp(name, from, from_len) == 0) {
             size_t tail_len = strlen(name + from_len);
             size_t total = strlen(to) + tail_len + 1;
-            char *candidate = (char *)malloc(total);
-            if (!candidate) fail("out of memory");
+            char *candidate = (char *)qwen_malloc(total, "tensor alias");
             snprintf(candidate, total, "%s%s", to, name + from_len);
             t = st_find(&m->shards, candidate);
             free(candidate);
@@ -296,8 +387,7 @@ static st_tensor *find_scale_tensor(qwen35_model *m, const char *name) {
     static const char *const suffixes[] = {".weight_scale", ".scale", ".scales", ".qs"};
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
         size_t total = strlen(name) + strlen(suffixes[i]) + 1;
-        char *candidate = (char *)malloc(total);
-        if (!candidate) fail("out of memory");
+        char *candidate = (char *)qwen_malloc(total, "scale tensor alias");
         snprintf(candidate, total, "%s%s", name, suffixes[i]);
         st_tensor *t = find_tensor(m, candidate);
         free(candidate);
@@ -312,8 +402,7 @@ static int tensor_exists(qwen35_model *m, const char *name) {
 
 static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) {
     model_debug("load_tensor_f32: tensor=%s expected_nelems=%zu", name, nelems);
-    float *buf = (float *)calloc(nelems, sizeof(float));
-    if (!buf) fail("out of memory");
+    float *buf = (float *)qwen_calloc(nelems, sizeof(float), "tensor buffer");
     st_tensor *t = find_tensor(m, name);
     if (!t) {
         model_debug("load_tensor_f32: tensor=%s not found; returning zeroed buffer", name);
@@ -339,11 +428,9 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
         size_t bytes_per_row = (in_dim + 1) / 2;
         size_t packed_bytes = (size_t)t->nbytes;
         if (packed_bytes == nelems) {
-            uint8_t *raw = (uint8_t *)malloc(packed_bytes);
-            if (!raw) fail("out of memory");
+            uint8_t *raw = (uint8_t *)qwen_malloc(packed_bytes, "quantized payload");
             st_read_raw(&m->shards, t->name, raw, 0);
-            float *scale_vals = (float *)calloc(out_dim, sizeof(float));
-            if (!scale_vals) fail("out of memory");
+            float *scale_vals = (float *)qwen_calloc(out_dim, sizeof(float), "quantized scales");
             if (scale) {
                 st_read_f32(&m->shards, scale->name, scale_vals, 0);
             } else {
@@ -360,11 +447,9 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             return buf;
         }
         if (packed_bytes == out_dim * bytes_per_row) {
-            uint8_t *raw = (uint8_t *)malloc(packed_bytes);
-            if (!raw) fail("out of memory");
+            uint8_t *raw = (uint8_t *)qwen_malloc(packed_bytes, "quantized payload");
             st_read_raw(&m->shards, t->name, raw, 0);
-            float *scale_vals = (float *)calloc(out_dim, sizeof(float));
-            if (!scale_vals) fail("out of memory");
+            float *scale_vals = (float *)qwen_calloc(out_dim, sizeof(float), "quantized scales");
             if (scale) {
                 st_read_f32(&m->shards, scale->name, scale_vals, 0);
             } else {
@@ -391,11 +476,9 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
             if (logical_out_dim > 0 && nelems % logical_out_dim == 0) {
                 size_t logical_in_dim = nelems / logical_out_dim;
                 if (packed_bytes == out_dim * logical_in_dim) {
-                    uint8_t *raw = (uint8_t *)malloc(packed_bytes);
-                    if (!raw) fail("out of memory");
+                    uint8_t *raw = (uint8_t *)qwen_malloc(packed_bytes, "quantized payload");
                     st_read_raw(&m->shards, t->name, raw, 0);
-                    float *scale_vals = (float *)calloc(out_dim, sizeof(float));
-                    if (!scale_vals) fail("out of memory");
+                    float *scale_vals = (float *)qwen_calloc(out_dim, sizeof(float), "quantized scales");
                     if (scale) {
                         st_read_f32(&m->shards, scale->name, scale_vals, 0);
                     } else {
@@ -471,24 +554,9 @@ static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out,
     const size_t kv_elems = (size_t)kv_out * (size_t)hidden_size;
     const size_t packed_elems = q_elems + 2 * kv_elems;
     float *packed = load_tensor_f32(m, name, packed_elems);
-    float *q_buf = malloc(q_elems * sizeof(float));
-    if (!q_buf) {
-        free(packed);
-        fail("out of memory allocating q_proj buffer");
-    }
-    float *k_buf = malloc(kv_elems * sizeof(float));
-    if (!k_buf) {
-        free(q_buf);
-        free(packed);
-        fail("out of memory allocating k_proj buffer");
-    }
-    float *v_buf = malloc(kv_elems * sizeof(float));
-    if (!v_buf) {
-        free(q_buf);
-        free(k_buf);
-        free(packed);
-        fail("out of memory allocating v_proj buffer");
-    }
+    float *q_buf = qwen_malloc(q_elems * sizeof(float), "packed qkv q_proj");
+    float *k_buf = qwen_malloc(kv_elems * sizeof(float), "packed qkv k_proj");
+    float *v_buf = qwen_malloc(kv_elems * sizeof(float), "packed qkv v_proj");
     memcpy(q_buf, packed, q_elems * sizeof(float));
     memcpy(k_buf, packed + q_elems, kv_elems * sizeof(float));
     memcpy(v_buf, packed + q_elems + kv_elems, kv_elems * sizeof(float));
@@ -501,29 +569,26 @@ static bool load_packed_qkv_tensor(qwen35_model *m, const char *name, int q_out,
 
 static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermediate_size, int shared_expert_intermediate_size, int num_experts, int num_attention_heads, int num_kv_heads, int head_dim) {
     memset(layer, 0, sizeof(*layer));
-    layer->in_ln = (float *)calloc((size_t)hidden_size, sizeof(float));
-    layer->post_ln = (float *)calloc((size_t)hidden_size, sizeof(float));
-    if (!layer->in_ln || !layer->post_ln) fail("out of memory");
+    layer->in_ln = (float *)qwen_calloc((size_t)hidden_size, sizeof(float), "layer norm");
+    layer->post_ln = (float *)qwen_calloc((size_t)hidden_size, sizeof(float), "layer norm");
     for (int i = 0; i < hidden_size; i++) {
         layer->in_ln[i] = 1.0f;
         layer->post_ln[i] = 1.0f;
     }
-    layer->la_state = (float *)calloc((size_t)hidden_size, sizeof(float));
-    if (!layer->la_state) fail("out of memory");
+    layer->la_state = (float *)qwen_calloc((size_t)hidden_size, sizeof(float), "linear attention state");
     const int q_out = num_attention_heads * head_dim;
     const int kv_out = num_kv_heads * head_dim;
-    layer->q_proj = (float *)calloc((size_t)q_out * (size_t)hidden_size, sizeof(float));
-    layer->k_proj = (float *)calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float));
-    layer->v_proj = (float *)calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float));
-    layer->o_proj = (float *)calloc((size_t)hidden_size * (size_t)q_out, sizeof(float));
-    layer->mlp_gate_proj = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
-    layer->mlp_up_proj = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
-    layer->mlp_down_proj = (float *)calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float));
-    layer->router = (float *)calloc((size_t)num_experts * (size_t)hidden_size, sizeof(float));
-    layer->sh_gate = (float *)calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float));
-    layer->sh_up = (float *)calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float));
-    layer->sh_down = (float *)calloc((size_t)hidden_size * (size_t)shared_expert_intermediate_size, sizeof(float));
-    if (!layer->q_proj || !layer->k_proj || !layer->v_proj || !layer->o_proj || !layer->mlp_gate_proj || !layer->mlp_up_proj || !layer->mlp_down_proj || !layer->router || !layer->sh_gate || !layer->sh_up || !layer->sh_down) fail("out of memory");
+    layer->q_proj = (float *)qwen_calloc((size_t)q_out * (size_t)hidden_size, sizeof(float), "q_proj defaults");
+    layer->k_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float), "k_proj defaults");
+    layer->v_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)hidden_size, sizeof(float), "v_proj defaults");
+    layer->o_proj = (float *)qwen_calloc((size_t)hidden_size * (size_t)q_out, sizeof(float), "o_proj defaults");
+    layer->mlp_gate_proj = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "mlp gate defaults");
+    layer->mlp_up_proj = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "mlp up defaults");
+    layer->mlp_down_proj = (float *)qwen_calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float), "mlp down defaults");
+    layer->router = (float *)qwen_calloc((size_t)num_experts * (size_t)hidden_size, sizeof(float), "router defaults");
+    layer->sh_gate = (float *)qwen_calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float), "shared gate defaults");
+    layer->sh_up = (float *)qwen_calloc((size_t)shared_expert_intermediate_size * (size_t)hidden_size, sizeof(float), "shared up defaults");
+    layer->sh_down = (float *)qwen_calloc((size_t)hidden_size * (size_t)shared_expert_intermediate_size, sizeof(float), "shared down defaults");
     for (int i = 0; i < q_out; i++) {
         for (int j = 0; j < hidden_size; j++) {
             if (i == j) layer->q_proj[i * hidden_size + j] = 1.0f;
@@ -562,21 +627,19 @@ static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermed
             if (i == j) layer->sh_down[i * shared_expert_intermediate_size + j] = 0.2f;
         }
     }
-    layer->expert_gate_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
-    layer->expert_up_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
-    layer->expert_down_proj = (float **)calloc((size_t)num_experts, sizeof(float *));
-    if (!layer->expert_gate_proj || !layer->expert_up_proj || !layer->expert_down_proj) fail("out of memory");
+    layer->expert_gate_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
+    layer->expert_up_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
+    layer->expert_down_proj = (float **)qwen_calloc((size_t)num_experts, sizeof(float *), "expert table");
     for (int expert = 0; expert < num_experts; expert++) {
-        layer->expert_gate_proj[expert] = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
-        layer->expert_up_proj[expert] = (float *)calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float));
-        layer->expert_down_proj[expert] = (float *)calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float));
-        if (!layer->expert_gate_proj[expert] || !layer->expert_up_proj[expert] || !layer->expert_down_proj[expert]) fail("out of memory");
+        layer->expert_gate_proj[expert] = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "expert gate defaults");
+        layer->expert_up_proj[expert] = (float *)qwen_calloc((size_t)moe_intermediate_size * (size_t)hidden_size, sizeof(float), "expert up defaults");
+        layer->expert_down_proj[expert] = (float *)qwen_calloc((size_t)hidden_size * (size_t)moe_intermediate_size, sizeof(float), "expert down defaults");
     }
 }
 
 static void init_model(qwen35_model *m, const char *snap_dir) {
     memset(m, 0, sizeof(*m));
-    m->snap_dir = strdup(snap_dir);
+    m->snap_dir = qwen_strdup(snap_dir);
     char *config_path = join_path(snap_dir, "config.json");
     char *json_text = read_text_file(config_path);
     free(config_path);
@@ -612,17 +675,15 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         long parsed = strtol(kv_slots_env, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= MAX_KV_SLOTS) m->kv_slots = (int)parsed;
     }
-    m->kv_cache_k_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_k_slots));
-    m->kv_cache_v_slots = (float ***)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_v_slots));
-    m->kv_cache_lens = (int **)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_lens));
-    m->kv_cache_caps = (int **)calloc((size_t)m->num_layers, sizeof(*m->kv_cache_caps));
-    if (!m->kv_cache_k_slots || !m->kv_cache_v_slots || !m->kv_cache_lens || !m->kv_cache_caps) fail("out of memory");
+    m->kv_cache_k_slots = (float ***)qwen_calloc((size_t)m->num_layers, sizeof(*m->kv_cache_k_slots), "kv cache table");
+    m->kv_cache_v_slots = (float ***)qwen_calloc((size_t)m->num_layers, sizeof(*m->kv_cache_v_slots), "kv cache table");
+    m->kv_cache_lens = (int **)qwen_calloc((size_t)m->num_layers, sizeof(*m->kv_cache_lens), "kv cache table");
+    m->kv_cache_caps = (int **)qwen_calloc((size_t)m->num_layers, sizeof(*m->kv_cache_caps), "kv cache table");
     for (int layer = 0; layer < m->num_layers; layer++) {
-        m->kv_cache_k_slots[layer] = (float **)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_k_slots[layer]));
-        m->kv_cache_v_slots[layer] = (float **)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_v_slots[layer]));
-        m->kv_cache_lens[layer] = (int *)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_lens[layer]));
-        m->kv_cache_caps[layer] = (int *)calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_caps[layer]));
-        if (!m->kv_cache_k_slots[layer] || !m->kv_cache_v_slots[layer] || !m->kv_cache_lens[layer] || !m->kv_cache_caps[layer]) fail("out of memory");
+        m->kv_cache_k_slots[layer] = (float **)qwen_calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_k_slots[layer]), "kv cache slot table");
+        m->kv_cache_v_slots[layer] = (float **)qwen_calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_v_slots[layer]), "kv cache slot table");
+        m->kv_cache_lens[layer] = (int *)qwen_calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_lens[layer]), "kv cache lens");
+        m->kv_cache_caps[layer] = (int *)qwen_calloc((size_t)m->kv_slots, sizeof(*m->kv_cache_caps[layer]), "kv cache caps");
     }
     model_debug("init_model: parsed geometry vocab=%d hidden=%d layers=%d experts=%d experts_per_tok=%d moe_intermediate=%d shared_expert_intermediate=%d heads=%d kv_heads=%d head_dim=%d", m->vocab_size, m->hidden_size, m->num_layers, m->num_experts, m->experts_per_tok, m->moe_intermediate_size, m->shared_expert_intermediate_size, m->num_attention_heads, m->num_kv_heads, m->head_dim);
     if (m->vocab_size <= 0 || m->hidden_size <= 0 || m->num_layers <= 0) {
@@ -640,21 +701,18 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
     m->embed = load_tensor_f32(m, "model.embed_tokens.weight", embed_nelems);
     m->final_norm = load_optional_tensor_f32(m, "model.norm.weight", (size_t)m->hidden_size);
     if (!m->final_norm) {
-        m->final_norm = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-        if (!m->final_norm) fail("out of memory");
+        m->final_norm = (float *)qwen_calloc((size_t)m->hidden_size, sizeof(float), "final norm");
         for (int i = 0; i < m->hidden_size; i++) m->final_norm[i] = 1.0f;
     }
 
     m->lm_head = load_optional_tensor_f32(m, "lm_head.weight", (size_t)m->vocab_size * (size_t)m->hidden_size);
     if (!m->lm_head) {
-        m->lm_head = (float *)malloc((size_t)m->vocab_size * (size_t)m->hidden_size * sizeof(float));
-        if (!m->lm_head) fail("out of memory");
+        m->lm_head = (float *)qwen_malloc((size_t)m->vocab_size * (size_t)m->hidden_size * sizeof(float), "lm_head");
         memcpy(m->lm_head, m->embed, (size_t)m->vocab_size * (size_t)m->hidden_size * sizeof(float));
     }
 
-    m->layers = (QLayer *)calloc((size_t)m->num_layers, sizeof(*m->layers));
-    m->layer_types = (int *)calloc((size_t)m->num_layers, sizeof(*m->layer_types));
-    if (!m->layers || !m->layer_types) fail("out of memory");
+    m->layers = (QLayer *)qwen_calloc((size_t)m->num_layers, sizeof(*m->layers), "layer table");
+    m->layer_types = (int *)qwen_calloc((size_t)m->num_layers, sizeof(*m->layer_types), "layer type table");
 
     jval *layer_types = json_get(text_cfg, "layer_types");
     if (layer_types && layer_types->t == J_ARR && layer_types->len > 0) {
@@ -679,30 +737,26 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
         cur->in_ln = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
         if (!cur->in_ln) {
-            cur->in_ln = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-            if (!cur->in_ln) fail("out of memory");
+            cur->in_ln = (float *)qwen_calloc((size_t)m->hidden_size, sizeof(float), "layer norm");
             for (int i = 0; i < m->hidden_size; i++) cur->in_ln[i] = 1.0f;
         }
         snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
         cur->post_ln = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
         if (!cur->post_ln) {
-            cur->post_ln = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-            if (!cur->post_ln) fail("out of memory");
+            cur->post_ln = (float *)qwen_calloc((size_t)m->hidden_size, sizeof(float), "layer norm");
             for (int i = 0; i < m->hidden_size; i++) cur->post_ln[i] = 1.0f;
         }
         if (cur->is_full_attn) {
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer);
             cur->q_norm = load_optional_tensor_f32(m, name, (size_t)m->head_dim);
             if (!cur->q_norm) {
-                cur->q_norm = (float *)calloc((size_t)m->head_dim, sizeof(float));
-                if (!cur->q_norm) fail("out of memory");
+                cur->q_norm = (float *)qwen_calloc((size_t)m->head_dim, sizeof(float), "q_norm");
                 for (int i = 0; i < m->head_dim; i++) cur->q_norm[i] = 1.0f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer);
             cur->k_norm = load_optional_tensor_f32(m, name, (size_t)m->head_dim);
             if (!cur->k_norm) {
-                cur->k_norm = (float *)calloc((size_t)m->head_dim, sizeof(float));
-                if (!cur->k_norm) fail("out of memory");
+                cur->k_norm = (float *)qwen_calloc((size_t)m->head_dim, sizeof(float), "k_norm");
                 for (int i = 0; i < m->head_dim; i++) cur->k_norm[i] = 1.0f;
             }
             const int q_out = m->num_attention_heads * m->head_dim;
@@ -712,30 +766,26 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
                 cur->q_proj = load_optional_tensor_f32(m, name, (size_t)q_out * (size_t)m->hidden_size);
                 if (!cur->q_proj) {
-                    cur->q_proj = (float *)calloc((size_t)q_out * (size_t)m->hidden_size, sizeof(float));
-                    if (!cur->q_proj) fail("out of memory");
+                    cur->q_proj = (float *)qwen_calloc((size_t)q_out * (size_t)m->hidden_size, sizeof(float), "q_proj defaults");
                     for (int i = 0; i < q_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->q_proj[i * m->hidden_size + j] = 1.0f;
                 }
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
                 cur->k_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
                 if (!cur->k_proj) {
-                    cur->k_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
-                    if (!cur->k_proj) fail("out of memory");
+                    cur->k_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float), "k_proj defaults");
                     for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->k_proj[i * m->hidden_size + j] = 0.25f;
                 }
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
                 cur->v_proj = load_optional_tensor_f32(m, name, (size_t)kv_out * (size_t)m->hidden_size);
                 if (!cur->v_proj) {
-                    cur->v_proj = (float *)calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float));
-                    if (!cur->v_proj) fail("out of memory");
+                    cur->v_proj = (float *)qwen_calloc((size_t)kv_out * (size_t)m->hidden_size, sizeof(float), "v_proj defaults");
                     for (int i = 0; i < kv_out; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->v_proj[i * m->hidden_size + j] = 0.125f;
                 }
             }
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
             cur->o_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)q_out);
             if (!cur->o_proj) {
-                cur->o_proj = (float *)calloc((size_t)m->hidden_size * (size_t)q_out, sizeof(float));
-                if (!cur->o_proj) fail("out of memory");
+                cur->o_proj = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)q_out, sizeof(float), "o_proj defaults");
                 for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < q_out; j++) if (i == j) cur->o_proj[i * q_out + j] = 0.5f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer);
@@ -744,135 +794,115 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
             cur->mlp_gate_proj = load_optional_tensor_f32(m, name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
             if (!cur->mlp_gate_proj) {
-                cur->mlp_gate_proj = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->mlp_gate_proj) fail("out of memory");
+                cur->mlp_gate_proj = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "mlp gate defaults");
                 for (int i = 0; i < m->moe_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->mlp_gate_proj[i * m->hidden_size + j] = 0.5f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
             cur->mlp_up_proj = load_optional_tensor_f32(m, name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
             if (!cur->mlp_up_proj) {
-                cur->mlp_up_proj = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->mlp_up_proj) fail("out of memory");
+                cur->mlp_up_proj = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "mlp up defaults");
                 for (int i = 0; i < m->moe_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->mlp_up_proj[i * m->hidden_size + j] = 0.25f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
             cur->mlp_down_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
             if (!cur->mlp_down_proj) {
-                cur->mlp_down_proj = (float *)calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float));
-                if (!cur->mlp_down_proj) fail("out of memory");
+                cur->mlp_down_proj = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "mlp down defaults");
                 for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->moe_intermediate_size; j++) if (i == j) cur->mlp_down_proj[i * m->moe_intermediate_size + j] = 0.75f;
             }
-            cur->expert_gate_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
-            cur->expert_up_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
-            cur->expert_down_proj = (float **)calloc((size_t)m->num_experts, sizeof(float *));
-            if (!cur->expert_gate_proj || !cur->expert_up_proj || !cur->expert_down_proj) fail("out of memory");
+            cur->expert_gate_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
+            cur->expert_up_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
+            cur->expert_down_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             for (int expert = 0; expert < m->num_experts; expert++) {
                 char expert_name[1024];
                 snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert);
                 cur->expert_gate_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
                 if (!cur->expert_gate_proj[expert]) {
-                    cur->expert_gate_proj[expert] = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                    if (!cur->expert_gate_proj[expert]) fail("out of memory");
+                    cur->expert_gate_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
                 }
                 snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert);
                 cur->expert_up_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
                 if (!cur->expert_up_proj[expert]) {
-                    cur->expert_up_proj[expert] = (float *)calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-                    if (!cur->expert_up_proj[expert]) fail("out of memory");
+                    cur->expert_up_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
                 }
                 snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert);
                 cur->expert_down_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
                 if (!cur->expert_down_proj[expert]) {
-                    cur->expert_down_proj[expert] = (float *)calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float));
-                    if (!cur->expert_down_proj[expert]) fail("out of memory");
+                    cur->expert_down_proj[expert] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
                 }
             }
         } else {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer);
             cur->la_in_proj_a = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_a) {
-                cur->la_in_proj_a = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->la_in_proj_a) fail("out of memory");
+                cur->la_in_proj_a = (float *)qwen_calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", layer);
             cur->la_in_proj_b = load_optional_tensor_f32(m, name, (size_t)m->linear_num_key_heads * (size_t)m->hidden_size);
             if (!cur->la_in_proj_b) {
-                cur->la_in_proj_b = (float *)calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->la_in_proj_b) fail("out of memory");
+                cur->la_in_proj_b = (float *)qwen_calloc((size_t)m->linear_num_key_heads * (size_t)m->hidden_size, sizeof(float));
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer);
             cur->la_in_proj_qkv = load_optional_tensor_f32(m, name, (size_t)3 * (size_t)m->hidden_size * (size_t)m->hidden_size);
             if (!cur->la_in_proj_qkv) {
-                cur->la_in_proj_qkv = (float *)calloc((size_t)3 * (size_t)m->hidden_size * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->la_in_proj_qkv) fail("out of memory");
+                cur->la_in_proj_qkv = (float *)qwen_calloc((size_t)3 * (size_t)m->hidden_size * (size_t)m->hidden_size, sizeof(float));
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", layer);
             cur->la_in_proj_z = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim * (size_t)m->hidden_size);
             if (!cur->la_in_proj_z) {
-                cur->la_in_proj_z = (float *)calloc((size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim * (size_t)m->hidden_size, sizeof(float));
-                if (!cur->la_in_proj_z) fail("out of memory");
+                cur->la_in_proj_z = (float *)qwen_calloc((size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim * (size_t)m->hidden_size, sizeof(float));
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", layer);
             cur->la_out_proj = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim);
             if (!cur->la_out_proj) {
-                cur->la_out_proj = (float *)calloc((size_t)m->hidden_size * (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim, sizeof(float));
-                if (!cur->la_out_proj) fail("out of memory");
+                cur->la_out_proj = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->linear_num_value_heads * (size_t)m->linear_value_head_dim, sizeof(float));
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", layer);
             cur->la_norm = load_optional_tensor_f32(m, name, (size_t)m->linear_key_head_dim);
             if (!cur->la_norm) {
-                cur->la_norm = (float *)calloc((size_t)m->linear_key_head_dim, sizeof(float));
-                if (!cur->la_norm) fail("out of memory");
+                cur->la_norm = (float *)qwen_calloc((size_t)m->linear_key_head_dim, sizeof(float));
                 for (int i = 0; i < m->linear_key_head_dim; i++) cur->la_norm[i] = 1.0f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log.weight", layer);
             cur->la_A_log = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads);
             if (!cur->la_A_log) {
-                cur->la_A_log = (float *)calloc((size_t)m->linear_num_value_heads, sizeof(float));
-                if (!cur->la_A_log) fail("out of memory");
+                cur->la_A_log = (float *)qwen_calloc((size_t)m->linear_num_value_heads, sizeof(float));
                 for (int i = 0; i < m->linear_num_value_heads; i++) cur->la_A_log[i] = 0.1f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias.weight", layer);
             cur->la_dt_bias = load_optional_tensor_f32(m, name, (size_t)m->linear_num_value_heads);
             if (!cur->la_dt_bias) {
-                cur->la_dt_bias = (float *)calloc((size_t)m->linear_num_value_heads, sizeof(float));
-                if (!cur->la_dt_bias) fail("out of memory");
+                cur->la_dt_bias = (float *)qwen_calloc((size_t)m->linear_num_value_heads, sizeof(float));
                 for (int i = 0; i < m->linear_num_value_heads; i++) cur->la_dt_bias[i] = 0.01f;
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", layer);
             cur->la_conv1d = load_optional_tensor_f32(m, name, (size_t)3 * (size_t)m->hidden_size * 1 * 4);
             if (!cur->la_conv1d) {
-                cur->la_conv1d = (float *)calloc((size_t)3 * (size_t)m->hidden_size * 1 * 4, sizeof(float));
-                if (!cur->la_conv1d) fail("out of memory");
+                cur->la_conv1d = (float *)qwen_calloc((size_t)3 * (size_t)m->hidden_size * 1 * 4, sizeof(float));
             }
         }
         /* shared expert is present on ALL layer types (full and linear attention). */
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer);
         cur->sh_gate = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
         if (!cur->sh_gate) {
-            cur->sh_gate = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-            if (!cur->sh_gate) fail("out of memory");
+            cur->sh_gate = (float *)qwen_calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_gate[i * m->hidden_size + j] = 0.25f;
         }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer);
         cur->sh_up = load_optional_tensor_f32(m, name, (size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size);
         if (!cur->sh_up) {
-            cur->sh_up = (float *)calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
-            if (!cur->sh_up) fail("out of memory");
+            cur->sh_up = (float *)qwen_calloc((size_t)m->shared_expert_intermediate_size * (size_t)m->hidden_size, sizeof(float));
             for (int i = 0; i < m->shared_expert_intermediate_size; i++) for (int j = 0; j < m->hidden_size; j++) if (i == j) cur->sh_up[i * m->hidden_size + j] = 0.1f;
         }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer);
         cur->sh_down = load_optional_tensor_f32(m, name, (size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size);
         if (!cur->sh_down) {
-            cur->sh_down = (float *)calloc((size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size, sizeof(float));
-            if (!cur->sh_down) fail("out of memory");
+            cur->sh_down = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->shared_expert_intermediate_size, sizeof(float));
             for (int i = 0; i < m->hidden_size; i++) for (int j = 0; j < m->shared_expert_intermediate_size; j++) if (i == j) cur->sh_down[i * m->shared_expert_intermediate_size + j] = 0.2f;
         }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer);
         cur->shared_expert_gate = load_optional_tensor_f32(m, name, (size_t)m->hidden_size);
         if (!cur->shared_expert_gate) {
-            cur->shared_expert_gate = (float *)calloc((size_t)m->hidden_size, sizeof(float));
-            if (!cur->shared_expert_gate) fail("out of memory");
+            cur->shared_expert_gate = (float *)qwen_calloc((size_t)m->hidden_size, sizeof(float));
         }
     }
     free(arena);
@@ -1108,8 +1138,7 @@ static void softmax(float *values, int n) {
 static void topk_select(const float *scores, int n, int k, int *out_indices, float *out_weights) {
     if (n <= 0 || k <= 0) return;
     k = k < n ? k : n;
-    int *indices = (int *)malloc((size_t)n * sizeof(int));
-    if (!indices) fail("out of memory");
+    int *indices = (int *)qwen_malloc((size_t)n * sizeof(int));
     for (int i = 0; i < n; i++) indices[i] = i;
     for (int i = 0; i < n; i++) {
         int best = i;
@@ -1171,8 +1200,8 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     float *keep_scores = NULL;
     float *probs = NULL;
     int best = 0;
-    indices = (int *)malloc((size_t)n * sizeof(int));
-    values = (float *)malloc((size_t)n * sizeof(float));
+    indices = (int *)qwen_malloc((size_t)n * sizeof(int));
+    values = (float *)qwen_malloc((size_t)n * sizeof(float));
     if (!indices || !values) {
         free(indices);
         free(values);
@@ -1193,8 +1222,8 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     }
     int keep = n;
     if (top_k > 0 && top_k < keep) keep = top_k;
-    kept = (int *)malloc((size_t)keep * sizeof(int));
-    keep_scores = (float *)malloc((size_t)keep * sizeof(float));
+    kept = (int *)qwen_malloc((size_t)keep * sizeof(int));
+    keep_scores = (float *)qwen_malloc((size_t)keep * sizeof(float));
     if (!kept || !keep_scores) {
         free(kept);
         free(keep_scores);
@@ -1209,7 +1238,7 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     float maxv = keep_scores[0];
     for (int i = 1; i < keep; i++) if (keep_scores[i] > maxv) maxv = keep_scores[i];
     float sum = 0.0f;
-    probs = (float *)malloc((size_t)keep * sizeof(float));
+    probs = (float *)qwen_malloc((size_t)keep * sizeof(float));
     if (!probs) {
         free(probs);
         free(keep_scores);
@@ -1269,9 +1298,8 @@ static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot,
     int *cap = &m->kv_cache_caps[layer][slot];
     if (!m->kv_cache_k_slots[layer][slot] || !m->kv_cache_v_slots[layer][slot] || *cap < steps) {
         size_t bytes = (size_t)steps * (size_t)kv_dim * sizeof(float);
-        float *new_k = (float *)realloc(m->kv_cache_k_slots[layer][slot], bytes);
-        float *new_v = (float *)realloc(m->kv_cache_v_slots[layer][slot], bytes);
-        if (!new_k || !new_v) fail("out of memory");
+        float *new_k = (float *)qwen_realloc(m->kv_cache_k_slots[layer][slot], bytes, "kv cache k resize");
+        float *new_v = (float *)qwen_realloc(m->kv_cache_v_slots[layer][slot], bytes, "kv cache v resize");
         m->kv_cache_k_slots[layer][slot] = new_k;
         m->kv_cache_v_slots[layer][slot] = new_v;
         *cap = steps;
@@ -1307,8 +1335,7 @@ static void configure_parallelism(int requested_threads) {
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
                       int *out_tokens, float temperature, float top_p, int top_k, unsigned int seed,
                       int cache_slot) {
-    float *hidden = (float *)malloc((size_t)m->hidden_size * sizeof(float));
-    if (!hidden) fail("out of memory");
+    float *hidden = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
     for (int layer = 0; layer < m->num_layers; layer++) {
         QLayer *cur = &m->layers[layer];
         ensure_cache_slot(m, cur, layer, cache_slot, steps);
@@ -1324,18 +1351,17 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
         for (int i = 0; i < m->hidden_size; i++) hidden[i] = m->embed[token_id * m->hidden_size + i];
         for (int layer = 0; layer < m->num_layers; layer++) {
             QLayer *cur = &m->layers[layer];
-            float *residual = (float *)malloc((size_t)m->hidden_size * sizeof(float));
-            if (!residual) fail("out of memory");
+            float *residual = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
             memcpy(residual, hidden, (size_t)m->hidden_size * sizeof(float));
 
             if (cur->is_full_attn) {
                 const int q_dim = m->num_attention_heads * m->head_dim;
                 const int kv_dim = m->num_kv_heads * m->head_dim;
-                float *q_out = (float *)malloc((size_t)q_dim * sizeof(float));
-                float *k_out = (float *)malloc((size_t)kv_dim * sizeof(float));
-                float *v_out = (float *)malloc((size_t)kv_dim * sizeof(float));
-                float *attn = (float *)malloc((size_t)q_dim * sizeof(float));
-                float *post = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+                float *q_out = (float *)qwen_malloc((size_t)q_dim * sizeof(float));
+                float *k_out = (float *)qwen_malloc((size_t)kv_dim * sizeof(float));
+                float *v_out = (float *)qwen_malloc((size_t)kv_dim * sizeof(float));
+                float *attn = (float *)qwen_malloc((size_t)q_dim * sizeof(float));
+                float *post = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
                 if (!q_out || !k_out || !v_out || !attn || !post) fail("out of memory");
                 matmul_vec(hidden, cur->q_proj, m->hidden_size, q_dim, q_out);
                 matmul_vec(hidden, cur->k_proj, m->hidden_size, kv_dim, k_out);
@@ -1370,7 +1396,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 save_cache_slot(m, cur, layer, cache_slot);
                 for (int head = 0; head < m->num_attention_heads; head++) {
                     int kv_head = head / (kv_repeat > 0 ? kv_repeat : 1);
-                    float *scores = (float *)calloc((size_t)cur->kv_cache_len, sizeof(float));
+                    float *scores = (float *)qwen_calloc((size_t)cur->kv_cache_len, sizeof(float));
                     if (!scores) {
                         free(q_out);
                         free(k_out);
@@ -1407,8 +1433,8 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 free(attn);
                 free(post);
             } else {
-                float *la_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
-                float *la_gate = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+                float *la_out = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
+                float *la_gate = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
                 if (!la_out || !la_gate) fail("out of memory");
                 matmul_vec(hidden, cur->la_in_proj_qkv, m->hidden_size, m->hidden_size, la_out);
                 matmul_vec(hidden, cur->la_in_proj_z, m->hidden_size, m->hidden_size, la_gate);
@@ -1432,9 +1458,9 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 free(la_gate);
             }
 
-            float *ffn_in = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
-            float *ffn_mid = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
-            float *ffn_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+            float *ffn_in = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
+            float *ffn_mid = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
+            float *ffn_out = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
             if (!ffn_in || !ffn_mid || !ffn_out) fail("out of memory");
             if (cur->is_full_attn) {
                 matmul_vec(hidden, cur->mlp_gate_proj, m->hidden_size, m->moe_intermediate_size, ffn_in);
@@ -1448,21 +1474,20 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             }
 
             if (cur->is_full_attn && m->has_router && cur->router) {
-                float *router_logits = (float *)malloc((size_t)m->num_experts * sizeof(float));
-                if (!router_logits) fail("out of memory");
+                float *router_logits = (float *)qwen_malloc((size_t)m->num_experts * sizeof(float));
                 matmul_vec(hidden, cur->router, m->hidden_size, m->num_experts, router_logits);
                 softmax(router_logits, m->num_experts);
-                int *expert_indices = (int *)malloc((size_t)m->experts_per_tok * sizeof(int));
-                float *expert_weights = (float *)malloc((size_t)m->experts_per_tok * sizeof(float));
+                int *expert_indices = (int *)qwen_malloc((size_t)m->experts_per_tok * sizeof(int));
+                float *expert_weights = (float *)qwen_malloc((size_t)m->experts_per_tok * sizeof(float));
                 if (!expert_indices || !expert_weights) fail("out of memory");
                 topk_select(router_logits, m->num_experts, m->experts_per_tok, expert_indices, expert_weights);
                 for (int expert_slot = 0; expert_slot < m->experts_per_tok; expert_slot++) {
                     int expert_idx = expert_indices[expert_slot];
                     float weight = expert_weights[expert_slot];
                     if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx]) continue;
-                    float *expert_gate = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
-                    float *expert_up = (float *)malloc((size_t)m->moe_intermediate_size * sizeof(float));
-                    float *expert_res = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+                    float *expert_gate = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
+                    float *expert_up = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
+                    float *expert_res = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
                     if (!expert_gate || !expert_up || !expert_res) fail("out of memory");
                     matmul_vec(hidden, cur->expert_gate_proj[expert_idx], m->hidden_size, m->moe_intermediate_size, expert_gate);
                     for (int i = 0; i < m->moe_intermediate_size; i++) expert_gate[i] = silu(expert_gate[i]);
@@ -1480,9 +1505,9 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 free(expert_weights);
             }
 
-            float *shared_in = (float *)malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
-            float *shared_mid = (float *)malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
-            float *shared_out = (float *)malloc((size_t)m->hidden_size * sizeof(float));
+            float *shared_in = (float *)qwen_malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
+            float *shared_mid = (float *)qwen_malloc((size_t)m->shared_expert_intermediate_size * sizeof(float));
+            float *shared_out = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
             if (!shared_in || !shared_mid || !shared_out) fail("out of memory");
             /* shared expert gate: gate_scalar = sigmoid(shared_expert_gate . hidden) */
             float gate_scalar = 1.0f;
@@ -1510,8 +1535,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
             free(ffn_out);
         }
         layer_norm_inplace(hidden, m->final_norm, m->hidden_size);
-        float *logits = (float *)calloc((size_t)m->vocab_size, sizeof(float));
-        if (!logits) fail("out of memory");
+        float *logits = (float *)qwen_calloc((size_t)m->vocab_size, sizeof(float));
         for (int vocab = 0; vocab < m->vocab_size; vocab++) {
             float sum = 0.0f;
             for (int i = 0; i < m->hidden_size; i++) {
@@ -1540,8 +1564,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
 
 static int parse_token_ids(const char *text, int *out, int max_ids) {
     if (!text || !*text) return 0;
-    char *copy = strdup(text);
-    if (!copy) fail("out of memory");
+    char *copy = qwen_strdup(text);
     char *cursor = copy;
     int count = 0;
     while (*cursor && count < max_ids) {
@@ -1577,7 +1600,9 @@ static int read_exact(FILE *fp, unsigned char *buf, size_t len) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--seed N]\n", prog);
+    fprintf(stderr,
+            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
+            prog);
 }
 
 static void run_server(qwen35_model *model, int max_tokens, float temperature, float top_p, int top_k, unsigned int seed) {
@@ -1608,8 +1633,7 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             continue;
         }
         if (payload_len > 0) {
-            unsigned char *payload = (unsigned char *)malloc(payload_len + 1);
-            if (!payload) fail("out of memory");
+            unsigned char *payload = (unsigned char *)qwen_malloc(payload_len + 1, "server payload buffer");
             if (!read_exact(stdin, payload, payload_len)) {
                 fprintf(stderr, "[qwen35_moe] short read while reading prompt payload\n");
                 free(payload);
@@ -1620,8 +1644,8 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             }
             payload[payload_len] = '\0';
             char *prompt_text = (char *)payload;
-            int *tokens = (int *)calloc((size_t)max_tokens_request, sizeof(int));
-            int *out = (int *)calloc((size_t)max_tokens_request, sizeof(int));
+            int *tokens = (int *)qwen_calloc((size_t)max_tokens_request, sizeof(int));
+            int *out = (int *)qwen_calloc((size_t)max_tokens_request, sizeof(int));
             if (!tokens || !out) {
                 free(tokens);
                 free(out);
@@ -1658,6 +1682,7 @@ int main(int argc, char **argv) {
     float top_p = 0.0f;
     int top_k = 0;
     unsigned int seed = 0;
+    bool debug_enabled = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             snap_dir = argv[++i];
@@ -1679,6 +1704,14 @@ int main(int argc, char **argv) {
             top_p = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--debug") || !strcmp(argv[i], "--verbose")) {
+            debug_enabled = true;
+        } else if (!strcmp(argv[i], "--ram-limit-mb")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing value for --ram-limit-mb\n");
+                return 1;
+            }
+            configure_ram_limit(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
@@ -1691,6 +1724,7 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
+    if (debug_enabled) set_model_debug_enabled(true);
     if (temperature > 0.0f && seed == 0) srand((unsigned int)time(NULL));
     configure_parallelism(threads);
     qwen35_model model;
@@ -1700,12 +1734,10 @@ int main(int argc, char **argv) {
         free_model(&model);
         return 0;
     }
-    int *tokens = (int *)calloc((size_t)steps, sizeof(int));
-    if (!tokens) fail("out of memory");
+    int *tokens = (int *)qwen_calloc((size_t)steps, sizeof(int));
     int n_tokens = parse_token_ids(prompt ? prompt : "0", tokens, steps);
     if (n_tokens <= 0) n_tokens = 1;
-    int *out = (int *)calloc((size_t)steps, sizeof(int));
-    if (!out) fail("out of memory");
+    int *out = (int *)qwen_calloc((size_t)steps, sizeof(int));
     run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, top_k, seed, 0);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);

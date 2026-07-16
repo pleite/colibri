@@ -132,13 +132,17 @@ static void make_model_dir(const char *dir) {
     if (mkdir(dir, 0777) != 0 && errno != EEXIST) fail("mkdir %s", dir);
 }
 
-static void write_model_config(const char *dir) {
+static void write_model_config_with_dims(const char *dir, int vocab_size, int hidden_size) {
     char config_path[1024];
     snprintf(config_path, sizeof(config_path), "%s/config.json", dir);
     FILE *fp = fopen(config_path, "w");
     if (!fp) fail("cannot write %s", config_path);
-    fputs("{\"vocab_size\": 4, \"hidden_size\": 4, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}", fp);
+    fprintf(fp, "{\"vocab_size\": %d, \"hidden_size\": %d, \"num_hidden_layers\": 1, \"num_experts\": 2, \"num_experts_per_tok\": 1}", vocab_size, hidden_size);
     fclose(fp);
+}
+
+static void write_model_config(const char *dir) {
+    write_model_config_with_dims(dir, 4, 4);
 }
 
 static void write_model(const char *dir) {
@@ -183,6 +187,44 @@ static void write_model(const char *dir) {
         {"model.layers.0.mlp.down_proj.weight", down, 16},
     };
     write_safetensors_file(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+}
+
+static void write_large_model(const char *dir) {
+    make_model_dir(dir);
+    write_model_config_with_dims(dir, 4, 32768);
+
+    FILE *fp;
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_path[1024];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+
+    const size_t hidden_size = 32768;
+    const size_t vocab_size = 4;
+    size_t embed_elems = vocab_size * hidden_size;
+    size_t norm_elems = hidden_size;
+    size_t lmhead_elems = vocab_size * hidden_size;
+    float *embed = (float *)xmalloc(embed_elems * sizeof(float));
+    float *norm = (float *)xmalloc(norm_elems * sizeof(float));
+    float *lmhead = (float *)xmalloc(lmhead_elems * sizeof(float));
+    for (size_t i = 0; i < embed_elems; i++) embed[i] = 0.01f + (float)(i % 17) * 0.001f;
+    for (size_t i = 0; i < norm_elems; i++) norm[i] = 1.0f;
+    for (size_t i = 0; i < lmhead_elems; i++) lmhead[i] = 0.02f + (float)(i % 13) * 0.001f;
+
+    tensor tensors[] = {
+        {"model.embed_tokens.weight", embed, embed_elems},
+        {"model.norm.weight", norm, norm_elems},
+        {"lm_head.weight", lmhead, lmhead_elems},
+    };
+    write_safetensors_file(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+    free(embed);
+    free(norm);
+    free(lmhead);
 }
 
 static void write_quantized_model(const char *dir) {
@@ -442,8 +484,31 @@ static void run_reference(const toy_model *m, const int *tokens, int n_tokens, i
     }
 }
 
+static int run_engine_with_args(const char *model_dir, const char *args, int steps, int *out_tokens, char *output, size_t output_cap) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "./qwen35_moe --model %s --prompt 0 --steps %d %s 2>&1", model_dir, steps, args ? args : "");
+    FILE *pipe = popen(cmd, "r");
+    if (!pipe) fail("popen failed");
+    char line[256];
+    int index = 0;
+    size_t used = 0;
+    while (fgets(line, sizeof(line), pipe)) {
+        if (out_tokens && index < steps) {
+            out_tokens[index++] = atoi(line);
+        }
+        if (output && output_cap > 0) {
+            size_t len = strlen(line);
+            if (used + len + 1 < output_cap) {
+                memcpy(output + used, line, len);
+                used += len;
+            }
+        }
+    }
+    if (output && output_cap > 0) output[used] = '\0';
+    return pclose(pipe);
+}
+
 static void run_engine(const char *model_dir, int steps, const int *tokens, int n_tokens, int *out_tokens) {
-    char cmd[2048];
     char prompt[128];
     prompt[0] = '\0';
     for (int i = 0; i < n_tokens; i++) {
@@ -451,6 +516,7 @@ static void run_engine(const char *model_dir, int steps, const int *tokens, int 
         snprintf(part, sizeof(part), "%s%d", i == 0 ? "" : ",", tokens[i]);
         strncat(prompt, part, sizeof(prompt) - strlen(prompt) - 1);
     }
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd), "./qwen35_moe --model %s --prompt %s --steps %d", model_dir, prompt, steps);
     FILE *pipe = popen(cmd, "r");
     if (!pipe) fail("popen failed");
@@ -554,6 +620,26 @@ int main(void) {
     for (int i = 0; i < 4; i++) {
         if (prefix_actual[i] < 0) fail("prefixed quantized model produced invalid token %d", prefix_actual[i]);
     }
+
+    char debug_dir[] = "/tmp/colibri-qwen35-debug-XXXXXX";
+    char *debug_tmp = mkdtemp(debug_dir);
+    if (!debug_tmp) fail("mkdtemp failed");
+    write_model(debug_tmp);
+    int debug_actual[1] = {0};
+    char debug_output[2048] = {0};
+    int debug_status = run_engine_with_args(debug_tmp, "--debug", 1, debug_actual, debug_output, sizeof(debug_output));
+    if (debug_status != 0) fail("debug run failed: %s", debug_output);
+    if (strstr(debug_output, "[qwen35_moe]") == NULL) fail("debug output missing");
+
+    char ram_dir[] = "/tmp/colibri-qwen35-ram-XXXXXX";
+    char *ram_tmp = mkdtemp(ram_dir);
+    if (!ram_tmp) fail("mkdtemp failed");
+    write_large_model(ram_tmp);
+    char ram_output[4096] = {0};
+    int ram_status = run_engine_with_args(ram_tmp, "--ram-limit-mb 1", 1, NULL, ram_output, sizeof(ram_output));
+    if (ram_status == 0) fail("ram-limit run unexpectedly succeeded");
+    if (strstr(ram_output, "RAM limit exceeded") == NULL) fail("ram-limit output missing");
+    if (strstr(ram_output, "allocating") == NULL) fail("ram-limit output did not report an allocation attempt");
 
     puts("qwen35_moe test: ok");
     return 0;
