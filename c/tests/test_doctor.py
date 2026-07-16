@@ -101,6 +101,21 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["accelerator.vulkan"]["status"], "pass")
         self.assertEqual(report["status"], "ok")
 
+    def test_parallel_backend_reports_active_engines(self):
+        accelerators = {
+            "cuda": [],
+            "rocm": [{"index": 0, "name": "RX 7900 XTX", "total_bytes": 24 * GB, "free_bytes": 22 * GB}],
+            "vulkan": [],
+            "npu": [{"index": 0, "name": "XDNA", "total_bytes": 2 * GB, "free_bytes": 2 * GB}],
+        }
+        report = self.report(backend="parallel", accelerators=accelerators)
+        checks = self.checks_by_id(report)
+
+        self.assertIn("accelerator.parallel", checks)
+        self.assertEqual(checks["accelerator.parallel"]["status"], "pass")
+        self.assertEqual(checks["accelerator.parallel"]["details"]["engines"], ["rocm", "npu"])
+        self.assertEqual(checks["accelerator.parallel"]["details"]["role_affinity"]["attention"], "npu")
+
     def test_missing_model_collects_failures_instead_of_stopping_early(self):
         report = self.report(model=self.root / "missing")
         checks = self.checks_by_id(report)

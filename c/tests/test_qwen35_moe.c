@@ -227,6 +227,78 @@ static void write_large_model(const char *dir) {
     free(lmhead);
 }
 
+/* Builds a single-layer model whose q_proj is either stored as native INT8
+ * (dtype U8 payload + per-row F32 scales) or as the numerically-equivalent F32
+ * tensor. Everything else is identical F32. Running both and comparing tokens
+ * proves the memory-saving dequant-on-use path is bit-for-bit equivalent to the
+ * expanded F32 weights. */
+static void write_int8_qproj_model(const char *dir, int use_int8) {
+    make_model_dir(dir);
+    write_model_config(dir);
+
+    char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", dir);
+    FILE *fp = fopen(tokenizer_path, "w");
+    if (!fp) fail("cannot write %s", tokenizer_path);
+    fputs("{}\n", fp);
+    fclose(fp);
+
+    char shard_path[1024];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+
+    static float embed[16] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f, 1.6f};
+    static float norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    static float lmhead[16] = {0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f, 0.1f, 0.0f, 0.3f, 0.4f, 0.2f};
+    static float attn_norm[4] = {1.0f, 1.1f, 1.2f, 1.3f};
+    static float ffn_norm[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    static float k[16] = {0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f};
+    static float v[16] = {0.02f, 0, 0, 0, 0, 0.02f, 0, 0, 0, 0, 0.02f, 0, 0, 0, 0, 0.02f};
+    static float o[16] = {0.3f, 0, 0, 0, 0, 0.3f, 0, 0, 0, 0, 0.3f, 0, 0, 0, 0, 0.3f};
+    static float gate[16] = {0.1f, 0, 0, 0, 0, 0.1f, 0, 0, 0, 0, 0.1f, 0, 0, 0, 0, 0.1f};
+    static float up[16] = {0.2f, 0, 0, 0, 0, 0.2f, 0, 0, 0, 0, 0.2f, 0, 0, 0, 0, 0.2f};
+    static float down[16] = {0.4f, 0, 0, 0, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0, 0, 0, 0, 0.4f};
+    /* F32 q_proj = diag(0.1). INT8 q_proj = diag(2) with per-row scale 0.05,
+     * so dequant(2) * 0.05 == 0.1 exactly. */
+    static float q_f32[16] = {0.1f, 0, 0, 0, 0, 0.1f, 0, 0, 0, 0, 0.1f, 0, 0, 0, 0, 0.1f};
+    static const int8_t q_i8[16] = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2};
+    static const float q_scales[4] = {0.05f, 0.05f, 0.05f, 0.05f};
+
+    if (use_int8) {
+        raw_tensor tensors[] = {
+            {"model.embed_tokens.weight", embed, 16, sizeof(embed), "F32"},
+            {"model.norm.weight", norm, 4, sizeof(norm), "F32"},
+            {"lm_head.weight", lmhead, 16, sizeof(lmhead), "F32"},
+            {"model.layers.0.input_layernorm.weight", attn_norm, 4, sizeof(attn_norm), "F32"},
+            {"model.layers.0.post_attention_layernorm.weight", ffn_norm, 4, sizeof(ffn_norm), "F32"},
+            {"model.layers.0.self_attn.q_proj.weight", q_i8, 16, sizeof(q_i8), "U8"},
+            {"model.layers.0.self_attn.q_proj.weight.qs", q_scales, 4, sizeof(q_scales), "F32"},
+            {"model.layers.0.self_attn.k_proj.weight", k, 16, sizeof(k), "F32"},
+            {"model.layers.0.self_attn.v_proj.weight", v, 16, sizeof(v), "F32"},
+            {"model.layers.0.self_attn.o_proj.weight", o, 16, sizeof(o), "F32"},
+            {"model.layers.0.mlp.gate_proj.weight", gate, 16, sizeof(gate), "F32"},
+            {"model.layers.0.mlp.up_proj.weight", up, 16, sizeof(up), "F32"},
+            {"model.layers.0.mlp.down_proj.weight", down, 16, sizeof(down), "F32"},
+        };
+        write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+    } else {
+        raw_tensor tensors[] = {
+            {"model.embed_tokens.weight", embed, 16, sizeof(embed), "F32"},
+            {"model.norm.weight", norm, 4, sizeof(norm), "F32"},
+            {"lm_head.weight", lmhead, 16, sizeof(lmhead), "F32"},
+            {"model.layers.0.input_layernorm.weight", attn_norm, 4, sizeof(attn_norm), "F32"},
+            {"model.layers.0.post_attention_layernorm.weight", ffn_norm, 4, sizeof(ffn_norm), "F32"},
+            {"model.layers.0.self_attn.q_proj.weight", q_f32, 16, sizeof(q_f32), "F32"},
+            {"model.layers.0.self_attn.k_proj.weight", k, 16, sizeof(k), "F32"},
+            {"model.layers.0.self_attn.v_proj.weight", v, 16, sizeof(v), "F32"},
+            {"model.layers.0.self_attn.o_proj.weight", o, 16, sizeof(o), "F32"},
+            {"model.layers.0.mlp.gate_proj.weight", gate, 16, sizeof(gate), "F32"},
+            {"model.layers.0.mlp.up_proj.weight", up, 16, sizeof(up), "F32"},
+            {"model.layers.0.mlp.down_proj.weight", down, 16, sizeof(down), "F32"},
+        };
+        write_safetensors_file_raw(shard_path, tensors, sizeof(tensors) / sizeof(tensors[0]));
+    }
+}
+
 static void write_quantized_model(const char *dir) {
     make_model_dir(dir);
     write_model_config(dir);
@@ -619,6 +691,25 @@ int main(void) {
     run_engine(prefix_tmp, 4, tokens, 2, prefix_actual);
     for (int i = 0; i < 4; i++) {
         if (prefix_actual[i] < 0) fail("prefixed quantized model produced invalid token %d", prefix_actual[i]);
+    }
+
+    /* INT8 dequant-on-use must be token-exact against the equivalent F32 model,
+     * proving the memory-saving quantized path does not change results. */
+    char i8_dir[] = "/tmp/colibri-qwen35-i8-XXXXXX";
+    char *i8_tmp = mkdtemp(i8_dir);
+    if (!i8_tmp) fail("mkdtemp failed");
+    write_int8_qproj_model(i8_tmp, 1);
+    int i8_actual[4] = {0, 0, 0, 0};
+    run_engine(i8_tmp, 4, tokens, 2, i8_actual);
+
+    char f32ref_dir[] = "/tmp/colibri-qwen35-f32ref-XXXXXX";
+    char *f32ref_tmp = mkdtemp(f32ref_dir);
+    if (!f32ref_tmp) fail("mkdtemp failed");
+    write_int8_qproj_model(f32ref_tmp, 0);
+    int f32ref_actual[4] = {0, 0, 0, 0};
+    run_engine(f32ref_tmp, 4, tokens, 2, f32ref_actual);
+    for (int i = 0; i < 4; i++) {
+        if (i8_actual[i] != f32ref_actual[i]) fail("int8 vs f32 mismatch at token %d: int8=%d f32=%d", i, i8_actual[i], f32ref_actual[i]);
     }
 
     char debug_dir[] = "/tmp/colibri-qwen35-debug-XXXXXX";
