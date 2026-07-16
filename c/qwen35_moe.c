@@ -389,22 +389,34 @@ static float *load_tensor_f32(qwen35_model *m, const char *name, size_t nelems) 
                     uint8_t *raw = (uint8_t *)malloc(packed_bytes);
                     if (!raw) fail("out of memory");
                     st_read_raw(&m->shards, t->name, raw, 0);
-                    float *scale_vals = (float *)calloc(logical_out_dim, sizeof(float));
+                    float *scale_vals = (float *)calloc(out_dim, sizeof(float));
                     if (!scale_vals) fail("out of memory");
                     if (scale) {
-                        st_read_slice_f32(&m->shards, scale->name, 0, (int64_t)logical_out_dim, scale_vals, 0);
+                        st_read_f32(&m->shards, scale->name, scale_vals, 0);
                     } else {
-                        for (size_t row = 0; row < logical_out_dim; row++) scale_vals[row] = 1.0f;
+                        for (size_t row = 0; row < out_dim; row++) scale_vals[row] = 1.0f;
+                    }
+                    bool interleaved_rows = false;
+                    if (scale) {
+                        size_t split_matches = 0;
+                        size_t interleaved_matches = 0;
+                        for (size_t row = 0; row < logical_out_dim; row++) {
+                            if (fabsf(scale_vals[row] - scale_vals[row + logical_out_dim]) < 1e-6f) split_matches++;
+                            if (fabsf(scale_vals[row * 2] - scale_vals[row * 2 + 1]) < 1e-6f) interleaved_matches++;
+                        }
+                        interleaved_rows = interleaved_matches > split_matches;
                     }
                     for (size_t row = 0; row < logical_out_dim; row++) {
+                        size_t src_row = interleaved_rows ? (row * 2) : row;
+                        size_t scale_row = interleaved_rows ? (row * 2) : row;
                         for (size_t col = 0; col < logical_in_dim; col++) {
-                            int8_t value = (int8_t)raw[row * logical_in_dim + col];
-                            buf[row * logical_in_dim + col] = (float)value * scale_vals[row];
+                            int8_t value = (int8_t)raw[src_row * logical_in_dim + col];
+                            buf[row * logical_in_dim + col] = (float)value * scale_vals[scale_row];
                         }
                     }
                     free(raw);
                     free(scale_vals);
-                    model_debug("load_tensor_f32: tensor=%s accepted expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from the first half of %zu packed rows", name, packed_bytes, nelems, logical_out_dim, out_dim);
+                    model_debug("load_tensor_f32: tensor=%s accepting expanded int8 payload (%zu bytes -> %zu elems): decoded %zu rows from %s packed layout", name, packed_bytes, nelems, logical_out_dim, interleaved_rows ? "interleaved" : "first-half");
                     return buf;
                 }
             }
