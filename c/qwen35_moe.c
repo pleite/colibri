@@ -99,6 +99,12 @@ typedef enum {
     LAYER_TYPE_FULL = 1,
 } layer_type_t;
 
+typedef enum {
+    QWEN_EXPERT_STATE_UNLOADED = 0,
+    QWEN_EXPERT_STATE_RESIDENT = 1,
+    QWEN_EXPERT_STATE_PINNED = 2,
+} qwen_expert_state_t;
+
 typedef struct {
     float *in_ln;
     float *post_ln;
@@ -120,6 +126,7 @@ typedef struct {
     float **expert_gate_proj;
     float **expert_up_proj;
     float **expert_down_proj;
+    int *expert_state;
     float *la_in_proj_a;
     float *la_in_proj_b;
     float *la_in_proj_qkv;
@@ -812,23 +819,12 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
             cur->expert_gate_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             cur->expert_up_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
             cur->expert_down_proj = (float **)qwen_calloc((size_t)m->num_experts, sizeof(float *), "expert table");
+            cur->expert_state = (int *)qwen_calloc((size_t)m->num_experts, sizeof(int), "expert state table");
             for (int expert = 0; expert < m->num_experts; expert++) {
-                char expert_name[1024];
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert);
-                cur->expert_gate_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-                if (!cur->expert_gate_proj[expert]) {
-                    cur->expert_gate_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
-                }
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert);
-                cur->expert_up_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
-                if (!cur->expert_up_proj[expert]) {
-                    cur->expert_up_proj[expert] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
-                }
-                snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert);
-                cur->expert_down_proj[expert] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
-                if (!cur->expert_down_proj[expert]) {
-                    cur->expert_down_proj[expert] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
-                }
+                cur->expert_gate_proj[expert] = NULL;
+                cur->expert_up_proj[expert] = NULL;
+                cur->expert_down_proj[expert] = NULL;
+                cur->expert_state[expert] = QWEN_EXPERT_STATE_UNLOADED;
             }
         } else {
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer);
@@ -955,6 +951,7 @@ static void free_layer(qwen35_model *m, QLayer *layer) {
         }
         free(layer->expert_down_proj);
     }
+    free(layer->expert_state);
 }
 
 static void free_model(qwen35_model *m) {
@@ -1330,6 +1327,40 @@ static void sample_logits(const float *logits, int n, float temperature, float t
     free(indices);
 }
 
+static bool expert_tables_ready(const QLayer *cur) {
+    return cur != NULL && cur->expert_state != NULL && cur->expert_gate_proj != NULL &&
+           cur->expert_up_proj != NULL && cur->expert_down_proj != NULL;
+}
+
+static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_idx) {
+    if (!expert_tables_ready(cur)) {
+        return;
+    }
+    if (expert_idx < 0 || expert_idx >= m->num_experts) {
+        return;
+    }
+    if (cur->expert_state[expert_idx] != QWEN_EXPERT_STATE_UNLOADED) {
+        return;
+    }
+    char expert_name[1024];
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert_idx);
+    cur->expert_gate_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+    if (!cur->expert_gate_proj[expert_idx]) {
+        cur->expert_gate_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert gate defaults");
+    }
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert_idx);
+    cur->expert_up_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->moe_intermediate_size * (size_t)m->hidden_size);
+    if (!cur->expert_up_proj[expert_idx]) {
+        cur->expert_up_proj[expert_idx] = (float *)qwen_calloc((size_t)m->moe_intermediate_size * (size_t)m->hidden_size, sizeof(float), "expert up defaults");
+    }
+    snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert_idx);
+    cur->expert_down_proj[expert_idx] = load_optional_tensor_f32(m, expert_name, (size_t)m->hidden_size * (size_t)m->moe_intermediate_size);
+    if (!cur->expert_down_proj[expert_idx]) {
+        cur->expert_down_proj[expert_idx] = (float *)qwen_calloc((size_t)m->hidden_size * (size_t)m->moe_intermediate_size, sizeof(float), "expert down defaults");
+    }
+    cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
+}
+
 static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot, int steps) {
     if (slot < 0 || slot >= m->kv_slots) {
         int invalid_slot = slot;
@@ -1527,7 +1558,8 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
                 for (int expert_slot = 0; expert_slot < m->experts_per_tok; expert_slot++) {
                     int expert_idx = expert_indices[expert_slot];
                     float weight = expert_weights[expert_slot];
-                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx]) continue;
+                    ensure_expert(m, cur, layer, expert_idx);
+                    if (weight <= 0.0f || !cur->expert_gate_proj[expert_idx] || !cur->expert_up_proj[expert_idx] || !cur->expert_down_proj[expert_idx]) continue;
                     float *expert_gate = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_up = (float *)qwen_malloc((size_t)m->moe_intermediate_size * sizeof(float));
                     float *expert_res = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
