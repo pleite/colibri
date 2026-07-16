@@ -1,9 +1,9 @@
 # Backend and Engine Parity Gaps — colibrì
 
 **Date:** 2026-07-16
-**Updated:** 2026-07-17 00:00 (converter analysis)
+**Updated:** 2026-07-17 00:30 (memory savings analysis)
 
-This document is the single authoritative reference for the colibrì backend and engine stack. It reflects the actual state of `main` after PRs #46 and #47, and incorporates the converter analysis.
+This document is the single authoritative reference for the colibrì backend and engine stack. It reflects the actual state of `main` after PRs #46 and #47, and incorporates the converter and memory savings analysis.
 
 ---
 
@@ -23,85 +23,131 @@ This document is the single authoritative reference for the colibrì backend and
 
 ## Converter Analysis
 
-**Converter:** `c/tools/convert_qwen35_safetensors.py`
+### GLM-5.2 Converter (`c/tools/convert_fp8_to_int4.py`)
+
+**Strategy:** Disk-safe, shard-by-shard download → convert → delete. Peak disk = 1 shard + growing int4 output.
+
+**Tensor classification:**
+- `f32`: norms, routers (`mlp.gate.weight`), biases, `e_score_correction_bias`
+- `io`: `model.embed_tokens.weight`, `lm_head.weight` → quantized with `io_bits` (default 8)
+- `q`: attention, dense MLP, shared expert → quantized with `ebits` (default 4)
+- `x`: routed experts → quantized with `xbits` (default=ebits), streamed from disk
+- `skip`: DSA indexer, MTP layer (78), `eh_proj`, `enorm`, `hnorm`, `shared_head`
+
+**Quantization math:** Identical to C engine (`glm.c`):
+- `quant_int8()`: per-row scale, `np.clip(np.rint(w / s), -qmax-1, qmax).astype(np.int8)`
+- `quant_int4()`: per-row scale, nibble packing (2 values/byte), same as `pack_int4` in C
+- `quant_int2()`: per-row scale, 4 values/byte packing, same as `pack_int2` in C
 
 **Output format:**
-- **Quantized tensors** (attention weights, embed, lm_head, shared experts, dense MLP):
-  - Main tensor: `dtype=U8`, shape `[O, I]`, contains packed int8 or int4 values
-  - Scale tensor: `{name}.qs`, `dtype=F32`, shape `[O]`, contains per-row scales
-- **F32 tensors** (norms, routers, biases, linear attention projections, A_log, dt_bias):
-  - Single tensor: `dtype=F32`, shape as-is
+- Quantized tensors: `dtype=U8`, shape `[O, I]` (int8) or `[O, ceil(I/2)]` (int4)
+- Scale tensors: `{name}.qs`, `dtype=F32`, shape `[O]`
+- F32 tensors: `dtype=F32`, shape as-is
 
-**Quantization rules** (`should_quantize()`):
-- `.mlp.experts.*` → int4
-- `model.embed_tokens.*`, `lm_head.*`, `.self_attn.*` (non-linear_attn), `.shared_expert.*`, dense MLP → int8
-- Everything else → F32
+### Qwen3.5 Converter (`c/tools/convert_qwen35_safetensors.py`)
 
-**Engine's `load_tensor_f32()` handles U8 payload** (`dtype == 3`):
-- Case 1: `packed_bytes == nelems` → int8 (1 byte/element)
-- Case 2: `packed_bytes == out_dim * bytes_per_row` → int4 (2 values/byte)
-- Case 3: Ornith doubled int8 layout (special case for legacy models)
+**Strategy:** Multi-process worker pool with state-based resume. Handles FP8, BF16, F16, F32 inputs.
 
-The engine dequantizes U8 payloads back to F32 in memory using the .qs scales.
+**Tensor classification** (`should_quantize()`):
+- `int4`: `.mlp.experts.*` (routed experts)
+- `int8`: `model.embed_tokens.*`, `lm_head.*`, `.self_attn.*` (non-linear_attn), `.shared_expert.*`, dense MLP
+- `F32`: norms, routers, biases, linear attention projections, A_log, dt_bias
+
+**Quantization math:**
+- `quantize_int8()`: per-row scale, `int(round(value / scale))`, clip to [-128, 127]
+- `quantize_int4()`: per-row scale, `int(round(value / scale))`, clip to [-8, 7], nibble packing
+
+**Output format:**
+- Quantized tensors: `dtype=U8`, shape `[O, I]` (int8) or `[O, ceil(I/2)]` (int4)
+- Scale tensors: `{name}.qs`, `dtype=F32`, shape `[O]`
+- F32 tensors: `dtype=F32`, shape as-is
+
+**Key difference from GLM converter:** Qwen3.5 uses `int(round())` instead of `np.clip(np.rint())`, but the result is identical for well-behaved tensors.
 
 ---
 
-## Current State Summary
+## Memory Savings Analysis
 
-### Backends (all four)
+### GLM-5.2 Memory Layout
 
-| Backend | File | Status | What it does |
-|---------|------|--------|--------------|
-| **CPU** | `c/backend_runtime.c` (lane 0) | ✅ Working | Full CPU matmul with OpenMP parallelism, supports fmt 0/1/2/3 |
-| **NPU** | `c/backend_npu.c` | ✅ Host-backed shim | Copies to host memory, uses `matmul_host()`, supports fmt 0/1/2/3 |
-| **Vulkan** | `c/backend_vulkan.c` | ✅ Host-backed shim | Copies to host memory, probes Vulkan loader, uses `matmul_host()`, supports fmt 0/1/2/3 |
-| **ROCm/HIP** | `c/backend_rocm.hip` | ✅ HIP shim | Full HIP implementation with unified memory, `quant_matmul` kernel supports fmt 0/1/2/3 |
+**Resident tensors** (in RAM, quantized):
+- Dense weights: int4 → 0.5 byte/param
+- Shared experts: int8 → 1 byte/param
+- MTP layer: int8 → 1 byte/param
+- Embed/lm_head: int8 (io_bits=8) → 1 byte/param
 
-All backends share the `coli_cuda_*` ABI and dispatch through `backend_runtime.c`. When a selected backend fails upload or matmul, the runtime falls back to the CPU path.
+**Streaming tensors** (from disk, quantized):
+- Routed experts: int4 → 0.5 byte/param (loaded on-demand)
 
-**Key observation:** All four backends already support fmt 0 (F32), fmt 1 (INT8), fmt 2 (INT4), and fmt 3 (INT2). The `valid_fmt()` function in every backend accepts all four. The user's decision to only use fmt 0/1/2 means **no backend changes are needed for format support** — they already handle it.
+**F32 tensors** (small, sensitive):
+- Norms, routers, biases: ~1-2 GB total
 
-### Engines
+**Total resident memory for 17B params:**
+- Dense weights: ~8.7 GB (int4)
+- Shared experts: ~1.5 GB (int8)
+- MTP: ~0.1 GB (int8)
+- Embed/lm_head: ~1.9 GB (int8)
+- **Total: ~12.2 GB** (vs ~34 GB for bf16)
 
-| Engine | File | Status |
-|--------|------|--------|
-| **GLM-5.2** | `c/glm.c` | ✅ Complete (int4/int8 resident, expert streaming from disk, LRU cache, profiling, IDOT kernels) |
-| **Qwen3.5 MoE** | `c/qwen35_moe.c` | ⚠️ Skeleton forward pass (lazy expert loading, basic attention, no GPU backend integration, loads everything as F32) |
+**Memory savings:** ~64% reduction from bf16 to int4/int8.
 
-### Format Usage by Engine
+### Qwen3.5 MoE Memory Layout (Current)
 
-**GLM-5.2** (`c/glm.c`):
-- `fmt=0` (F32): norms (`final_norm`, `enorm`, `hnorm`, `mtp_norm`), routers (`router`, `router_bias`), biases (`la_in_proj_a`, `la_in_proj_b`), `lm_head` (when io_bits >= 8), `embed` (when io_bits >= 8), MTP layers
-- `fmt=1` (INT8): dense weights, shared experts, `lm_head` (when io_bits < 8), `embed` (when io_bits < 8)
-- `fmt=2` (INT4): dense resident weights (main compression path, ~8.7 GB for 17B params)
+**All tensors loaded as F32:**
+- Dense weights: 4 byte/param
+- Shared experts: 4 byte/param
+- Routed experts: 4 byte/param (loaded on-demand)
+- Embed/lm_head: 4 byte/param
+- Norms/routers/biases: 4 byte/param
 
-**Qwen3.5 MoE** (`c/qwen35_moe.c`):
-- **All tensors loaded as F32** via `load_tensor_f32()` — no quantization path yet
-- Norms (`in_ln`, `post_ln`, `la_norm`), routers (`router`), biases (`la_dt_bias`), `q_norm`, `k_norm`, `la_in_proj_a/b/qkv/z`, `embed`, `lm_head`, `final_norm` → all F32
-- Expert weights (gate_proj, up_proj, down_proj) → loaded as F32, no quantization
-- **Gap:** The converter outputs int4/int8 + F32 scales, but the engine dequantizes everything back to F32 in memory. This means:
-  - No memory savings from quantization (tensors are stored as F32 after dequantization)
-  - No use of the backend runtime (all matmuls are CPU)
-  - No use of INT8/INT4 formats in the backend
+**Total resident memory for 397B params (Ornith):**
+- Dense weights: ~3.2 TB (bf16) → **~1.6 TB (int4)** with quantization
+- Shared experts: ~160 GB (bf16) → **~80 GB (int8)** with quantization
+- Routed experts: ~320 GB (bf16) → **~160 GB (int4)** with quantization (streaming)
+- Embed/lm_head: ~2 GB (bf16) → **~1 GB (int8)** with quantization
+- Norms/routers/biases: ~2 GB (bf16) → **~2 GB (F32)** unchanged
+
+**Current state (no quantization):** ~3.7 TB resident + streaming
+**Target state (with quantization):** ~1.6 TB resident + 160 GB streaming
+
+**Memory savings needed:** ~57% reduction from bf16 to int4/int8.
+
+---
+
+## Engine Gap: Qwen3.5 Must Match GLM Memory Layout
+
+**Current Qwen3.5 engine:**
+- `load_tensor_f32()` dequantizes U8 payloads back to F32 in memory
+- All tensors stored as `float *` in `QLayer` struct
+- No memory savings from quantization
+- No use of backend runtime (all matmuls are CPU)
+
+**Required Qwen3.5 engine changes:**
+1. Store tensors in quantized format (INT8/INT4) in the `QLayer` struct
+2. Use the backend runtime for matmul (which supports fmt 1/2)
+3. Only dequantize at matmul time (dequant-on-use)
+4. Match GLM's memory layout: dense weights int4, shared experts int8, routed experts int4 (streaming)
+
+**This unlocks:**
+- ~57% memory reduction (matching GLM's 64% savings)
+- GPU acceleration via backend runtime
+- Reduced memory bandwidth for matmul operations
 
 ---
 
 ## Backend Implementation Assessment
 
-### The good news: all backends already support the needed formats
+### All backends already support the needed formats
 
 Every backend (`backend_runtime.c`, `backend_npu.c`, `backend_vulkan.c`, `backend_rocm.hip`) has:
 - `valid_fmt()` accepting fmt 0, 1, 2, 3
 - `packed_bytes()` computing correct sizes for all formats
 - `scale_bytes()` handling scale tensors for non-F32 formats
 - `host_matmul()` (NPU/Vulkan) or `weight_at()` (ROCm) decoding all formats correctly
-- `decode_i4()` and `decode_i2()` for packed int4/int2
 
-**No backend code changes are needed for format support.** The formats are already implemented.
+**No backend code changes are needed for format support.**
 
 ### The real work: GPU-native kernels for NPU and Vulkan
-
-The NPU and Vulkan backends currently use `matmul_host()` which is a **CPU fallback**. They copy weights to host memory and run CPU matmul. This works but doesn't use the GPU.
 
 **ROCm already has a real GPU kernel** (`quant_matmul` in `backend_rocm.hip`) that runs on the RDNA 4 iGPU. It supports fmt 0/1/2/3 with unified memory (Strix Halo APU).
 
@@ -109,27 +155,38 @@ The NPU and Vulkan backends currently use `matmul_host()` which is a **CPU fallb
 
 **NPU (XDNA 2) needs XRT kernels** for fixed-shape subgraphs. This is the lowest priority and most complex.
 
-### Approach comparison
+### NPU vs GPU vs CPU: Fixed-Shape Analysis
 
-| Backend | Current state | What's needed | Complexity |
-|---------|--------------|---------------|------------|
-| **CPU** | ✅ Working | Nothing | Done |
-| **ROCm** | ✅ Real HIP kernel | Nothing for int4/int8/F32. FP8/FP6/FP4 would need new kernel types (but user said no) | Done |
-| **Vulkan** | ⚠️ Host-backed shim | SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording | Medium — needs low-level Vulkan API code |
-| **NPU** | ⚠️ Host-backed shim | XRT kernel loading, fixed-shape subgraph offload, device discovery | High — needs XRT/XCLBIN toolchain |
+**NPU (XDNA 2) requirements:**
+- Fixed-shape subgraphs only (AIE2 tile-based ISA)
+- Best for: MLA attention (fixed-shape per token), shared-expert MLP (always active, same shape every layer)
+- Worst for: Routed experts (variable topk per token → variable shape)
 
-**Recommendation:** Focus on Vulkan first (mature ecosystem, Mesa/RADV available on Fedora), then ROCm optimization (already works, just needs validation), then NPU (lowest priority, most complex).
+**GPU (RDNA 4) requirements:**
+- Variable-shape matmuls
+- Best for: Routed experts (variable topk), dense weights (large matrices)
+- Can handle: Fixed-shape subgraphs (but less efficient than NPU for small fixed shapes)
+
+**CPU requirements:**
+- Fallback for all backends
+- Best for: Small tensors (norms, routers, biases), orchestration, routing
+
+**Recommendation:**
+1. **NPU:** Offload MLA attention and shared-expert MLP (fixed-shape, always active)
+2. **GPU:** Handle routed experts and dense weights (variable-shape, large matrices)
+3. **CPU:** Fallback for everything, plus small tensor operations
 
 ---
 
 ## Key Gaps
 
-1. **Qwen3.5 engine needs to store tensors in quantized format** — Currently dequantizes everything to F32 in memory. Needs to:
+1. **Qwen3.5 engine must store tensors in quantized format** — Currently dequantizes everything to F32 in memory. Needs to:
    - Store tensors in INT8/INT4 format (fmt 1/2) in the `QLayer` struct
    - Use the backend runtime for matmul (which supports fmt 1/2)
    - Only dequantize at matmul time (dequant-on-use)
+   - Match GLM's memory layout: dense weights int4, shared experts int8, routed experts int4 (streaming)
 
-2. **Vulkan GPU-native kernels** — Need SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording. This is the only backend requiring new low-level code.
+2. **Vulkan GPU-native kernels** — Need SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording.
 
 3. **NPU GPU-native kernels** — Need XRT kernel loading, fixed-shape subgraph offload. Lowest priority.
 
@@ -143,9 +200,9 @@ The NPU and Vulkan backends currently use `matmul_host()` which is a **CPU fallb
 
 ## Implementation Priority
 
-1. **Qwen3.5 engine quantization storage** — Store tensors in INT8/INT4 format (fmt 1/2) in the `QLayer` struct, use backend runtime for matmul, dequant-on-use at matmul time. This unlocks memory savings and GPU acceleration.
+1. **Qwen3.5 engine quantization storage** — Store tensors in INT8/INT4 format (fmt 1/2) in the `QLayer` struct, use backend runtime for matmul, dequant-on-use at matmul time. Match GLM's memory layout for equivalent memory savings (~57% reduction).
 
-2. **Vulkan GPU-native kernels** — SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording. This is the only backend requiring new low-level code.
+2. **Vulkan GPU-native kernels** — SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording.
 
 3. **ROCm validation** — Test existing HIP kernel with int4/int8/F32 on Strix Halo, validate unified memory path.
 
