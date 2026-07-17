@@ -22,9 +22,7 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
-    container:
-      image: registry.fedoraproject.org/fedora:43
+    runs-on: [self-hosted, linux, x64, fedora]
     strategy:
       fail-fast: false
       matrix:
@@ -38,22 +36,9 @@ jobs:
       - name: Install Git and container tooling
         run: |
           set -euo pipefail
-          dnf upgrade -y --setopt=install_weak_deps=False
-          dnf install -y --setopt=install_weak_deps=False \
+          sudo dnf upgrade -y --setopt=install_weak_deps=False
+          sudo dnf install -y --setopt=install_weak_deps=False \
             git curl tar gzip bzip2 ca-certificates podman
-          mkdir -p /etc/containers /var/lib/containers/storage
-          # Use the VFS driver and host user namespaces for container storage in
-          # this CI container to avoid overlayfs and user-namespace issues when
-          # Podman runs inside another container.
-          cat > /etc/containers/containers.conf <<'CONTAINERS_CONF_END'
-          [storage]
-          driver = "vfs"
-
-          [engine]
-          cgroup_manager = "cgroupfs"
-          events_logger = "file"
-          userns = "host"
-          CONTAINERS_CONF_END
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -95,10 +80,6 @@ jobs:
             echo "No container tags were generated" >&2
             exit 1
           fi
-
-          # Use chroot isolation to avoid nested namespace issues when building
-          # inside the GitHub Actions container.
-          export BUILDAH_ISOLATION=chroot
 
           primary_tag="${tags[0]}"
           podman build \
