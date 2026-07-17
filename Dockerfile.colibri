@@ -3,7 +3,10 @@
 FROM ubuntu:24.04 AS build
 
 ARG BACKEND=vulkan
+# Optional URL to a compatible XRT .deb package when xrt/libxrt-dev are not available in the configured APT repositories.
 ARG XRT_DEB_URL=
+# Optional SHA-256 checksum for XRT_DEB_URL when a .deb fallback is used.
+ARG XRT_DEB_SHA256=
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ROCM_PATH=/opt/rocm \
@@ -22,24 +25,31 @@ RUN case "$BACKEND" in \
             curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
             echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ ubuntu main" \
                 > /etc/apt/sources.list.d/rocm.list ;; \
-    esac
-
-RUN install_xrt_deps() { \
-        if apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; then \
+    esac \
+    && has_xrt_packages() { \
+        apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; \
+    } \
+    && install_xrt_deps() { \
+        if has_xrt_packages; then \
             apt-get update && apt-get install -y --no-install-recommends \
                 xrt libxrt-dev \
             && rm -rf /var/lib/apt/lists/*; \
         elif [ -n "$XRT_DEB_URL" ]; then \
             curl -fsSL "$XRT_DEB_URL" -o /tmp/xrt.deb && \
+            if [ -n "$XRT_DEB_SHA256" ]; then \
+                printf '%s  /tmp/xrt.deb\n' "$XRT_DEB_SHA256" | sha256sum -c -; \
+            fi && \
             apt-get update && apt-get install -y --no-install-recommends /tmp/xrt.deb \
             && rm -f /tmp/xrt.deb \
             && rm -rf /var/lib/apt/lists/*; \
         else \
-            echo "xrt/libxrt-dev is not available in the configured Apt sources; provide XRT_DEB_URL to a compatible .deb or add the appropriate repository (for example from https://github.com/Xilinx/XRT)." >&2; \
+            printf '%s\n' \
+                "xrt/libxrt-dev is not available in the configured APT sources; provide XRT_DEB_URL to a compatible .deb or add the appropriate repository." \
+                "See https://github.com/Xilinx/XRT for details." >&2; \
             exit 1; \
         fi; \
-    }; \
-    case "$BACKEND" in \
+    } \
+    && case "$BACKEND" in \
         vulkan) \
             apt-get update && apt-get install -y --no-install-recommends \
                 libvulkan-dev vulkan-tools glslang-tools spirv-tools \
@@ -47,8 +57,8 @@ RUN install_xrt_deps() { \
             && rm -rf /var/lib/apt/lists/* ;; \
         rocm) \
             apt-get update && apt-get install -y --no-install-recommends \
-                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-dev \
-                hipblas hipblas-dev rocm-cmake libomp-dev \
+                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel librocblas-dev \
+                libhipblas-dev rocm-cmake libomp-dev \
             && rm -rf /var/lib/apt/lists/* ;; \
         npu) \
             install_xrt_deps ;; \
@@ -56,8 +66,8 @@ RUN install_xrt_deps() { \
             apt-get update && apt-get install -y --no-install-recommends \
                 libvulkan-dev vulkan-tools glslang-tools spirv-tools \
                 mesa-vulkan-drivers libvulkan1 \
-                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-dev \
-                hipblas hipblas-dev rocm-cmake libomp-dev \
+                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel librocblas-dev \
+                libhipblas-dev rocm-cmake libomp-dev \
             && rm -rf /var/lib/apt/lists/* \
             && install_xrt_deps ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
