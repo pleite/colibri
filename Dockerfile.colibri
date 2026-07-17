@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN case "$BACKEND" in \
+RUN set -e && case "$BACKEND" in \
         rocm|all) \
             curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
             echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4 noble main" \
@@ -29,9 +29,16 @@ RUN case "$BACKEND" in \
     && has_xrt_packages() { \
         apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; \
     } \
+    && install_rocm_deps() { \
+        apt-get update && apt-get install -y --no-install-recommends \
+            rocm-llvm rocm-device-libs hip-runtime-amd hip-dev \
+            rocblas-dev hipblas-dev rocm-cmake libomp-dev \
+        && rm -rf /var/lib/apt/lists/*; \
+    } \
     && install_xrt_deps() { \
+        apt-get update && \
         if has_xrt_packages; then \
-            apt-get update && apt-get install -y --no-install-recommends \
+            apt-get install -y --no-install-recommends \
                 xrt libxrt-dev \
             && rm -rf /var/lib/apt/lists/*; \
         elif [ -n "$XRT_DEB_URL" ]; then \
@@ -39,14 +46,13 @@ RUN case "$BACKEND" in \
             if [ -n "$XRT_DEB_SHA256" ]; then \
                 printf '%s  /tmp/xrt.deb\n' "$XRT_DEB_SHA256" | sha256sum -c -; \
             fi && \
-            apt-get update && apt-get install -y --no-install-recommends /tmp/xrt.deb \
+            apt-get install -y --no-install-recommends /tmp/xrt.deb \
             && rm -f /tmp/xrt.deb \
             && rm -rf /var/lib/apt/lists/*; \
         else \
             printf '%s\n' \
-                "xrt/libxrt-dev is not available in the configured APT sources; provide XRT_DEB_URL to a compatible .deb or add the appropriate repository." \
-                "See https://github.com/Xilinx/XRT for details." >&2; \
-            exit 1; \
+                "xrt/libxrt-dev is not available in the configured APT sources; skipping XRT installation." \
+                "Provide XRT_DEB_URL to install a compatible .deb or see https://github.com/Xilinx/XRT for instructions." >&2; \
         fi; \
     } \
     && case "$BACKEND" in \
@@ -56,19 +62,15 @@ RUN case "$BACKEND" in \
                 mesa-vulkan-drivers libvulkan1 \
             && rm -rf /var/lib/apt/lists/* ;; \
         rocm) \
-            apt-get update && apt-get install -y --no-install-recommends \
-                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel librocblas-dev \
-                libhipblas-dev rocm-cmake libomp-dev \
-            && rm -rf /var/lib/apt/lists/* ;; \
+            install_rocm_deps ;; \
         npu) \
             install_xrt_deps ;; \
         all) \
             apt-get update && apt-get install -y --no-install-recommends \
                 libvulkan-dev vulkan-tools glslang-tools spirv-tools \
                 mesa-vulkan-drivers libvulkan1 \
-                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel librocblas-dev \
-                libhipblas-dev rocm-cmake libomp-dev \
             && rm -rf /var/lib/apt/lists/* \
+            && install_rocm_deps \
             && install_xrt_deps ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
     esac
