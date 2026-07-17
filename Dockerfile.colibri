@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN case "$BACKEND" in \
         rocm|all) \
             curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ ubuntu main" \
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4 noble main" \
                 > /etc/apt/sources.list.d/rocm.list ;; \
     esac \
     && has_xrt_packages() { \
