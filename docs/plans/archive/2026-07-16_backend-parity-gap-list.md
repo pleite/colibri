@@ -247,3 +247,56 @@ Every backend (`backend_runtime.c`, `backend_npu.c`, `backend_vulkan.c`, `backen
 - `docs/plans/2026-07-15_copilot-ornith-feature-completeness.md` — Content absorbed into this doc
 - `docs/plans/2026-07-15_engine-capability-audit.md` — Content absorbed into this doc
 - `docs/plans/backend-gap-analysis.md` — Content absorbed into this doc
+
+---
+
+## Post-PR #61 Container Validation (2026-07-17T17:00Z)
+
+### What Changed
+
+PR #61 reverted Dockerfile.colibri from Ubuntu 24.04 back to Fedora 43. All 4 container images (vulkan, rocm, npu, all) now build and push to GHCR successfully.
+
+### Validation Results
+
+**Binaries present in all containers:** glm, qwen35_moe (both ELF x86-64)
+**Python files present in all containers:** openai_server.py, doctor.py, resource_plan.py, tools/
+
+**Backend object files:**
+- colibri-all: backend_runtime.o, backend_rocm.o, backend_vulkan.o, backend_npu.o
+- colibri-rocm: backend_runtime.o, backend_rocm.o
+- colibri-vulkan: backend_runtime.o, backend_vulkan.o
+- colibri-npu: backend_runtime.o, backend_npu.o
+
+**Runtime library validation (ldd):**
+- colibri-rocm: libamdhip64.so.7, libhsa-runtime64.so.1, libamd_comgr.so.3, librocprofiler-register.so.0 — ROCm runtime fully linked
+- colibri-vulkan: NO libvulkan.so.1 — backend_vulkan.o compiled but runtime libvulkan missing (CPU fallback only)
+- colibri-npu: NO libxrt — backend_npu.o compiled but XRT runtime missing (CPU fallback only)
+
+### NEW GAPS (Post-PR #61)
+
+| # | Gap | Severity | Details |
+|---|-----|----------|---------|
+| 7 | test_backend_npu link failure | HIGH | Makefile test_backend_npu target links backend_npu.o without NPU_BACKEND_CFLAGS. coli_cuda_* calls resolve to undefined symbols. Fix: add NPU_BACKEND_CFLAGS to test link line. |
+| 8 | Vulkan runtime libvulkan missing | MEDIUM | vulkan container has backend_vulkan.o compiled but no libvulkan.so.1. dlopen-based backend can't load actual Vulkan. Fix: add libvulkan1 to vulkan container packages. |
+| 9 | NPU runtime XRT missing | MEDIUM | npu container has backend_npu.o compiled but no libxrt. XCLBIN loading fails. CPU fallback works. Fix: ensure XRT copr repo packages install correctly in container. |
+| 10 | No test step in CI workflow | MEDIUM | CI only builds containers. No tests run inside them. test_backend_npu would fail immediately. Fix: add test step to container-images.yml. |
+| 11 | No test-python in CI | LOW | Python tests (test_doctor.py, test_openai_server.py, test_qwen35_quant_converter.py) never run. Fix: add test-python to CI. |
+| 12 | No coli_runtime binary | LOW | Plans reference coli_runtime but Makefile only builds glm and qwen35_moe. Fix: add coli_runtime target to Makefile. |
+
+### Container Image Sizes
+
+| Image | Size | Notes |
+|-------|------|-------|
+| colibri-all | 10.7 GB | Full Fedora 43 + all backends + ROCm |
+| colibri-rocm | 10.4 GB | Fedora 43 + ROCm |
+| colibri-vulkan | 937 MB | Fedora 43 + Vulkan (no ROCm) |
+| colibri-npu | 611 MB | Fedora 43 + NPU (no ROCm) |
+
+### Recommended Fixes (in order)
+
+1. Fix Makefile test_backend_npu target — add NPU_BACKEND_CFLAGS to test link line
+2. Add libvulkan1 to vulkan container Dockerfile
+3. Verify XRT installs in NPU container (check copr repo availability)
+4. Add test step to CI workflow (run make test-c inside container after build)
+5. Add test-python step to CI workflow
+6. Consider multi-stage Dockerfile to reduce image sizes
