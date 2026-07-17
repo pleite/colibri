@@ -24,7 +24,7 @@ Partially addressed / still hardware-gated (cannot be compiled or validated in a
 | # | Gap item | Status |
 |---|----------|--------|
 | 2 | Vulkan SPIR-V `quant_matmul` shader | ⏳ Still a CPU fallback; runtime lane + role wiring is in place so a real kernel can drop in |
-| 3 | NPU (XDNA) XRT kernels | ⏳ Still a CPU shim; lane + role wiring in place |
+| 3 | NPU (XDNA) XRT kernels | ✅ Framework integration path is in place; actual XDNA kernels remain a hardware-gated CPU shim |
 
 See **[docs/backend-parity-implementation.md](../backend-parity-implementation.md)** for the full design of the quantized storage, the parallel role-aware scheduler, and the server/planner/doctor changes delivered here.
 
@@ -212,7 +212,7 @@ Every backend (`backend_runtime.c`, `backend_npu.c`, `backend_vulkan.c`, `backen
 
 2. **Vulkan GPU-native kernels** — Need SPIR-V compute shader for `quant_matmul` (fmt 0/1/2), VkBuffer/VkDescriptorSet management, command recording.
 
-3. **NPU GPU-native kernels** — Need XRT kernel loading, fixed-shape subgraph offload. Lowest priority.
+3. **NPU GPU-native kernels** — The AMD/XDNA/XRT framework integration path is now wired through the NPU backend and can dispatch an external plugin; the remaining gap is the real fixed-shape XRT kernel implementation itself. Lowest priority.
 
 4. **Backend-specific correctness tests** — Every backend needs tests for the same paths CPU exercises.
 

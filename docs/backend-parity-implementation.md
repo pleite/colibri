@@ -266,9 +266,19 @@ To make that drop-in path explicit, the Vulkan and NPU shims now accept an
 optional native-kernel plugin via environment variables:
 
 - `COLI_VULKAN_KERNEL_LIB=/path/to/libcolibri_vulkan_kernel.so`
+- `COLI_NPU_FRAMEWORK=xdna` (or `amd`, `xrt`) to select the AMD/XDNA path explicitly
 - `COLI_NPU_XRT_LIB=/path/to/libcolibri_npu_xrt.so` (preferred for AMD XDNA/XRT)
+- `COLI_NPU_DRIVER_LIB=/path/to/libcolibri_npu_driver.so` (framework-specific alias)
 - `COLI_NPU_KERNEL_LIB=/path/to/libcolibri_npu_kernel.so` (fallback compatibility name)
 
 A plugin may export `coli_vulkan_native_matmul()` / `coli_npu_native_matmul()`
 (and optional init/shutdown hooks) and will be used in preference to the CPU
-reference path; otherwise the existing host fallback remains active.
+reference path; otherwise the existing host fallback remains active. When
+`COLI_NPU_FRAMEWORK` is set to an AMD/XDNA-style value (`xdna`, `amd`, `xrt`),
+the backend prefers `COLI_NPU_XRT_LIB`, then `COLI_NPU_DRIVER_LIB`, then
+`COLI_NPU_KERNEL_LIB` for the framework-specific lookup order. The same
+`COLI_NPU_XRT_LIB` / `COLI_NPU_DRIVER_LIB` / `COLI_NPU_KERNEL_LIB` variables are
+also accepted without the framework flag; the flag only changes which one is
+tried first. The NPU backend now resolves the AMD/XDNA stack through this
+explicit framework-aware path, but the actual fixed-shape XRT kernels remain
+the remaining hardware-gated implementation gap.
