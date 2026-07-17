@@ -2,8 +2,8 @@
 set -euo pipefail
 
 RUNTIME="${CONTAINER_RUNTIME:-podman}"
-IMAGE="${IMAGE:-ghcr.io/pleite/colibri-npu:latest}"
-NAME="${NAME:-colibri-npu}"
+IMAGE="${IMAGE:-}"
+NAME="${NAME:-}"
 PORT="${PORT:-8000}"
 CONTAINER_PORT="${CONTAINER_PORT:-8000}"
 BACKEND="${BACKEND:-npu}"
@@ -39,17 +39,17 @@ validate_model_dir() {
 usage() {
     cat <<'EOF'
 Usage: ./c/scripts/run-container.sh [--image IMAGE] [--name NAME] [--port PORT] [--backend BACKEND] [--model-dir DIR]
-
+    
 Optional flags:
-  --image    Container image to run (defaults to the NPU image)
+  --image    Container image to run (defaults to a backend-specific image)
   --name     Container name
   --port     Host port to publish (defaults to 8000)
   --backend  Value for COLI_ACCEL (defaults to npu)
   --model-dir Mount a host model directory into /models and set COLI_MODEL=/models
-
+    
 Examples:
   c/scripts/run-container.sh
-  c/scripts/run-container.sh --image ghcr.io/pleite/colibri-npu:latest --model-dir /path/to/your-model
+  c/scripts/run-container.sh --backend cpu --image ghcr.io/pleite/colibri-cpu:latest --model-dir /path/to/your-model
   c/scripts/run-container.sh --name colibri-npu --port 8080 --backend npu --model-dir /path/to/your-model
 EOF
 }
@@ -104,6 +104,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ -z "$IMAGE" ]; then
+    case "$BACKEND" in
+        cpu) IMAGE="ghcr.io/pleite/colibri-cpu:latest" ;;
+        vulkan) IMAGE="ghcr.io/pleite/colibri-vulkan:latest" ;;
+        rocm) IMAGE="ghcr.io/pleite/colibri-rocm:latest" ;;
+        npu) IMAGE="ghcr.io/pleite/colibri-npu:latest" ;;
+        all) IMAGE="ghcr.io/pleite/colibri-all:latest" ;;
+        auto) IMAGE="ghcr.io/pleite/colibri-cpu:latest" ;;
+    esac
+fi
+
+if [ -z "$NAME" ]; then
+    NAME="colibri-$BACKEND"
+fi
+
 if ! command -v "$RUNTIME" >/dev/null 2>&1; then
     echo "error: container runtime '$RUNTIME' is not installed" >&2
     exit 1
@@ -115,17 +130,20 @@ validate_backend "$BACKEND"
 run_args=(run --rm -d --name "$NAME")
 run_args+=(--publish "${PORT}:${CONTAINER_PORT}")
 run_args+=(--env "COLI_ACCEL=$BACKEND")
-# Keep host group memberships inside the container so the mounted device nodes remain accessible.
-run_args+=(--group-add keep-groups)
 
-for host_path in /dev/accel /dev/dri /dev/kfd; do
-    if [ -e "$host_path" ]; then
-        run_args+=(--mount "type=bind,src=$host_path,dst=$host_path")
+if [ "$BACKEND" != "cpu" ]; then
+    # Keep host group memberships inside the container so the mounted device nodes remain accessible.
+    run_args+=(--group-add keep-groups)
+
+    for host_path in /dev/accel /dev/dri /dev/kfd; do
+        if [ -e "$host_path" ]; then
+            run_args+=(--mount "type=bind,src=$host_path,dst=$host_path")
+        fi
+    done
+
+    if [ -d /sys/bus/accel ]; then
+        run_args+=(--mount "type=bind,src=/sys/bus/accel,dst=/sys/bus/accel,readonly")
     fi
-done
-
-if [ -d /sys/bus/accel ]; then
-    run_args+=(--mount "type=bind,src=/sys/bus/accel,dst=/sys/bus/accel,readonly")
 fi
 
 if [ -n "$MODEL_DIR" ]; then

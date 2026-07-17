@@ -23,16 +23,51 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 
 ## Container images
 
-A reusable container build is available in `Dockerfile.colibri`. The same Dockerfile builds backend-specific images for Vulkan, ROCm, and NPU-enabled variants by passing `--build-arg BACKEND=<vulkan|rocm|npu|all>`.
+A reusable container build is available in `Dockerfile.colibri`. The same Dockerfile builds backend-specific images for CPU, Vulkan, ROCm, and NPU-enabled variants by passing `--build-arg BACKEND=<cpu|vulkan|rocm|npu|all>`.
 
 ```bash
+docker build -f Dockerfile.colibri -t colibri-cpu --build-arg BACKEND=cpu .
 docker build -f Dockerfile.colibri -t colibri-vulkan --build-arg BACKEND=vulkan .
 docker build -f Dockerfile.colibri -t colibri-rocm --build-arg BACKEND=rocm .
 docker build -f Dockerfile.colibri -t colibri-npu --build-arg BACKEND=npu .
 docker build -f Dockerfile.colibri -t colibri-all --build-arg BACKEND=all .
 ```
 
-The `all` variant installs and builds Vulkan, ROCm, and NPU backends together so the runtime scheduler can dispatch across them from the same image. The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
+The CPU image is intended for a Qwen/OpenAI server smoke test on CI and on a workstation with enough RAM for the model being exercised. It builds both the GLM and Qwen entrypoints and starts the standard OpenAI-compatible gateway on port 8000. The repository also includes `.github/workflows/container-images.yml`, which builds and publishes matching images to GHCR for each backend on pushes to `main`/`master`, tags, and workflow dispatch.
+
+### Running the CPU-only Qwen/OpenAI container
+
+The CPU image is a good fit for a proof-of-concept that validates the OpenAI-serving path without GPU dependencies. Start it with a model directory mounted into `/models` and a memory cap that leaves headroom for the host runtime:
+
+```bash
+podman run --rm -d --name colibri-cpu \
+  -p 8000:8000 \
+  --memory=12g \
+  --cpus=4 \
+  --mount type=bind,src=/path/to/your-model,dst=/models,ro \
+  --env COLI_MODEL=/models \
+  ghcr.io/pleite/colibri-cpu:latest
+```
+
+Then probe the server:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5","messages":[{"role":"user","content":"Hello"}],"stream":false}'
+```
+
+The same launch flow works from `c/scripts/run-container.sh`:
+
+```bash
+./c/scripts/run-container.sh --backend cpu --image ghcr.io/pleite/colibri-cpu:latest --model-dir /path/to/your-model
+```
+
+The CPU-only path is intended for smoke testing and validation of the server surface. Large Qwen models still depend on the host's available RAM and disk throughput, and expert streaming / cache behavior remains a manual validation step rather than a production guarantee.
+
+The `all` variant installs and builds Vulkan, ROCm, and NPU backends together so the runtime scheduler can dispatch across them from the same image.
 
 ### Running the NPU-enabled container
 
