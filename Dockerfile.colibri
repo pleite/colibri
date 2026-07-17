@@ -1,106 +1,36 @@
 # syntax=docker/dockerfile:1.7
 # Colibri backend container image for Vulkan, ROCm, or NPU-enabled builds.
-FROM ubuntu:24.04 AS build
+FROM fedora:43 AS build
 
 ARG BACKEND=vulkan
-# Optional URL to a compatible XRT .deb package when xrt/libxrt-dev are not available in the configured APT repositories.
-ARG XRT_DEB_URL=
-# Optional SHA-256 checksum for XRT_DEB_URL when a .deb fallback is used.
-ARG XRT_DEB_SHA256=
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    ROCM_PATH=/opt/rocm \
+ENV ROCM_PATH=/opt/rocm \
     HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
     PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential gcc g++ make git python3 python3-pip \
-        ca-certificates curl gnupg \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN set -e && case "$BACKEND" in \
-        rocm|all) \
-            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4 noble main" \
-                > /etc/apt/sources.list.d/rocm.list ;; \
-    esac \
-    && has_xrt_packages() { \
-        apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; \
-    } \
-    && install_rocm_package() { \
-        local pkg; \
-        for pkg in "$@"; do \
-           if apt-cache show "$pkg" >/dev/null 2>&1; then \
-               apt-get install -y --no-install-recommends "$pkg"; \
-               return 0; \
-           fi; \
-        done; \
-        echo "Unable to locate any of the requested ROCm packages: $*" >&2; \
-        return 1; \
-    } \
-    && install_rocm_deps() { \
-        apt-get update \
-        && install_rocm_package rocm-llvm \
-        && install_rocm_package rocm-device-libs \
-        && install_rocm_package hip-runtime-amd \
-        && install_rocm_package hip-dev hip-devel \
-        && install_rocm_package rocblas-dev rocblas-devel \
-        && install_rocm_package hipblas-dev hipblas-devel \
-        && install_rocm_package rocm-cmake \
-        && install_rocm_package libomp-dev libomp-devel \
-        && rm -rf /var/lib/apt/lists/* \
-        && ROCM_CLANG=$(ls /opt/rocm/llvm/bin/clang-[0-9]* 2>/dev/null \
-               | grep -E '/clang-[0-9]+$' | sort -V | tail -1) \
-        && if [ -n "$ROCM_CLANG" ] && [ ! -e /opt/rocm/llvm/bin/clang-17 ]; then \
-               ln -sf "$ROCM_CLANG" /opt/rocm/llvm/bin/clang-17; \
-           fi \
-        && if [ ! -e /opt/rocm/bin/rocm_agent_enumerator ] \
-               && command -v rocm_agent_enumerator >/dev/null 2>&1; then \
-               mkdir -p /opt/rocm/bin \
-               && ln -sf "$(command -v rocm_agent_enumerator)" /opt/rocm/bin/rocm_agent_enumerator; \
-           fi; \
-    } \
-    && install_xrt_deps() { \
-        apt-get update && \
-        if has_xrt_packages; then \
-            apt-get install -y --no-install-recommends \
-                xrt libxrt-dev \
-            && rm -rf /var/lib/apt/lists/*; \
-        elif [ -n "$XRT_DEB_URL" ]; then \
-            curl -fsSL "$XRT_DEB_URL" -o /tmp/xrt.deb && \
-            if [ -n "$XRT_DEB_SHA256" ]; then \
-                printf '%s  /tmp/xrt.deb\n' "$XRT_DEB_SHA256" | sha256sum -c -; \
-            fi && \
-            apt-get install -y --no-install-recommends /tmp/xrt.deb \
-            && rm -f /tmp/xrt.deb \
-            && rm -rf /var/lib/apt/lists/*; \
-        else \
-            printf '%s\n' \
-                "xrt/libxrt-dev is not available in the configured APT sources; skipping XRT installation." \
-                "Provide XRT_DEB_URL to install a compatible .deb or see https://github.com/Xilinx/XRT for instructions." >&2; \
-        fi; \
-    } \
+RUN set -e && \
+    dnf install -y --setopt=install_weak_deps=False \
+        gcc gcc-c++ make git python3 python3-pip \
+        ca-certificates curl gnupg dnf-plugins-core \
     && case "$BACKEND" in \
-        vulkan) \
-            apt-get update && apt-get install -y --no-install-recommends \
-                libvulkan-dev vulkan-tools glslang-tools spirv-tools \
-                mesa-vulkan-drivers libvulkan1 \
-            && rm -rf /var/lib/apt/lists/* ;; \
-        rocm) \
-            install_rocm_deps ;; \
-        npu) \
-            install_xrt_deps ;; \
-        all) \
-            apt-get update && apt-get install -y --no-install-recommends \
-                libvulkan-dev vulkan-tools glslang-tools spirv-tools \
-                mesa-vulkan-drivers libvulkan1 \
-            && rm -rf /var/lib/apt/lists/* \
-            && install_rocm_deps \
-            && install_xrt_deps ;; \
-        *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
-    esac
+        rocm|all) \
+           dnf copr enable -y tpitera/rocm && \
+           dnf install -y --setopt=install_weak_deps=False \
+               rocm-hip-sdk rocm-hip-devel hipcc rocm-smi ;; \
+    esac \
+    && case "$BACKEND" in \
+        vulkan|all) \
+           dnf install -y --setopt=install_weak_deps=False \
+               vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
+    esac \
+    && case "$BACKEND" in \
+        npu|all) \
+           dnf copr enable -y xanderlent/amd-npu-driver && \
+           dnf install -y --setopt=install_weak_deps=False xrt ;; \
+    esac \
+    && dnf clean all
 
 WORKDIR /opt/colibri/c
 COPY c /opt/colibri/c
