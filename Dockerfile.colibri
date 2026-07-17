@@ -1,45 +1,37 @@
 # syntax=docker/dockerfile:1.7
 # Colibri backend container image for Vulkan, ROCm, or NPU-enabled builds.
-FROM ubuntu:24.04 AS build
+FROM registry.fedoraproject.org/fedora:43 AS build
 
 ARG BACKEND=vulkan
-ARG ROCM_VERSION=7.2.4
-ARG UBUNTU_CODENAME=noble
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    ROCM_PATH=/opt/rocm \
+ENV ROCM_PATH=/opt/rocm \
     HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
     PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential gcc g++ make git python3 python3-pip \
+RUN set -e && dnf install -y --setopt=install_weak_deps=False \
+        gcc gcc-c++ make git python3 python3-pip \
         ca-certificates curl gnupg \
-    && rm -rf /var/lib/apt/lists/*
+    && dnf clean all
 
 RUN set -e && case "$BACKEND" in \
         vulkan|all) \
-           apt-get update && apt-get install -y --no-install-recommends \
-               libvulkan-dev vulkan-tools spirv-tools \
-               mesa-vulkan-drivers libvulkan1 \
-           && rm -rf /var/lib/apt/lists/* ;; \
+           dnf install -y --setopt=install_weak_deps=False \
+               vulkan-devel vulkan-tools spirv-tools shaderc \
+               mesa-vulkan-drivers vulkan-loader \
+           && dnf clean all ;; \
         rocm|all) \
-           curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
-           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION}/ ${UBUNTU_CODENAME} main" \
-               > /etc/apt/sources.list.d/rocm.list && \
-           apt-get update && apt-get install -y --no-install-recommends \
-               rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
-               librocblas-dev libhipblas-dev rocm-cmake libomp-dev hipcc rocm-smi \
-           && rm -rf /var/lib/apt/lists/* ;; \
+           dnf install -y --setopt=install_weak_deps=False dnf-plugins-core && \
+           dnf copr enable -y tpitera/rocm && \
+           dnf install -y --setopt=install_weak_deps=False \
+               rocm-hip-sdk rocm-hip-devel hipcc rocm-smi \
+           && dnf clean all ;; \
         npu|all) \
-           apt-get update && if apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; then \
-               apt-get install -y --no-install-recommends xrt libxrt-dev; \
-           else \
-               echo "warning: failed to install XRT packages for the NPU backend (package unavailable in Ubuntu 24.04 repositories); continuing without them; NPU runtime support may be unavailable" >&2; \
-           fi \
-           && rm -rf /var/lib/apt/lists/* ;; \
+           dnf install -y --setopt=install_weak_deps=False dnf-plugins-core && \
+           dnf copr enable -y xanderlent/amd-npu-driver && \
+           dnf install -y --setopt=install_weak_deps=False xrt && \
+           dnf clean all ;; \
         *) echo "unsupported backend: $BACKEND (valid values: vulkan, rocm, npu, all [installs every backend])" >&2; exit 1 ;; \
     esac
 
