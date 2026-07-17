@@ -41,7 +41,7 @@ validate_model_dir() {
 usage() {
     cat <<'EOF'
 Usage: ./c/scripts/run-container.sh [--image IMAGE] [--name NAME] [--port PORT] [--backend BACKEND] [--model-dir DIR]
-    
+
 Optional flags:
   --image    Container image to run (defaults to a backend-specific image)
   --name     Container name
@@ -50,7 +50,7 @@ Optional flags:
   --model-dir Mount a host model directory into /models and set COLI_MODEL=/models
   --memory   Container memory limit (for example 12g)
   --cpus     Container CPU count (for example 4)
-    
+
 Examples:
   c/scripts/run-container.sh
   c/scripts/run-container.sh --backend cpu --image ghcr.io/pleite/colibri-cpu:latest --model-dir /path/to/your-model
@@ -124,6 +124,10 @@ if [ -z "$IMAGE" ]; then
         npu) IMAGE="ghcr.io/pleite/colibri-npu:latest" ;;
         all) IMAGE="ghcr.io/pleite/colibri-all:latest" ;;
         auto) IMAGE="ghcr.io/pleite/colibri-cpu:latest" ;;
+        *)
+            echo "error: unsupported backend '$BACKEND'" >&2
+            exit 2
+            ;;
     esac
 fi
 
@@ -151,7 +155,7 @@ if [ -n "$CPUS" ]; then
     run_args+=(--cpus "$CPUS")
 fi
 
-if [ "$BACKEND" != "cpu" ]; then
+if [ "$BACKEND" != "cpu" ] && [ "$BACKEND" != "auto" ]; then
     # Keep host group memberships inside the container so the mounted device nodes remain accessible.
     run_args+=(--group-add keep-groups)
 

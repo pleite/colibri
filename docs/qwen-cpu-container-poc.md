@@ -1,6 +1,6 @@
 # CPU-only Qwen/OpenAI container PoC
 
-This note captures the proof-of-concept container path for exposing the colibrì OpenAI-compatible server from a CPU-only image and trying it with a Qwen model in CI or on a workstation.
+This note captures the proof-of-concept container path for exposing the colibri OpenAI-compatible server from a CPU-only image and trying it with a Qwen model in CI or on a workstation.
 
 ## What this PoC validates
 
