@@ -16,6 +16,7 @@ RUN set -e && \
         ca-certificates curl gnupg dnf-plugins-core \
     && case "$BACKEND" in \
         rocm|all) \
+           # Enable the community ROCm COPR repo for Fedora since the stock Fedora repos do not provide the ROCm toolchain packages. \
            dnf copr enable -y tpitera/rocm && \
            dnf install -y --setopt=install_weak_deps=False \
                rocm-hip-sdk rocm-hip-devel hipcc rocm-smi ;; \
@@ -27,6 +28,7 @@ RUN set -e && \
     esac \
     && case "$BACKEND" in \
         npu|all) \
+           # Enable the community AMD/XRT COPR repo because XRT is not shipped in the stock Fedora repositories. \
            dnf copr enable -y xanderlent/amd-npu-driver && \
            dnf install -y --setopt=install_weak_deps=False xrt ;; \
     esac \

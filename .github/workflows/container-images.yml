@@ -20,6 +20,9 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:43
+      options: --privileged
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +33,11 @@ jobs:
           - all
 
     steps:
+      - name: Install Git and container tooling
+        run: |
+          set -e
+          dnf install -y git curl tar gzip bzip2 ca-certificates
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
