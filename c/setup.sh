@@ -24,7 +24,12 @@ MINGW*|MSYS*)
     echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing (pacman -S mingw-w64-x86_64-gcc)"; exit 1; }
     ;;
 *)
-    command -v gcc  >/dev/null || { echo "gcc is missing (for example: sudo apt install build-essential)"; exit 1; }
+    command -v gcc  >/dev/null || {
+        echo "gcc is missing"
+        echo "  Fedora: sudo dnf install gcc gcc-c++ make"
+        echo "  Debian/Ubuntu: sudo apt install build-essential"
+        exit 1
+    }
     echo "  gcc: $(gcc -dumpversion) · $(nproc) core"
     echo -n "  OpenMP: "; echo 'int main(){return 0;}' | gcc -fopenmp -xc - -o /tmp/_omp 2>/dev/null && echo ok || { echo "libgomp is missing"; exit 1; }
     ;;
