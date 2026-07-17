@@ -1,0 +1,23 @@
+# Colibrì planning documents
+
+This directory contains the active roadmap and the archive of superseded planning notes.
+
+## Active plans
+
+- `2026-07-17_consolidated-roadmap.md` — the current, consolidated plan for runtime parity, engine fidelity, server features and multimodal follow-up work.
+- `2026-07-17_self-hosted-runner-setup.md` — the current setup note for the Strix Halo self-hosted runner workstream.
+
+## Archived notes
+
+The following historical notes have been moved to `archive/` because they were exploratory, superseded or too narrow to remain the primary plan:
+
+- `archive/2026-07-15_copilot-ornith-feature-completeness.md`
+- `archive/2026-07-15_engine-capability-audit.md`
+- `archive/2026-07-16_backend-parity-gap-list.md`
+- `archive/2026-07-17_ci-framework-migration.md`
+- `archive/2026-07-17_ci-test-integration.md`
+- `archive/2026-07-17_llama-server-int4-analysis.md`
+- `archive/2026-07-17_rocm-package-fix.md`
+- `archive/2026-07-17_status_review.md`
+- `archive/2026-07-17_toolchain-setup.md`
+- `archive/backend-gap-analysis.md`
