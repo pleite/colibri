@@ -62,7 +62,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 The same launch flow works from `c/scripts/run-container.sh`:
 
 ```bash
-./c/scripts/run-container.sh --backend cpu --image ghcr.io/pleite/colibri-cpu:latest --model-dir /path/to/your-model
+./c/scripts/run-container.sh --backend cpu --image ghcr.io/pleite/colibri-cpu:latest --memory 12g --cpus 4 --model-dir /path/to/your-model
 ```
 
 The CPU-only path is intended for smoke testing and validation of the server surface. Large Qwen models still depend on the host's available RAM and disk throughput, and expert streaming / cache behavior remains a manual validation step rather than a production guarantee.

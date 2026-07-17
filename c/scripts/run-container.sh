@@ -9,6 +9,8 @@ CONTAINER_PORT="${CONTAINER_PORT:-8000}"
 BACKEND="${BACKEND:-npu}"
 MODEL_DIR="${MODEL_DIR:-}"
 MODEL_MOUNT="${MODEL_MOUNT:-/models}"
+MEMORY="${MEMORY:-}"
+CPUS="${CPUS:-}"
 
 validate_port() {
     local value="$1"
@@ -46,6 +48,8 @@ Optional flags:
   --port     Host port to publish (defaults to 8000)
   --backend  Value for COLI_ACCEL (defaults to npu)
   --model-dir Mount a host model directory into /models and set COLI_MODEL=/models
+  --memory   Container memory limit (for example 12g)
+  --cpus     Container CPU count (for example 4)
     
 Examples:
   c/scripts/run-container.sh
@@ -92,6 +96,14 @@ while [[ $# -gt 0 ]]; do
             MODEL_DIR="$2"
             shift 2
             ;;
+        --memory)
+            MEMORY="$2"
+            shift 2
+            ;;
+        --cpus)
+            CPUS="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -130,6 +142,14 @@ validate_backend "$BACKEND"
 run_args=(run --rm -d --name "$NAME")
 run_args+=(--publish "${PORT}:${CONTAINER_PORT}")
 run_args+=(--env "COLI_ACCEL=$BACKEND")
+
+if [ -n "$MEMORY" ]; then
+    run_args+=(--memory "$MEMORY")
+fi
+
+if [ -n "$CPUS" ]; then
+    run_args+=(--cpus "$CPUS")
+fi
 
 if [ "$BACKEND" != "cpu" ]; then
     # Keep host group memberships inside the container so the mounted device nodes remain accessible.
