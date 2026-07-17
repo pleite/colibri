@@ -22,10 +22,21 @@ RUN set -e && case "$BACKEND" in \
                mesa-vulkan-drivers vulkan-loader \
            && dnf clean all ;; \
         rocm|all) \
-           dnf install -y --setopt=install_weak_deps=False dnf-plugins-core && \
-           dnf copr enable -y tpitera/rocm && \
+           cat > /etc/yum.repos.d/rocm.repo <<'EOF' && \
+[ROCm-7.2.4]
+name=ROCm7.2.4
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.4/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+EOF
            dnf install -y --setopt=install_weak_deps=False \
-               rocm-hip-sdk rocm-hip-devel hipcc rocm-smi \
+               --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+               cmake lld clang clang-devel compiler-rt libcurl-devel ninja-build \
+               rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
+               rocblas rocblas-devel hipblas hipblas-devel rocm-cmake libomp-devel libomp \
+               rocminfo radeontop \
            && dnf clean all ;; \
         npu|all) \
            dnf install -y --setopt=install_weak_deps=False dnf-plugins-core && \
