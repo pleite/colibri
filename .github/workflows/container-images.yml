@@ -42,11 +42,17 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             git curl tar gzip bzip2 ca-certificates podman
           mkdir -p /etc/containers /var/lib/containers/storage
-          # Use the VFS driver for container storage in this CI container to avoid
-          # overlayfs issues when Podman runs inside another container.
+          # Use the VFS driver and host user namespaces for container storage in
+          # this CI container to avoid overlayfs and user-namespace issues when
+          # Podman runs inside another container.
           cat > /etc/containers/containers.conf <<'CONTAINERS_CONF_END'
           [storage]
           driver = "vfs"
+
+          [engine]
+          cgroup_manager = "cgroupfs"
+          events_logger = "file"
+          userns = "host"
           CONTAINERS_CONF_END
 
       - name: Checkout repository
@@ -90,7 +96,8 @@ jobs:
             exit 1
           fi
 
-          # Use chroot isolation to avoid nested namespace issues when building inside the GitHub Actions container.
+          # Use chroot isolation to avoid nested namespace issues when building
+          # inside the GitHub Actions container.
           export BUILDAH_ISOLATION=chroot
 
           primary_tag="${tags[0]}"
