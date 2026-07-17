@@ -59,5 +59,19 @@ int main(void) {
     if (!close_enough(plugin_out, (const float[]){77.0f}, 1)) return 1;
     coli_cuda_tensor_free(plugin_tensor);
     coli_cuda_shutdown();
+
+    if (unsetenv("COLI_NPU_XRT_LIB") != 0) return 1;
+    if (unsetenv("COLI_NPU_KERNEL_LIB") != 0) return 1;
+    if (setenv("COLI_NPU_FRAMEWORK", "xdna", 1) != 0) return 1;
+    if (setenv("COLI_NPU_DRIVER_LIB", "tests/backend_native_plugin.so", 1) != 0) return 1;
+    if (!coli_cuda_init(test_devices, 1)) return 77;
+    float framework_out[1] = {0.0f};
+    ColiCudaTensor *framework_tensor = NULL;
+    if (!coli_cuda_matmul(&framework_tensor, framework_out, x, w_f32, NULL, 0, 1, 4, 1, 0)) return 1;
+    if (!close_enough(framework_out, (const float[]){77.0f}, 1)) return 1;
+    coli_cuda_tensor_free(framework_tensor);
+    coli_cuda_shutdown();
+    if (unsetenv("COLI_NPU_FRAMEWORK") != 0) return 1;
+    if (unsetenv("COLI_NPU_DRIVER_LIB") != 0) return 1;
     return 0;
 }

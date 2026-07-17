@@ -3,6 +3,11 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+/* The NPU loader uses POSIX case-insensitive matching for AMD/XDNA framework
+ * names; this backend targets Linux/Unix environments where strcasecmp is
+ * available. */
+#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -80,14 +85,86 @@ static void *g_native_handle = NULL;
 static int (*g_native_init)(void) = NULL;
 static void (*g_native_shutdown)(void) = NULL;
 static int (*g_native_matmul)(const void *weights, const float *scales, int fmt, int S, int I, int O, float *y, const float *x, int device) = NULL;
-static const char *g_native_plugin_path = NULL;
+/* Owned by the backend and released on shutdown or init failure. */
+static char *g_native_plugin_path = NULL;
 
-static int load_native_plugin(void) {
-    const char *plugin_path = getenv("COLI_NPU_XRT_LIB");
+static int is_amd_xdna_framework(const char *framework) {
+    char normalized[16];
+    if (!framework || !*framework) return 0;
+    size_t len = strlen(framework);
+    if (len >= sizeof(normalized)) return 0;
+    for (size_t i = 0; i < len; ++i) {
+        int c = (int)(unsigned char)framework[i];
+        if (c >= 'A' && c <= 'Z') {
+            normalized[i] = (char)(c + 32);
+        } else {
+            normalized[i] = (char)((c == '-') ? '_' : c);
+        }
+    }
+    normalized[len] = '\0';
+    return strcmp(normalized, "xdna") == 0 ||
+           strcmp(normalized, "amd") == 0 ||
+           strcmp(normalized, "xrt") == 0 ||
+           strcmp(normalized, "amd_xdna") == 0;
+}
+
+static void reset_native_plugin_state(void) {
+    g_native_handle = NULL;
+    free(g_native_plugin_path);
+    g_native_plugin_path = NULL;
+    g_native_init = NULL;
+    g_native_shutdown = NULL;
+    g_native_matmul = NULL;
+}
+
+static const char *resolve_native_plugin_path(void) {
+    const char *framework = getenv("COLI_NPU_FRAMEWORK");
+    const char *plugin_path = NULL;
+    if (framework && *framework && is_amd_xdna_framework(framework)) {
+        plugin_path = getenv("COLI_NPU_XRT_LIB");
+        if (!plugin_path || !*plugin_path) plugin_path = getenv("COLI_NPU_DRIVER_LIB");
+        if (!plugin_path || !*plugin_path) plugin_path = getenv("COLI_NPU_KERNEL_LIB");
+    }
+    if (!plugin_path || !*plugin_path) {
+        plugin_path = getenv("COLI_NPU_XRT_LIB");
+    }
+    if (!plugin_path || !*plugin_path) {
+        plugin_path = getenv("COLI_NPU_DRIVER_LIB");
+    }
     if (!plugin_path || !*plugin_path) {
         plugin_path = getenv("COLI_NPU_KERNEL_LIB");
     }
-    if (!plugin_path || !*plugin_path) return 0;
+    if (!plugin_path || !*plugin_path) {
+        plugin_path = getenv("COLI_NPU_PLUGIN");
+    }
+    if (!plugin_path || !*plugin_path) {
+        plugin_path = getenv("COLI_NPU_LIB");
+    }
+    if (!plugin_path || !*plugin_path) {
+        plugin_path = getenv("COLI_NPU_DRIVER");
+    }
+    if (plugin_path && *plugin_path) {
+        return plugin_path;
+    }
+    if (framework && *framework && is_amd_xdna_framework(framework)) {
+        return "";
+    }
+    return NULL;
+}
+
+static int load_native_plugin(void) {
+    const char *plugin_path = resolve_native_plugin_path();
+    const char *framework = getenv("COLI_NPU_FRAMEWORK");
+    const int requested_config = framework || getenv("COLI_NPU_DRIVER") || getenv("COLI_NPU_XRT_LIB") ||
+                                 getenv("COLI_NPU_DRIVER_LIB") || getenv("COLI_NPU_KERNEL_LIB") ||
+                                 getenv("COLI_NPU_PLUGIN") || getenv("COLI_NPU_LIB");
+    if (!plugin_path || !*plugin_path) {
+        if (requested_config) {
+            fprintf(stderr,
+                    "npu: NPU environment variables were set but no valid plugin path was configured; falling back to CPU\n");
+        }
+        return 0;
+    }
     if (g_native_handle) {
         if (g_native_plugin_path && strcmp(g_native_plugin_path, plugin_path) != 0) {
             fprintf(stderr, "npu: refusing to swap native kernel plugin from '%s' to '%s'\n",
@@ -116,7 +193,14 @@ static int load_native_plugin(void) {
     }
 
     g_native_handle = handle;
-    g_native_plugin_path = plugin_path;
+    free(g_native_plugin_path);
+    g_native_plugin_path = strdup(plugin_path);
+    if (!g_native_plugin_path) {
+        fprintf(stderr, "npu: failed to cache plugin path '%s'\n", plugin_path);
+        dlclose(g_native_handle);
+        reset_native_plugin_state();
+        return 0;
+    }
     g_native_matmul = (int (*)(const void *, const float *, int, int, int, int, float *, const float *, int))symbol;
 
     dlerror();
@@ -138,10 +222,7 @@ static int load_native_plugin(void) {
         if (g_native_shutdown) g_native_shutdown();
         dlclose(g_native_handle);
         g_native_handle = NULL;
-        g_native_plugin_path = NULL;
-        g_native_init = NULL;
-        g_native_shutdown = NULL;
-        g_native_matmul = NULL;
+        reset_native_plugin_state();
         return 0;
     }
 
@@ -258,10 +339,7 @@ void coli_npu_shutdown(void) {
         dlclose(g_native_handle);
     }
     g_native_handle = NULL;
-    g_native_plugin_path = NULL;
-    g_native_init = NULL;
-    g_native_shutdown = NULL;
-    g_native_matmul = NULL;
+    reset_native_plugin_state();
     while (g_tensor_count > 0) {
         coli_npu_tensor_free(g_tensors[0]);
     }
