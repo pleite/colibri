@@ -1,48 +1,52 @@
 # syntax=docker/dockerfile:1.7
 # Colibri backend container image for Vulkan, ROCm, or NPU-enabled builds.
-FROM registry.fedoraproject.org/fedora:43 AS build
+FROM ubuntu:24.04 AS build
 
 ARG BACKEND=vulkan
 
-ENV ROCM_PATH=/opt/rocm \
+ENV DEBIAN_FRONTEND=noninteractive \
+    ROCM_PATH=/opt/rocm \
     HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
     PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
-RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
-    gcc gcc-c++ make git python3 python3-pip python3-devel ca-certificates \
-    dnf-plugins-core \
-    && case "$BACKEND" in \
-        rocm|all) printf '%s\n' \
-            '[rocm]' \
-            'name=ROCm 7.2.4' \
-            'baseurl=https://repo.radeon.com/rocm/rhel10/7.2.4/main' \
-            'enabled=1' \
-            'priority=50' \
-            'gpgcheck=1' \
-            'gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key' \
-            > /etc/yum.repos.d/rocm.repo ;; \
-    esac \
-    && case "$BACKEND" in \
-        vulkan) dnf -y --nodocs --setopt=install_weak_deps=False install \
-            vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
-        rocm) dnf -y --nodocs --setopt=install_weak_deps=False install \
-            rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
-            hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers ;; \
-        npu) dnf copr enable -y xanderlent/amd-npu-driver \
-            && dnf -y --nodocs --setopt=install_weak_deps=False install \
-            xrt vulkan-headers ;; \
-        all) dnf copr enable -y xanderlent/amd-npu-driver \
-            && dnf -y --nodocs --setopt=install_weak_deps=False install \
-            vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader \
-            rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
-            hipblas hipblas-devel rocm-cmake libomp-devel libomp vulkan-headers \
-            xrt ;; \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential gcc g++ make git python3 python3-pip \
+        ca-certificates curl gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN case "$BACKEND" in \
+        vulkan) \
+            apt-get update && apt-get install -y --no-install-recommends \
+                libvulkan-dev vulkan-tools glslang-tools spirv-tools \
+                mesa-vulkan-drivers libvulkan1 \
+            && rm -rf /var/lib/apt/lists/* ;; \
+        rocm) \
+            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ ubuntu main" \
+                > /etc/apt/sources.list.d/rocm.list && \
+            apt-get update && apt-get install -y --no-install-recommends \
+                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
+                hipblas hipblas-devel rocm-cmake libomp-dev \
+            && rm -rf /var/lib/apt/lists/* ;; \
+        npu) \
+            apt-get update && apt-get install -y --no-install-recommends \
+                xrt libxrt-dev \
+            && rm -rf /var/lib/apt/lists/* ;; \
+        all) \
+            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ ubuntu main" \
+                > /etc/apt/sources.list.d/rocm.list && \
+            apt-get update && apt-get install -y --no-install-recommends \
+                libvulkan-dev vulkan-tools glslang-tools spirv-tools \
+                mesa-vulkan-drivers libvulkan1 \
+                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel rocblas rocblas-devel \
+                hipblas hipblas-devel rocm-cmake libomp-dev \
+                xrt libxrt-dev \
+            && rm -rf /var/lib/apt/lists/* ;; \
         *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
-    esac \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf/*
+    esac
 
 WORKDIR /opt/colibri/c
 COPY c /opt/colibri/c
