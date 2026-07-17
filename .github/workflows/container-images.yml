@@ -14,6 +14,9 @@ permissions:
   contents: read
   packages: write
 
+# The default GitHub Actions token is used for GHCR pushes, so the workflow
+# must retain the packages:write permission in this job.
+
 env:
   REGISTRY: ghcr.io
 
@@ -34,23 +37,34 @@ jobs:
     steps:
       - name: Install Git and container tooling
         run: |
-          set -e
+          set -euo pipefail
           dnf upgrade -y --setopt=install_weak_deps=False
-          dnf install -y --setopt=install_weak_deps=False git curl tar gzip bzip2 ca-certificates
+          dnf install -y --setopt=install_weak_deps=False \
+            git curl tar gzip bzip2 ca-certificates podman
+          mkdir -p /etc/containers /var/lib/containers/storage
+          # Use the VFS driver for container storage in this CI container to avoid
+          # overlayfs issues when Podman runs inside another container.
+          cat > /etc/containers/containers.conf <<'CONTAINERS_CONF_END'
+          [storage]
+          driver = "vfs"
+          CONTAINERS_CONF_END
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          username="${{ github.actor }}"
+          registry="${{ env.REGISTRY }}"
+          password="${{ secrets.GITHUB_TOKEN}}"
+
+          : "${username:?missing GitHub username}"
+          : "${registry:?missing container registry}"
+          : "${password:?missing GitHub token}"
+
+          printf '%s' "$password" | podman login --username "$username" --password-stdin "$registry"
 
       - name: Extract image metadata
         id: meta
@@ -65,15 +79,35 @@ jobs:
             type=ref,event=tag,suffix=-${{ matrix.backend }}
 
       - name: Build and push container image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.colibri
-          push: ${{ github.event_name != 'pull_request' }}
-          build-args: |
-            BACKEND=${{ matrix.backend }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(printf '%s\n' "$IMAGE_TAGS" | sed '/^$/d')
+          if [ ${#tags[@]} -eq 0 ]; then
+            echo "No container tags were generated" >&2
+            exit 1
+          fi
+
+          # Use chroot isolation to avoid nested namespace issues when building inside the GitHub Actions container.
+          export BUILDAH_ISOLATION=chroot
+
+          primary_tag="${tags[0]}"
+          podman build \
+            --format docker \
+            --platform linux/amd64 \
+            --build-arg BACKEND=${{ matrix.backend }} \
+            --file ./Dockerfile.colibri \
+            --tag "$primary_tag" \
+            .
+
+          for tag in "${tags[@]:1}"; do
+            podman tag "$primary_tag" "$tag"
+          done
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            for tag in "${tags[@]}"; do
+              podman push "$tag"
+            done
+          fi
