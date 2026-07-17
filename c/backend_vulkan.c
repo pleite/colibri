@@ -58,6 +58,11 @@ static ColiCudaTensor **g_tensors = NULL;
 static size_t g_tensor_capacity = 0;
 static _Atomic bool g_parallelism_configured = false;
 static int g_vulkan_loader_available = 0;
+static void *g_native_handle = NULL;
+static int (*g_native_init)(void) = NULL;
+static void (*g_native_shutdown)(void) = NULL;
+static int (*g_native_matmul)(const void *weights, const float *scales, int fmt, int S, int I, int O, float *y, const float *x, int device) = NULL;
+static char *g_native_plugin_path = NULL;
 
 static int env_truthy(const char *name) {
     const char *value = getenv(name);
@@ -90,6 +95,71 @@ static void probe_loader(void) {
     } else {
         g_vulkan_loader_available = 0;
     }
+}
+
+static int load_native_plugin(void) {
+    const char *plugin_path = getenv("COLI_VULKAN_KERNEL_LIB");
+    if (!plugin_path || !*plugin_path) return 0;
+    if (g_native_handle) {
+        if (g_native_plugin_path && strcmp(g_native_plugin_path, plugin_path) != 0) {
+            fprintf(stderr, "vulkan: refusing to swap native kernel plugin from '%s' to '%s'\n",
+                    g_native_plugin_path, plugin_path);
+            return 0;
+        }
+        return 1;
+    }
+
+    dlerror();
+    void *handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
+    char *dlopen_error = dlerror();
+    if (!handle) {
+        fprintf(stderr, "vulkan: failed to open native kernel plugin '%s': %s\n",
+                plugin_path, dlopen_error ? dlopen_error : "unknown error");
+        return 0;
+    }
+
+    dlerror();
+    void *symbol = dlsym(handle, "coli_vulkan_native_matmul");
+    char *dlsym_error = dlerror();
+    if (!symbol || dlsym_error) {
+        fprintf(stderr, "vulkan: plugin '%s' is missing coli_vulkan_native_matmul\n", plugin_path);
+        dlclose(handle);
+        return 0;
+    }
+
+    g_native_handle = handle;
+    free(g_native_plugin_path);
+    g_native_plugin_path = strdup(plugin_path);
+    g_native_matmul = (int (*)(const void *, const float *, int, int, int, int, float *, const float *, int))symbol;
+
+    dlerror();
+    void *init_symbol = dlsym(handle, "coli_vulkan_native_init");
+    dlsym_error = dlerror();
+    if (!dlsym_error && init_symbol) {
+        g_native_init = (int (*)(void))init_symbol;
+    }
+
+    dlerror();
+    void *shutdown_symbol = dlsym(handle, "coli_vulkan_native_shutdown");
+    dlsym_error = dlerror();
+    if (!dlsym_error && shutdown_symbol) {
+        g_native_shutdown = (void (*)(void))shutdown_symbol;
+    }
+
+    if (g_native_init && !g_native_init()) {
+        fprintf(stderr, "vulkan: native plugin init failed for '%s'\n", plugin_path);
+        if (g_native_shutdown) g_native_shutdown();
+        dlclose(g_native_handle);
+        g_native_handle = NULL;
+        free(g_native_plugin_path);
+        g_native_plugin_path = NULL;
+        g_native_init = NULL;
+        g_native_shutdown = NULL;
+        g_native_matmul = NULL;
+        return 0;
+    }
+
+    return 1;
 }
 
 static void register_tensor(ColiCudaTensor *tensor) {
@@ -190,11 +260,24 @@ int coli_cuda_init(const int *devices, int count) {
     }
     configure_parallelism();
     probe_loader();
+    load_native_plugin();
     g_initialized = 1;
     return 1;
 }
 
 void coli_cuda_shutdown(void) {
+    if (g_native_shutdown) {
+        g_native_shutdown();
+    }
+    if (g_native_handle) {
+        dlclose(g_native_handle);
+    }
+    g_native_handle = NULL;
+    free(g_native_plugin_path);
+    g_native_plugin_path = NULL;
+    g_native_init = NULL;
+    g_native_shutdown = NULL;
+    g_native_matmul = NULL;
     while (g_tensor_count > 0) {
         coli_cuda_tensor_free(g_tensors[0]);
     }
@@ -280,6 +363,13 @@ int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device) {
     if (!tensor || !y || !x || S <= 0 || I <= 0 || O <= 0 || !valid_fmt(fmt)) return 0;
+    if (g_native_matmul) {
+        if (g_native_matmul(weights, scales, fmt, S, I, O, y, x, device)) {
+            return 1;
+        }
+        fprintf(stderr, "vulkan: native plugin '%s' returned failure; falling back to CPU\n",
+                g_native_plugin_path ? g_native_plugin_path : "<unknown>");
+    }
     if (!*tensor || (*tensor)->fmt != fmt || (*tensor)->I != I || (*tensor)->O != O || (*tensor)->device != device) {
         if (!coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
     }

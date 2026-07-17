@@ -42,7 +42,7 @@ ifneq (,$(filter ppc64le ppc64,$(UNAME_M)))
 CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
+LDFLAGS = -lm -fopenmp -ldl
 EXE     =
 else
 # --- Linux x86-64 (percorso originale, invariato) ---
@@ -52,7 +52,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
+LDFLAGS = -lm -fopenmp -ldl
 EXE     =
 endif
 endif
@@ -67,7 +67,7 @@ NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 BACKEND_OBJ :=
 BACKEND_OBJ += backend_runtime.o
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE) tests/test_backend_parallel$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_vulkan$(EXE) tests/test_backend_runtime$(EXE) tests/test_backend_parallel$(EXE)
 NPU_BACKEND_CFLAGS =
 NPU_BACKEND_TEST_OBJ = backend_npu.o
 NPU_BACKEND_RUNTIME_TEST_OBJ =
@@ -246,8 +246,11 @@ tests/test_tier$(EXE): tests/test_tier.c tier.h
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o
-	$(CC) $(CFLAGS) $(NPU_BACKEND_CFLAGS) $< $(NPU_BACKEND_TEST_OBJ) -o $@ $(LDFLAGS)
+tests/test_backend_npu$(EXE): tests/test_backend_npu.c backend_npu.o tests/backend_native_plugin.so
+	$(CC) $(CFLAGS) -DCOLI_ENABLE_NPU $< $(NPU_BACKEND_TEST_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_backend_vulkan$(EXE): tests/test_backend_vulkan.c tests/backend_vulkan_native_plugin.so
+	$(CC) $(CFLAGS) -DCOLI_ENABLE_VULKAN -DCOLI_CUDA -DCOLI_VULKAN $< backend_vulkan.c -o $@ $(LDFLAGS)
 
 tests/test_backend_runtime$(EXE): tests/test_backend_runtime.c backend_runtime.o
 	$(CC) $(CFLAGS) $< backend_runtime.o $(NPU_BACKEND_RUNTIME_TEST_OBJ) $(VULKAN_BACKEND_RUNTIME_TEST_OBJ) -o $@ $(LDFLAGS)
@@ -261,6 +264,12 @@ tests/backend_runtime_npu.o: backend_runtime.c backend_runtime.h parallelism.h
 
 tests/test_backend_parallel$(EXE): tests/test_backend_parallel.c tests/backend_runtime_npu.o backend_npu.o
 	$(CC) $(CFLAGS) -DCOLI_ENABLE_NPU $< tests/backend_runtime_npu.o backend_npu.o -o $@ $(LDFLAGS)
+
+tests/backend_native_plugin.so: tests/backend_native_plugin.c
+	$(CC) -shared -fPIC -O3 -Wall -Wextra -o $@ $<
+
+tests/backend_vulkan_native_plugin.so: tests/backend_vulkan_native_plugin.c
+	$(CC) -shared -fPIC -O3 -Wall -Wextra -o $@ $< -lvulkan
 
 tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -280,7 +289,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_runtime.o backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) tests/backend_runtime_npu.o $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen35_moe$(EXE) iobench$(EXE) backend_runtime.o backend_cuda.o backend_cuda_test$(EXE) backend_rocm.o backend_rocm_test$(EXE) backend_npu.o backend_npu_test$(EXE) backend_vulkan.o backend_vulkan_test$(EXE) tests/backend_runtime_npu.o tests/backend_native_plugin.so tests/backend_vulkan_native_plugin.so $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all glm qwen35_moe_build cuda-test rocm-test npu-test vulkan-test portable test-c test-python test check clean

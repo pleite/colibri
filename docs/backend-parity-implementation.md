@@ -166,7 +166,26 @@ dispatch, role partitioning, and the reporting API.
 
 ---
 
-## 3. Planner and doctor: simultaneous backends with role affinity
+## 3. Vulkan native plugin path
+
+The Vulkan backend now exposes an optional native-plugin dispatch path for real
+compute-kernel implementations. The default shim still preserves the CPU reference
+path as a safe fallback, but when `COLI_VULKAN_KERNEL_LIB=/path/to/lib.so` is set
+it will try to load a plugin exporting `coli_vulkan_native_init()`,
+`coli_vulkan_native_shutdown()`, and `coli_vulkan_native_matmul()`.
+
+To make that path concrete, the repository now includes a reference Vulkan compute
+shader (`c/tests/shaders/shader.comp`) and a matching SPIR-V asset
+(`c/tests/shaders/comp.spv`) modeled after the
+`bmilde/vulkan_matrix_mul` example. `c/tests/backend_vulkan_native_plugin.c`
+implements an opt-in plugin that uses that shader to dispatch a simple matmul
+through Vulkan when the runtime is available; if the shader, device, or driver is
+unavailable, it falls back to the existing CPU matmul implementation so the system
+continues to run.
+
+---
+
+## 4. Planner and doctor: simultaneous backends with role affinity
 
 ### `resource_plan.py`
 
@@ -195,7 +214,7 @@ active engines and the resolved role affinity.
 
 ---
 
-## 4. OpenAI server: model Jinja chat templates
+## 5. OpenAI server: model Jinja chat templates
 
 `openai_server.py` gains optional support for a model's own
 `chat_template.jinja` (the HuggingFace-style template shipped with Qwen3.5/GLM
@@ -242,3 +261,14 @@ Real GPU-native Vulkan SPIR-V and NPU XRT kernels still fall back to CPU: they
 cannot be compiled or validated in a CPU-only CI sandbox. The runtime lane and
 role-affinity wiring is in place so a real kernel can be dropped into the existing
 lane without further scheduler changes.
+
+To make that drop-in path explicit, the Vulkan and NPU shims now accept an
+optional native-kernel plugin via environment variables:
+
+- `COLI_VULKAN_KERNEL_LIB=/path/to/libcolibri_vulkan_kernel.so`
+- `COLI_NPU_XRT_LIB=/path/to/libcolibri_npu_xrt.so` (preferred for AMD XDNA/XRT)
+- `COLI_NPU_KERNEL_LIB=/path/to/libcolibri_npu_kernel.so` (fallback compatibility name)
+
+A plugin may export `coli_vulkan_native_matmul()` / `coli_npu_native_matmul()`
+(and optional init/shutdown hooks) and will be used in preference to the CPU
+reference path; otherwise the existing host fallback remains active.

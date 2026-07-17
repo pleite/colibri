@@ -50,5 +50,14 @@ int main(void) {
     coli_cuda_tensor_free(backend_tensor_i8);
     coli_cuda_tensor_free(backend_tensor_i4);
     coli_cuda_shutdown();
+
+    if (setenv("COLI_NPU_XRT_LIB", "tests/backend_native_plugin.so", 1) != 0) return 1;
+    if (!coli_cuda_init(test_devices, 1)) return 77;
+    float plugin_out[1] = {0.0f};
+    ColiCudaTensor *plugin_tensor = NULL;
+    if (!coli_cuda_matmul(&plugin_tensor, plugin_out, x, w_f32, NULL, 0, 1, 4, 1, 0)) return 1;
+    if (!close_enough(plugin_out, (const float[]){77.0f}, 1)) return 1;
+    coli_cuda_tensor_free(plugin_tensor);
+    coli_cuda_shutdown();
     return 0;
 }
