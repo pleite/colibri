@@ -1,38 +1,42 @@
 # syntax=docker/dockerfile:1.7
 # Colibri backend container image for Vulkan, ROCm, or NPU-enabled builds.
-FROM fedora:43 AS build
+FROM ubuntu:24.04 AS build
 
 ARG BACKEND=vulkan
 
-ENV ROCM_PATH=/opt/rocm \
+ENV DEBIAN_FRONTEND=noninteractive \
+    ROCM_PATH=/opt/rocm \
     HIP_PATH=/opt/rocm \
     HIP_CLANG_PATH=/opt/rocm/llvm/bin \
     HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
     PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 
-RUN set -e && \
-    dnf install -y --setopt=install_weak_deps=False \
-        gcc gcc-c++ make git python3 python3-pip \
-        ca-certificates curl gnupg dnf-plugins-core \
-    && case "$BACKEND" in \
-        rocm|all) \
-           # Enable the community ROCm COPR repo for Fedora since the stock Fedora repos do not provide the ROCm toolchain packages. \
-           dnf copr enable -y tpitera/rocm && \
-           dnf install -y --setopt=install_weak_deps=False \
-               rocm-hip-sdk rocm-hip-devel hipcc rocm-smi ;; \
-    esac \
-    && case "$BACKEND" in \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential gcc g++ make git python3 python3-pip \
+        ca-certificates curl gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -e && case "$BACKEND" in \
         vulkan|all) \
-           dnf install -y --setopt=install_weak_deps=False \
-               vulkan-devel vulkan-tools glslc spirv-tools mesa-vulkan-drivers vulkan-loader ;; \
-    esac \
-    && case "$BACKEND" in \
+           apt-get update && apt-get install -y --no-install-recommends \
+               libvulkan-dev vulkan-tools glslang-tools spirv-tools \
+               mesa-vulkan-drivers libvulkan1 \
+           && rm -rf /var/lib/apt/lists/* ;; \
+        rocm|all) \
+           curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
+           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ noble main" \
+               > /etc/apt/sources.list.d/rocm.list && \
+           apt-get update && apt-get install -y --no-install-recommends \
+               rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
+               librocblas-dev libhipblas-dev rocm-cmake libomp-dev \
+           && rm -rf /var/lib/apt/lists/* ;; \
         npu|all) \
-           # Enable the community AMD/XRT COPR repo because XRT is not shipped in the stock Fedora repositories. \
-           dnf copr enable -y xanderlent/amd-npu-driver && \
-           dnf install -y --setopt=install_weak_deps=False xrt ;; \
-    esac \
-    && dnf clean all
+           apt-get update && (apt-get install -y --no-install-recommends \
+               xrt libxrt-dev || true) \
+           && rm -rf /var/lib/apt/lists/* ;; \
+        *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
+    esac
 
 WORKDIR /opt/colibri/c
 COPY c /opt/colibri/c
