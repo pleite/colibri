@@ -29,10 +29,27 @@ RUN set -e && case "$BACKEND" in \
     && has_xrt_packages() { \
         apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; \
     } \
+    && install_rocm_package() { \
+        local pkg; \
+        for pkg in "$@"; do \
+           if apt-cache show "$pkg" >/dev/null 2>&1; then \
+               apt-get install -y --no-install-recommends "$pkg"; \
+               return 0; \
+           fi; \
+        done; \
+        echo "Unable to locate any of the requested ROCm packages: $*" >&2; \
+        return 1; \
+    } \
     && install_rocm_deps() { \
-        apt-get update && apt-get install -y --no-install-recommends \
-            rocm-llvm rocm-device-libs hip-runtime-amd hip-dev \
-            rocblas-dev hipblas-dev rocm-cmake libomp-dev \
+        apt-get update \
+        && install_rocm_package rocm-llvm \
+        && install_rocm_package rocm-device-libs \
+        && install_rocm_package hip-runtime-amd \
+        && install_rocm_package hip-dev hip-devel \
+        && install_rocm_package rocblas-dev rocblas-devel \
+        && install_rocm_package hipblas-dev hipblas-devel \
+        && install_rocm_package rocm-cmake \
+        && install_rocm_package libomp-dev libomp-devel \
         && rm -rf /var/lib/apt/lists/* \
         && ROCM_CLANG=$(ls /opt/rocm/llvm/bin/clang-[0-9]* 2>/dev/null \
                | grep -E '/clang-[0-9]+$' | sort -V | tail -1) \
