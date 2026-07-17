@@ -33,7 +33,17 @@ RUN set -e && case "$BACKEND" in \
         apt-get update && apt-get install -y --no-install-recommends \
             rocm-llvm rocm-device-libs hip-runtime-amd hip-dev \
             rocblas-dev hipblas-dev rocm-cmake libomp-dev \
-        && rm -rf /var/lib/apt/lists/*; \
+        && rm -rf /var/lib/apt/lists/* \
+        && ROCM_CLANG=$(ls /opt/rocm/llvm/bin/clang-[0-9]* 2>/dev/null \
+               | grep -E '/clang-[0-9]+$' | sort -V | tail -1) \
+        && if [ -n "$ROCM_CLANG" ] && [ ! -e /opt/rocm/llvm/bin/clang-17 ]; then \
+               ln -sf "$ROCM_CLANG" /opt/rocm/llvm/bin/clang-17; \
+           fi \
+        && if [ ! -e /opt/rocm/bin/rocm_agent_enumerator ] \
+               && command -v rocm_agent_enumerator >/dev/null 2>&1; then \
+               mkdir -p /opt/rocm/bin \
+               && ln -sf "$(command -v rocm_agent_enumerator)" /opt/rocm/bin/rocm_agent_enumerator; \
+           fi; \
     } \
     && install_xrt_deps() { \
         apt-get update && \
