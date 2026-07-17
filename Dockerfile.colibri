@@ -3,6 +3,8 @@
 FROM ubuntu:24.04 AS build
 
 ARG BACKEND=vulkan
+ARG ROCM_VERSION=7.2.4
+ARG UBUNTU_CODENAME=noble
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ROCM_PATH=/opt/rocm \
@@ -20,22 +22,25 @@ RUN apt-get update \
 RUN set -e && case "$BACKEND" in \
         vulkan|all) \
            apt-get update && apt-get install -y --no-install-recommends \
-               libvulkan-dev vulkan-tools glslang-tools spirv-tools \
+               libvulkan-dev vulkan-tools spirv-tools \
                mesa-vulkan-drivers libvulkan1 \
            && rm -rf /var/lib/apt/lists/* ;; \
         rocm|all) \
            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /usr/share/keyrings/rocm.gpg && \
-           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4/ noble main" \
+           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION}/ ${UBUNTU_CODENAME} main" \
                > /etc/apt/sources.list.d/rocm.list && \
            apt-get update && apt-get install -y --no-install-recommends \
                rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
-               librocblas-dev libhipblas-dev rocm-cmake libomp-dev \
+               librocblas-dev libhipblas-dev rocm-cmake libomp-dev hipcc rocm-smi \
            && rm -rf /var/lib/apt/lists/* ;; \
         npu|all) \
-           apt-get update && (apt-get install -y --no-install-recommends \
-               xrt libxrt-dev || true) \
+           apt-get update && if apt-cache show xrt >/dev/null 2>&1 && apt-cache show libxrt-dev >/dev/null 2>&1; then \
+               apt-get install -y --no-install-recommends xrt libxrt-dev; \
+           else \
+               echo "warning: failed to install XRT packages for the NPU backend (package unavailable in Ubuntu 24.04 repositories); continuing without them; NPU runtime support may be unavailable" >&2; \
+           fi \
            && rm -rf /var/lib/apt/lists/* ;; \
-        *) echo "unsupported backend: $BACKEND" >&2; exit 1 ;; \
+        *) echo "unsupported backend: $BACKEND (valid values: vulkan, rocm, npu, all [installs every backend])" >&2; exit 1 ;; \
     esac
 
 WORKDIR /opt/colibri/c
