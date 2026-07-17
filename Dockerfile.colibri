@@ -18,7 +18,7 @@ RUN set -e && dnf install -y --setopt=install_weak_deps=False \
 RUN set -e && case "$BACKEND" in \
         vulkan|all) \
            dnf install -y --setopt=install_weak_deps=False \
-               vulkan-devel vulkan-tools spirv-tools shaderc \
+               vulkan-devel vulkan-tools spirv-tools glslc libshaderc-devel \
                mesa-vulkan-drivers vulkan-loader \
            && dnf clean all ;; \
         rocm|all) \
