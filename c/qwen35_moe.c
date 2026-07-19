@@ -260,6 +260,12 @@ static double g_prompt_time_ms = 0.0;
 static double g_generation_time_ms = 0.0;
 static int g_total_tokens = 0;
 
+static double get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
 static void set_model_debug_enabled(bool enabled) {
     g_model_debug_enabled = enabled;
     g_model_debug_initialized = true;
@@ -1842,6 +1848,9 @@ static void check_and_evict_if_needed(qwen35_model *m) {
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
                       int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
                       int cache_slot) {
+#if COLI_HAS_BACKEND
+    double _run_start = get_time_ms();
+#endif
     float *hidden = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
     for (int layer = 0; layer < m->num_layers; layer++) {
         QLayer *cur = &m->layers[layer];
@@ -2177,6 +2186,11 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
             }
             printf("\x01\x01END\x01\x01\n");
             printf("STAT %d 0.00 0.0 0.00\n", max_tokens_request);
+#if COLI_HAS_BACKEND
+    g_generation_time_ms = get_time_ms() - _run_start;
+    g_total_tokens = steps;
+#endif
+
             fflush(stdout);
             free(tokens);
             free(out);
