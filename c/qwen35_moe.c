@@ -114,6 +114,7 @@ typedef enum {
     QWEN_EXPERT_STATE_UNLOADED = 0,
     QWEN_EXPERT_STATE_RESIDENT = 1,
     QWEN_EXPERT_STATE_PINNED = 2,
+    QWEN_EXPERT_STATE_EVICTED = 3,
 } qwen_expert_state_t;
 
 /* Quantized tensor container (dequant-on-use). Mirrors GLM's QT layout so
@@ -356,6 +357,96 @@ static char *qwen_strdup(const char *s) {
     char *copy = (char *)qwen_malloc(len, "string copy");
     memcpy(copy, s, len);
     return copy;
+}
+
+typedef struct {
+    int layer;
+    int expert;
+    int64_t last_used;
+} expert_lru_entry_t;
+
+static expert_lru_entry_t *g_expert_lru = NULL;
+static int g_expert_lru_size = 0;
+static int64_t g_lru_counter = 0;
+
+static void expert_lru_init(qwen35_model *m) {
+    g_expert_lru_size = m->num_layers * m->num_experts;
+    g_expert_lru = (expert_lru_entry_t *)qwen_calloc(g_expert_lru_size, sizeof(expert_lru_entry_t), "expert LRU");
+    for (int i = 0; i < g_expert_lru_size; i++) {
+        g_expert_lru[i].layer = i / m->num_experts;
+        g_expert_lru[i].expert = i % m->num_experts;
+        g_expert_lru[i].last_used = 0;
+    }
+    g_lru_counter = 0;
+    model_debug("expert LRU initialized: %d entries", g_expert_lru_size);
+}
+
+static void expert_lru_free(void) {
+    free(g_expert_lru);
+    g_expert_lru = NULL;
+    g_expert_lru_size = 0;
+    g_lru_counter = 0;
+}
+
+static void expert_lru_touch(qwen35_model *m, int layer, int expert) {
+    if (!g_expert_lru) return;
+    int idx = layer * m->num_experts + expert;
+    if (idx < g_expert_lru_size) {
+        g_expert_lru[idx].last_used = ++g_lru_counter;
+    }
+}
+
+static size_t qt_data_bytes(QTensor *qt) {
+    if (!qt || !qt->data) return 0;
+    switch (qt->fmt) {
+        case 0: return (size_t)qt->O * qt->I * sizeof(float);
+        case 1: return (size_t)qt->O * qt->I * sizeof(int8_t);
+        case 2: return (size_t)qt->O * ((qt->I + 1) / 2);
+        default: return 0;
+    }
+}
+
+static void evict_single_expert(qwen35_model *m, QLayer *cur, int layer, int expert) {
+    if (cur->expert_state[expert] != QWEN_EXPERT_STATE_RESIDENT) return;
+    size_t bytes_freed = 0;
+    if (cur->expert_gate_proj[expert].data) {
+        bytes_freed += qt_data_bytes(&cur->expert_gate_proj[expert]);
+        release_ram(bytes_freed, MEM_CAT_ROUTED_EXPERTS);
+        free(cur->expert_gate_proj[expert].data);
+        cur->expert_gate_proj[expert].data = NULL;
+    }
+    if (cur->expert_up_proj[expert].data) {
+        bytes_freed += qt_data_bytes(&cur->expert_up_proj[expert]);
+        release_ram(bytes_freed, MEM_CAT_ROUTED_EXPERTS);
+        free(cur->expert_up_proj[expert].data);
+        cur->expert_up_proj[expert].data = NULL;
+    }
+    if (cur->expert_down_proj[expert].data) {
+        bytes_freed += qt_data_bytes(&cur->expert_down_proj[expert]);
+        release_ram(bytes_freed, MEM_CAT_ROUTED_EXPERTS);
+        free(cur->expert_down_proj[expert].data);
+        cur->expert_down_proj[expert].data = NULL;
+    }
+    cur->expert_state[expert] = QWEN_EXPERT_STATE_EVICTED;
+    model_debug("evicted expert %d.%d (freed ~%zu bytes)", layer, expert, bytes_freed);
+}
+
+static void expert_evict_lru_from_layer(qwen35_model *m, QLayer *cur, int layer) {
+    if (!g_expert_lru) return;
+    int64_t min_time = INT64_MAX;
+    int victim = -1;
+    for (int e = 0; e < m->num_experts; e++) {
+        if (cur->expert_state[e] == QWEN_EXPERT_STATE_RESIDENT) {
+            int idx = layer * m->num_experts + e;
+            if (idx < g_expert_lru_size && g_expert_lru[idx].last_used < min_time) {
+                min_time = g_expert_lru[idx].last_used;
+                victim = e;
+            }
+        }
+    }
+    if (victim >= 0) {
+        evict_single_expert(m, cur, layer, victim);
+    }
 }
 
 /* Scale tensors are float32 and are expected to match exactly for duplicated rows;
@@ -1118,6 +1209,7 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         }
     }
     free(arena);
+    expert_lru_init(m);
     model_debug("model init complete: %d layers, %d experts, %d kv_slots", m->num_layers, m->num_experts, m->kv_slots);
     validate_layer_config(m);
 }
@@ -1178,6 +1270,7 @@ static void free_model(qwen35_model *m) {
     free(m->final_norm);
     free(m->lm_head);
     for (int i = 0; i < m->num_layers; i++) free_layer(m, &m->layers[i]);
+    expert_lru_free();
     free(m->layers);
     free(m->layer_types);
     for (int layer = 0; layer < m->num_layers; layer++) {
@@ -1560,6 +1653,11 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     if (cur->expert_state[expert_idx] != QWEN_EXPERT_STATE_UNLOADED) {
         return;
     }
+    if (get_mem_used(MEM_CAT_ROUTED_EXPERTS) > g_ram_limit_bytes * g_evict_threshold_pct / 100) {
+        model_debug("RAM usage at %zu%% of limit, evicting LRU expert from layer %d",
+                    get_mem_used(MEM_CAT_ROUTED_EXPERTS) * 100 / g_ram_limit_bytes, layer);
+        expert_evict_lru_from_layer(m, cur, layer);
+    }
     char expert_name[1024];
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert_idx);
     cur->expert_gate_proj[expert_idx] = load_qtensor(m, expert_name, m->moe_intermediate_size, m->hidden_size, NULL);
@@ -1571,6 +1669,7 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     cur->expert_down_proj[expert_idx] = load_qtensor(m, expert_name, m->hidden_size, m->moe_intermediate_size, NULL);
     reserve_ram((size_t)m->hidden_size * m->moe_intermediate_size * sizeof(float), MEM_CAT_ROUTED_EXPERTS, "expert down_proj");
     cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
+    expert_lru_touch(m, layer, expert_idx);
     model_debug("loaded expert %d.%d", layer, expert_idx);
 }
 
