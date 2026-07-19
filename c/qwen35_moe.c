@@ -254,6 +254,7 @@ static bool g_model_debug_enabled = false;
 static bool g_model_debug_initialized = false;
 static size_t g_ram_limit_bytes = 0;
 static int g_evict_threshold_pct = 80;
+static int s_last_mem_log_layer = -1;
 static size_t g_mem_used[MEM_CAT_COUNT] = {0};
 
 static void set_model_debug_enabled(bool enabled) {
@@ -395,15 +396,18 @@ static void expert_lru_touch(qwen35_model *m, int layer, int expert) {
         g_expert_lru[idx].last_used = ++g_lru_counter;
     }
 }
+static size_t qt_elem_size(int fmt) {
+    switch (fmt) {
+        case 0: return sizeof(float);
+        case 1: return sizeof(int8_t);
+        case 2: return 1;
+        default: return sizeof(float);
+    }
+}
 
 static size_t qt_data_bytes(QTensor *qt) {
     if (!qt || !qt->data) return 0;
-    switch (qt->fmt) {
-        case 0: return (size_t)qt->O * qt->I * sizeof(float);
-        case 1: return (size_t)qt->O * qt->I * sizeof(int8_t);
-        case 2: return (size_t)qt->O * ((qt->I + 1) / 2);
-        default: return 0;
-    }
+    return (size_t)qt->O * qt->I * qt_elem_size(qt->fmt);
 }
 
 static void evict_single_expert(qwen35_model *m, QLayer *cur, int layer, int expert) {
@@ -533,6 +537,8 @@ static const expert_tensor_ref_t *find_expert_tensor_ref(int layer, int expert_i
         }
     }
     return NULL;
+
+
 }
 
 /* Scale tensors are float32 and are expected to match exactly for duplicated rows;
@@ -1761,6 +1767,12 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     reserve_ram((size_t)m->hidden_size * m->moe_intermediate_size * sizeof(float), MEM_CAT_ROUTED_EXPERTS, "expert down_proj");
     cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
     expert_lru_touch(m, layer, expert_idx);
+    if (layer % 10 == 0 && layer != s_last_mem_log_layer) {
+        s_last_mem_log_layer = layer;
+        model_debug("memory summary: routed_experts=%zu/%zu (%.1f%%)",
+                    get_mem_used(MEM_CAT_ROUTED_EXPERTS), g_ram_limit_bytes,
+                    get_mem_used(MEM_CAT_ROUTED_EXPERTS) * 100.0 / g_ram_limit_bytes);
+    }
     model_debug("loaded expert %d.%d", layer, expert_idx);
 }
 
