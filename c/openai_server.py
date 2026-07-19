@@ -702,7 +702,7 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens),
                          KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
-            [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
+            [str(executable), "--model", str(model)], env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
         self.lock = threading.Lock()

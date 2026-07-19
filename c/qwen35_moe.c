@@ -101,6 +101,16 @@ typedef enum {
 } layer_type_t;
 
 typedef enum {
+    MEM_CAT_EMBED_NORM = 0,
+    MEM_CAT_DENSE_WEIGHTS,
+    MEM_CAT_SHARED_EXPERTS,
+    MEM_CAT_ROUTED_EXPERTS,
+    MEM_CAT_KV_CACHE,
+    MEM_CAT_TEMPORARY,
+    MEM_CAT_COUNT
+} mem_category_t;
+
+typedef enum {
     QWEN_EXPERT_STATE_UNLOADED = 0,
     QWEN_EXPERT_STATE_RESIDENT = 1,
     QWEN_EXPERT_STATE_PINNED = 2,
@@ -242,7 +252,8 @@ static bool parse_bool_env(const char *name) {
 static bool g_model_debug_enabled = false;
 static bool g_model_debug_initialized = false;
 static size_t g_ram_limit_bytes = 0;
-static size_t g_ram_peak_bytes = 0;
+static int g_evict_threshold_pct = 80;
+static size_t g_mem_used[MEM_CAT_COUNT] = {0};
 
 static void set_model_debug_enabled(bool enabled) {
     g_model_debug_enabled = enabled;
@@ -279,19 +290,35 @@ static void configure_ram_limit(const char *value) {
     model_debug("RAM limit enabled: %zu bytes", g_ram_limit_bytes);
 }
 
-static bool reserve_ram(size_t bytes, const char *what) {
+static bool reserve_ram(size_t bytes, mem_category_t category, const char *what) {
     if (g_ram_limit_bytes == 0) return true;
-    if (g_ram_peak_bytes + bytes > g_ram_limit_bytes) {
+    if (g_mem_used[category] + bytes > g_ram_limit_bytes) {
         fprintf(stderr, "[qwen35_moe] RAM limit exceeded while allocating %s (%zu bytes requested, %zu bytes used, %zu bytes limit)\n",
-                what, bytes, g_ram_peak_bytes, g_ram_limit_bytes);
+                what, bytes, g_mem_used[category], g_ram_limit_bytes);
         return false;
     }
-    g_ram_peak_bytes += bytes;
+    g_mem_used[category] += bytes;
     return true;
 }
 
+static void release_ram(size_t bytes, mem_category_t category) {
+    if (bytes > 0 && g_mem_used[category] >= bytes) {
+        g_mem_used[category] -= bytes;
+    }
+}
+
+static size_t get_mem_used(mem_category_t category) {
+    return g_mem_used[category];
+}
+
+static size_t get_mem_total_used(void) {
+    size_t total = 0;
+    for (int i = 0; i < MEM_CAT_COUNT; i++) total += g_mem_used[i];
+    return total;
+}
+
 static void *qwen_malloc_impl(size_t size, const char *what) {
-    if (!reserve_ram(size, what)) fail("memory limit exceeded while allocating %s", what);
+    if (!reserve_ram(size, MEM_CAT_TEMPORARY, what)) fail("memory limit exceeded while allocating %s", what);
     void *ptr = malloc(size);
     if (!ptr) fail("out of memory");
     return ptr;
@@ -300,7 +327,7 @@ static void *qwen_malloc_impl(size_t size, const char *what) {
 static void *qwen_calloc_impl(size_t nmemb, size_t size, const char *what) {
     if (nmemb != 0 && size > SIZE_MAX / nmemb) fail("allocation size overflow");
     size_t total = nmemb * size;
-    if (!reserve_ram(total, what)) fail("memory limit exceeded while allocating %s", what);
+    if (!reserve_ram(total, MEM_CAT_TEMPORARY, what)) fail("memory limit exceeded while allocating %s", what);
     void *ptr = calloc(nmemb, size);
     if (!ptr) fail("out of memory");
     return ptr;
@@ -318,7 +345,7 @@ static size_t qwen_malloc_usable_size(void *ptr) {
 static void *qwen_realloc_impl(void *ptr, size_t size, const char *what) {
     size_t old_size = ptr ? qwen_malloc_usable_size(ptr) : 0;
     size_t delta = size > old_size ? size - old_size : 0;
-    if (delta > 0 && !reserve_ram(delta, what)) fail("memory limit exceeded while reallocating %s", what);
+    if (delta > 0 && !reserve_ram(delta, MEM_CAT_TEMPORARY, what)) fail("memory limit exceeded while reallocating %s", what);
     void *new_ptr = realloc(ptr, size);
     if (!new_ptr && size != 0) fail("out of memory");
     return new_ptr;
@@ -837,6 +864,32 @@ static void init_layer_defaults(QLayer *layer, int hidden_size, int moe_intermed
     }
 }
 
+
+static bool validate_layer_config(qwen35_model *m) {
+    if (m->num_layers == 0) {
+        model_debug("WARNING: model has 0 layers");
+        return false;
+    }
+    if (m->num_experts == 0) {
+        model_debug("WARNING: model has 0 experts");
+        return false;
+    }
+    if (m->moe_intermediate_size == 0 || m->hidden_size == 0) {
+        model_debug("WARNING: invalid model dimensions");
+        return false;
+    }
+    if (m->num_attention_heads == 0 || m->num_kv_heads == 0) {
+        model_debug("WARNING: invalid attention config");
+        return false;
+    }
+    if (m->num_experts % m->num_attention_heads != 0) {
+        model_debug("WARNING: num_experts (%d) not divisible by num_attention_heads (%d)", m->num_experts, m->num_attention_heads);
+    }
+    model_debug("layer config validated: %d layers, %d experts, %d attn_heads, %d kv_heads, hidden=%d, moe_inter=%d",
+        m->num_layers, m->num_experts, m->num_attention_heads, m->num_kv_heads, m->hidden_size, m->moe_intermediate_size);
+    return true;
+}
+
 static void init_model(qwen35_model *m, const char *snap_dir) {
     memset(m, 0, sizeof(*m));
     m->snap_dir = qwen_strdup(snap_dir);
@@ -1065,6 +1118,8 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         }
     }
     free(arena);
+    model_debug("model init complete: %d layers, %d experts, %d kv_slots", m->num_layers, m->num_experts, m->kv_slots);
+    validate_layer_config(m);
 }
 
 static void free_layer(qwen35_model *m, QLayer *layer) {
@@ -1508,11 +1563,15 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     char expert_name[1024];
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, expert_idx);
     cur->expert_gate_proj[expert_idx] = load_qtensor(m, expert_name, m->moe_intermediate_size, m->hidden_size, NULL);
+    reserve_ram((size_t)m->moe_intermediate_size * m->hidden_size * sizeof(float), MEM_CAT_ROUTED_EXPERTS, "expert gate_proj");
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.up_proj.weight", layer, expert_idx);
     cur->expert_up_proj[expert_idx] = load_qtensor(m, expert_name, m->moe_intermediate_size, m->hidden_size, NULL);
+    reserve_ram((size_t)m->moe_intermediate_size * m->hidden_size * sizeof(float), MEM_CAT_ROUTED_EXPERTS, "expert up_proj");
     snprintf(expert_name, sizeof(expert_name), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, expert_idx);
     cur->expert_down_proj[expert_idx] = load_qtensor(m, expert_name, m->hidden_size, m->moe_intermediate_size, NULL);
+    reserve_ram((size_t)m->hidden_size * m->moe_intermediate_size * sizeof(float), MEM_CAT_ROUTED_EXPERTS, "expert down_proj");
     cur->expert_state[expert_idx] = QWEN_EXPERT_STATE_RESIDENT;
+    model_debug("loaded expert %d.%d", layer, expert_idx);
 }
 
 static void ensure_cache_slot(qwen35_model *m, QLayer *cur, int layer, int slot, int steps) {
@@ -1560,6 +1619,13 @@ static void configure_parallelism(int requested_threads) {
 #endif
 }
 
+static void check_and_evict_if_needed(qwen35_model *m) {
+    size_t expert_usage = get_mem_used(MEM_CAT_ROUTED_EXPERTS);
+    size_t threshold = g_ram_limit_bytes * g_evict_threshold_pct / 100;
+    if (expert_usage < threshold) return;
+    model_debug("RAM usage at %zu%% of threshold (%zu/%zu bytes), eviction not yet implemented",
+        expert_usage * 100 / threshold, expert_usage, threshold);
+}
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
                       int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
                       int cache_slot) {
@@ -1570,10 +1636,12 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
         cur->kv_cache_len = m->kv_cache_lens[layer][cache_slot];
         cur->kv_cache_cap = m->kv_cache_caps[layer][cache_slot];
     }
+    model_debug("run_model: %d tokens, %d steps, %d layers, %d experts", n_tokens, steps, m->num_layers, m->num_experts);
     if (temperature > 0.0f) {
         if (seed != 0) srand(seed);
         else srand((unsigned int)time(NULL));
     }
+    check_and_evict_if_needed(m);
     for (int step = 0; step < steps; step++) {
         int token_id = step < n_tokens ? tokens[step] : (step > 0 ? out_tokens[step - 1] : tokens[0]);
         for (int i = 0; i < m->hidden_size; i++) hidden[i] = m->embed[token_id * m->hidden_size + i];
@@ -1788,6 +1856,7 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
         out_tokens[step] = best;
         free(logits);
     }
+    model_debug("run_model complete: total memory used=%zu/%zu, routed experts=%zu", get_mem_total_used(), g_ram_limit_bytes, get_mem_used(MEM_CAT_ROUTED_EXPERTS));
     free(hidden);
 }
 
@@ -1949,6 +2018,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             configure_ram_limit(argv[++i]);
+        } else if (strcmp(argv[i], "--evict-threshold") == 0 && i + 1 < argc) {
+            g_evict_threshold_pct = atoi(argv[i + 1]);
+            if (g_evict_threshold_pct < 10 || g_evict_threshold_pct > 99) {
+                fprintf(stderr, "ERROR: --evict-threshold must be between 10 and 99\n");
+                return 1;
+            }
+            model_debug("evict threshold: %d%%", g_evict_threshold_pct);
+            i += 2;
         } else {
             usage(argv[0]);
             return 1;
