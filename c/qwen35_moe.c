@@ -1825,8 +1825,16 @@ static void check_and_evict_if_needed(qwen35_model *m) {
     size_t expert_usage = get_mem_used(MEM_CAT_ROUTED_EXPERTS);
     size_t threshold = g_ram_limit_bytes * g_evict_threshold_pct / 100;
     if (expert_usage < threshold) return;
-    model_debug("RAM usage at %zu%% of threshold (%zu/%zu bytes), eviction not yet implemented",
+    model_debug("RAM usage at %zu%% of threshold (%zu/%zu bytes), performing preemptive eviction",
         expert_usage * 100 / threshold, expert_usage, threshold);
+    // Evict experts from layers that are least likely to be needed next
+    // This is a simple heuristic: evict from the last few layers first
+    for (int layer = m->num_layers - 1; layer >= 0 && get_mem_used(MEM_CAT_ROUTED_EXPERTS) >= threshold; layer--) {
+        QLayer *cur = &m->layers[layer];
+        if (expert_tables_ready(cur)) {
+            expert_evict_lru_from_layer(m, cur, layer);
+        }
+    }
 }
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
                       int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
