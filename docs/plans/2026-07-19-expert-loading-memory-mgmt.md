@@ -76,3 +76,16 @@ All 5 tasks verified and working:
 - Profiling hooks (token/s, memory, latency)
 - Backend runtime integration (Vulkan, ROCm, NPU)
 - ROCm int4/int8 validation on Strix Halo
+
+---
+
+# Expert Eviction Fix — 2026-07-19
+
+**Issue:** `check_and_evict_if_needed()` function logged "eviction not yet implemented" but did not actually perform eviction.
+
+**Fix:** Modified `check_and_evict_if_needed()` to actually perform preemptive eviction by iterating through layers from last to first and calling `expert_evict_lru_from_layer()` for each layer while RAM usage exceeds threshold.
+
+**Commit:** `52108d4 feat(qwen35): implement expert eviction in check_and_evict_if_needed()`
+
+**Status:** ✅ FIXED — Expert eviction is now fully implemented and working.
+
