@@ -449,6 +449,92 @@ static void expert_evict_lru_from_layer(qwen35_model *m, QLayer *cur, int layer)
     }
 }
 
+typedef struct {
+    char name[512];
+    int layer;
+    int expert_idx;
+    int tensor_type;
+    int dtype;
+    int64_t numel;
+    int64_t nbytes;
+} expert_tensor_ref_t;
+
+static expert_tensor_ref_t *g_expert_index = NULL;
+static int g_expert_index_count = 0;
+static int g_expert_index_cap = 0;
+
+static int build_expert_index(qwen35_model *m) {
+    int count = 0;
+    for (int e = 0; e < m->shards.n; e++) {
+        st_tensor t = m->shards.t[e];
+        if (t.name[0] == 0) continue;
+        if (!strstr(t.name, ".mlp.experts.")) continue;
+        if (!strstr(t.name, "_proj.weight")) continue;
+        count++;
+    }
+    if (count == 0) {
+        model_debug("build_expert_index: no expert tensors found");
+        return 0;
+    }
+    g_expert_index_cap = count;
+    g_expert_index = (expert_tensor_ref_t *)qwen_calloc(count, sizeof(expert_tensor_ref_t), "expert index");
+    int idx = 0;
+    for (int e = 0; e < m->shards.n; e++) {
+        st_tensor t = m->shards.t[e];
+        if (t.name[0] == 0 || idx >= count) continue;
+        if (!strstr(t.name, ".mlp.experts.")) continue;
+        if (!strstr(t.name, "_proj.weight")) continue;
+        const char *p = t.name;
+        const char *lp = "model.layers.";
+        if (strncmp(p, lp, strlen(lp)) != 0) continue;
+        p += strlen(lp);
+        char ls[32] = {0};
+        int li = 0;
+        while (*p >= '0' && *p <= '9' && li < 31) ls[li++] = *p++;
+        if (li == 0) continue;
+        ls[li] = '\0';
+        int layer = atoi(ls);
+        if (layer >= m->num_layers) continue;
+        p = strstr(p, ".mlp.experts.");
+        if (!p) continue;
+        p += strlen(".mlp.experts.");
+        char es[32] = {0};
+        int ei = 0;
+        while (*p >= '0' && *p <= '9' && ei < 31) es[ei++] = *p++;
+        if (ei == 0) continue;
+        es[ei] = '\0';
+        int expert_idx = atoi(es);
+        int tt = -1;
+        if (strstr(p, "gate_proj.weight")) tt = 0;
+        else if (strstr(p, "up_proj.weight")) tt = 1;
+        else if (strstr(p, "down_proj.weight")) tt = 2;
+        if (tt < 0) continue;
+        strncpy(g_expert_index[idx].name, t.name, sizeof(g_expert_index[idx].name) - 1);
+        g_expert_index[idx].layer = layer;
+        g_expert_index[idx].expert_idx = expert_idx;
+        g_expert_index[idx].tensor_type = tt;
+        g_expert_index[idx].dtype = t.dtype;
+        g_expert_index[idx].numel = t.numel;
+        g_expert_index[idx].nbytes = t.nbytes;
+        idx++;
+    }
+    g_expert_index_count = idx;
+    model_debug("build_expert_index: indexed %d expert tensors", idx);
+    return 0;
+}
+
+static const expert_tensor_ref_t *find_expert_tensor_ref(int layer, int expert_idx, int tensor_type) {
+    if (!g_expert_index) return NULL;
+    for (int i = 0; i < g_expert_index_count; i++) {
+        if (g_expert_index[i].layer == layer &&
+            g_expert_index[i].expert_idx == expert_idx &&
+            g_expert_index[i].tensor_type == tensor_type) {
+            return &g_expert_index[i];
+        }
+    }
+    return NULL;
+}
+
 /* Scale tensors are float32 and are expected to match exactly for duplicated rows;
  * this small epsilon only absorbs float parsing noise. */
 static const float SCALE_LAYOUT_EPSILON = 1e-6f;
@@ -1209,6 +1295,7 @@ static void init_model(qwen35_model *m, const char *snap_dir) {
         }
     }
     free(arena);
+    build_expert_index(m);
     expert_lru_init(m);
     model_debug("model init complete: %d layers, %d experts, %d kv_slots", m->num_layers, m->num_experts, m->kv_slots);
     validate_layer_config(m);
@@ -1270,6 +1357,10 @@ static void free_model(qwen35_model *m) {
     free(m->final_norm);
     free(m->lm_head);
     for (int i = 0; i < m->num_layers; i++) free_layer(m, &m->layers[i]);
+    free(g_expert_index);
+    g_expert_index = NULL;
+    g_expert_index_count = 0;
+    g_expert_index_cap = 0;
     expert_lru_free();
     free(m->layers);
     free(m->layer_types);
