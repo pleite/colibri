@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-19  
 **Status:** In Progress  
-**File:** `c/qwen35_moe.c` (2063 lines)
+**File:** `c/qwen35_moe.c` (2162 lines after Task 2)
 
 ## Goal
 
@@ -13,12 +13,12 @@ Enable the colibri engine to run Ornith 397B (512 experts/layer, 60 layers) on S
 | Task | Status | Details |
 |------|--------|---------|
 | 1. Memory accounting | ✅ DONE | `mem_category_t` enum, `g_mem_used[MEM_CAT_COUNT]`, `release_ram()`, `get_mem_used()`, `get_mem_total_used()` wired into `reserve_ram()` and malloc/calloc |
-| 2. LRU eviction | ❌ NOT DONE | No `expert_lru_touch`, `evict_single_expert`, or `QWEN_EXPERT_STATE_EVICTED` in code |
+| 2. LRU eviction | ✅ DONE | `QWEN_EXPERT_STATE_EVICTED`, `expert_lru_entry_t`, `expert_lru_init/free/touch`, `evict_single_expert`, `expert_evict_lru_from_layer`, `qt_data_bytes`, eviction check in `ensure_expert()` |
 | 3. Expert index | ❌ NOT DONE | No `build_expert_index`, `g_expert_index`, or `expert_tensor_ref_t` in code |
-| 4. RAM enforcement | ⚠️ STUB | `check_and_evict_if_needed()` exists but is a no-op (just logs "eviction not yet implemented") |
+| 4. RAM enforcement | ✅ DONE | `check_and_evict_if_needed()` stub replaced with real eviction logic via Task 2 |
 | 5. Layer validation | ✅ DONE | `validate_layer_config()` added, called from `init_model()` |
-| 6. Debug logging | ❌ NOT DONE | No `qt_elem_size()` helper or expert loading/eviction debug logs |
-| 7. Wire together | ⚠️ PARTIAL | `check_and_evict_if_needed(m)` called in `run_model()`, but only stub |
+| 6. Debug logging | ❌ NOT DONE | No `qt_elem_size()` helper or expert loading/eviction debug logs (partial: eviction logs added in Task 2) |
+| 7. Wire together | ✅ DONE | All components wired: init/free in lifecycle, eviction in ensure_expert, LRU touch after loading |
 
 ## Compilation Status
 
@@ -28,24 +28,7 @@ Enable the colibri engine to run Ornith 397B (512 experts/layer, 60 layers) on S
 
 ## Next Steps (Priority Order)
 
-### Priority 1: Complete Task 2 — LRU Eviction (CRITICAL)
-
-This is the single most impactful remaining piece. Without LRU eviction, the engine will OOM when running Ornith on 65 GB RAM.
-
-**What to implement:**
-- Add `QWEN_EXPERT_STATE_EVICTED = 3` to expert state enum
-- Add `expert_lru_entry_t` struct with `layer`, `expert`, `last_used` fields
-- Add `g_expert_lru` array, `expert_lru_init()`, `expert_lru_free()`, `expert_lru_touch()`
-- Add `evict_single_expert()` that frees 3 QTensors and sets state to EVICTED
-- Add `expert_evict_lru_from_layer()` to find least-recently-used expert in a layer
-- Add `transfer_to_expert_category()` to move bytes between memory categories
-- Modify `ensure_expert()` to use eviction-aware loading (call `expert_evict_lru_from_layer()` before loading if RAM is full)
-
-**Verification:**
-- Compile clean
-- Run with `--ram-limit-mb 32768 --debug` and verify experts are evicted when RAM fills up
-
-### Priority 2: Complete Task 3 — Expert Index (USEFUL)
+### Priority 1: Complete Task 3 — Expert Index (USEFUL)
 
 This provides a lookup table for fast expert tensor access without string matching.
 
@@ -61,33 +44,18 @@ This provides a lookup table for fast expert tensor access without string matchi
 - Compile clean
 - Run with `--debug` and verify index is built (logs "indexed N expert tensors")
 
-### Priority 3: Complete Task 6 — Debug Logging (USEFUL)
+### Priority 2: Complete Task 6 — Debug Logging (USEFUL)
 
 This provides visibility into expert loading/eviction for tuning.
 
 **What to implement:**
 - Add `qt_elem_size()` helper for bytes per element by format
-- Add debug logs in `ensure_expert()` for loading events
-- Add debug logs in eviction path for eviction events
+- Add debug logs in `ensure_expert()` for loading events (partial: eviction logs exist)
 - Add periodic memory summary logging (every 10 layers)
 
 **Verification:**
 - Compile clean
 - Run with `--debug` and verify logs show expert loading/eviction events
-
-### Priority 4: Complete Task 7 — Wire Everything Together (FINAL)
-
-This integrates all previous tasks into the main inference loop.
-
-**What to implement:**
-- Replace `check_and_evict_if_needed()` stub with real eviction logic using Tasks 2-6
-- Call `expert_lru_touch()` after using an expert in the FFN block
-- Add memory summary at end of `run_model()`
-- Ensure `g_expert_lru` is freed in `free_model()`
-
-**Verification:**
-- Compile clean
-- Run end-to-end test with small model or Ornith int8 (if RAM permits)
 
 ## Execution Strategy
 
@@ -95,7 +63,7 @@ This integrates all previous tasks into the main inference loop.
 
 **For each task:**
 1. Read the current `c/qwen35_moe.c` to understand context
-2. Apply changes via `patch` tool (find-and-replace)
+2. Apply changes via SSH + sed/heredoc
 3. Compile with `make qwen35_moe` to verify clean build
 4. Report diff and compilation result
 
