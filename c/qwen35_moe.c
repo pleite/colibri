@@ -29,17 +29,17 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if defined(COLI_VULKAN)
+#if defined(COLI_ENABLE_VULKAN)
 #include "backend_vulkan.h"
-#elif defined(COLI_ROCM)
+#elif defined(COLI_ENABLE_ROCM)
 #include "backend_rocm.h"
-#elif defined(COLI_NPU)
+#elif defined(COLI_ENABLE_NPU)
 #include "backend_npu.h"
 #elif defined(COLI_CUDA)
 #include "backend_cuda.h"
 #endif
 
-#if defined(COLI_ROCM)
+#if defined(COLI_ENABLE_ROCM)
 int coli_rocm_init(const int *devices, int count);
 void coli_rocm_shutdown(void);
 int coli_rocm_device_count(void);
@@ -71,17 +71,17 @@ int coli_npu_compat_tensor_device(const ColiCudaTensor *tensor);
 #include "st.h"
 #include "backend_runtime.h"
 
-#if !defined(COLI_VULKAN) && !defined(COLI_ROCM) && !defined(COLI_NPU) && !defined(COLI_CUDA)
+#if !defined(COLI_ENABLE_VULKAN) && !defined(COLI_ENABLE_ROCM) && !defined(COLI_ENABLE_NPU) && !defined(COLI_CUDA)
 typedef struct ColiCudaTensor ColiCudaTensor;
 #endif
 
-#if !defined(COLI_ROCM) && !defined(COLI_ENABLE_NPU)
+#if !defined(COLI_ENABLE_ROCM) && !defined(COLI_ENABLE_NPU)
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 #endif
 
 /* Keep the backend-selection condition centralized and use the same ordering as
  * the existing include/dispatch logic: Vulkan, ROCm, NPU, then CUDA. */
-#if defined(COLI_VULKAN) || defined(COLI_ROCM) || defined(COLI_NPU) || defined(COLI_CUDA)
+#if defined(COLI_ENABLE_VULKAN) || defined(COLI_ENABLE_ROCM) || defined(COLI_ENABLE_NPU) || defined(COLI_CUDA)
 #define COLI_HAS_BACKEND 1
 #else
 #define COLI_HAS_BACKEND 0
@@ -256,6 +256,9 @@ static size_t g_ram_limit_bytes = 0;
 static int g_evict_threshold_pct = 80;
 static int s_last_mem_log_layer = -1;
 static size_t g_mem_used[MEM_CAT_COUNT] = {0};
+static double g_prompt_time_ms = 0.0;
+static double g_generation_time_ms = 0.0;
+static int g_total_tokens = 0;
 
 static void set_model_debug_enabled(bool enabled) {
     g_model_debug_enabled = enabled;
@@ -1409,7 +1412,7 @@ static int qwen_backend_init_once(void) {
             g_qwen_backend_checked = 1;
             g_qwen_backend_kind = QWEN_BACKEND_NONE;
             g_qwen_backend_ready = 0;
-#if defined(COLI_ROCM)
+#if defined(COLI_ENABLE_ROCM)
             if (qwen_backend_device_nodes_available()) {
                 int devices[1] = {0};
                 if (coli_rocm_init(devices, 1)) {
@@ -1445,7 +1448,7 @@ static int qwen_backend_init_once(void) {
 static int qwen_backend_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights,
                                const float *scales, int fmt, int S, int I, int O, int device) {
     if (!qwen_backend_init_once()) return 0;
-#if defined(COLI_ROCM)
+#if defined(COLI_ENABLE_ROCM)
     if (g_qwen_backend_kind == QWEN_BACKEND_ROCM) {
         return coli_rocm_matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
     }
@@ -1460,7 +1463,7 @@ static int qwen_backend_matmul(ColiCudaTensor **tensor, float *y, const float *x
 
 static void qwen_backend_tensor_free(ColiCudaTensor *tensor) {
     if (g_qwen_backend_ready) {
-#if defined(COLI_ROCM)
+#if defined(COLI_ENABLE_ROCM)
         if (g_qwen_backend_kind == QWEN_BACKEND_ROCM) {
             coli_rocm_tensor_free(tensor);
             return;
@@ -1473,7 +1476,7 @@ static void qwen_backend_tensor_free(ColiCudaTensor *tensor) {
         }
 #endif
     }
-#if !defined(COLI_ROCM) && !defined(COLI_ENABLE_NPU)
+#if !defined(COLI_ENABLE_ROCM) && !defined(COLI_ENABLE_NPU)
     coli_cuda_tensor_free(tensor);
 #endif
 }
@@ -2109,7 +2112,7 @@ static int read_exact(FILE *fp, unsigned char *buf, size_t len) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N]\n",
+            "usage: %s [--model DIR] [--prompt TEXT] [--steps N] [--threads N] [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--seed N] [--debug] [--verbose] [--ram-limit-mb N] [--profile]\n",
             prog);
 }
 
@@ -2197,6 +2200,7 @@ int main(int argc, char **argv) {
     int top_k = 0;
     unsigned int seed = 0;
     bool debug_enabled = false;
+    bool profile_enabled = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             snap_dir = argv[++i];
