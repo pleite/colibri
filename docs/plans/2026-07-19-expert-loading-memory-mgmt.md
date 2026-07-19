@@ -55,3 +55,24 @@ Older planning documents have been moved to `docs/plans/archive/`:
 - `2026-07-17_toolchain-setup.md`
 
 This plan supersedes all of the above for the expert loading workstream.
+
+---
+
+# Milestone 3: Server Integration — COMPLETE (2026-07-19)
+
+All 5 tasks verified and working:
+
+| Task | Status | Details |
+|------|--------|---------|
+| M3T1: Engine Launch | ✅ DONE | `Engine` class launches `qwen35_moe` with `--model` flag, `KV_SLOTS` env var |
+| M3T2: Jinja Template | ✅ DONE | `load_jinja_chat_template()` + `render_chat_jinja()` work with ornith-int8 template |
+| M3T3: Tool-Call Streaming | ✅ DONE | `parse_tool_calls_qwen()` + streaming suppression + post-generation parsing |
+| M3T4: Multi-Slot KV | ✅ DONE | `kv_slots` + `cache_slot` validated, Qwen3.5 engine supports 1-16 slots |
+| M3T5: API Compatibility | ✅ DONE | `chat_completion()` handles all OpenAI-compatible parameters |
+
+## Next Milestone
+
+**Milestone 4: Performance Optimization**
+- Profiling hooks (token/s, memory, latency)
+- Backend runtime integration (Vulkan, ROCm, NPU)
+- ROCm int4/int8 validation on Strix Halo
