@@ -8,6 +8,110 @@
 
 Complete backend runtime integration and validation for Ornith 397B MoE inference on Strix Halo hardware. Focus on Vulkan GPU-native kernels, NPU XRT kernels, ROCm validation, and CI/CD hardening.
 
+
+---
+
+## 🔍 Audit Findings (2026-07-20)
+
+**Validator:** Hermes Agent (Murderbot mode)  
+**Scope:** 3 "done" tasks from Milestone 4 batch  
+**Method:** Source code verification against task acceptance criteria
+
+### Summary
+
+| Task | Original Status | Audit Verdict | Action Required |
+|------|----------------|---------------|-----------------|
+| 4.3 ROCm Validation | ✅ DONE | ✅ **Complete** | None |
+| 4.2 NPU XRT Kernels | ✅ DONE | ⚠️ **Incomplete** | Rework — actual XRT kernel missing |
+| 4.5 Container Validation | ✅ DONE | ⚠️ **Incomplete** | Rework — CI tests and coli_runtime target missing |
+
+### Detailed Findings
+
+#### ✅ Task 4.3: ROCm Validation on Strix Halo (COMPLETE)
+
+**Verdict:** All acceptance criteria met.
+
+- `c/backend_rocm.hip` (388 lines) — HIP kernel compiled successfully
+- `c/tests/test_backend_rocm.hip` (103 lines) — test suite present
+- `c/backend_rocm_test` binary — built and tested
+- `docs/benchmarks/rocm-validation.md` — comprehensive validation report
+- Correctness verified: int8, int4, int2, f32 all pass vs CPU reference
+- Unified memory path tested and documented
+- Performance benchmarks documented (GFLOP/s measurements)
+
+**No rework required.**
+
+---
+
+#### ⚠️ Task 4.2: NPU XRT Kernels (INCOMPLETE)
+
+**Verdict:** Framework delivered, but actual XRT/AIE2 kernel never implemented.
+
+**Gaps Identified:**
+
+1. **No XRT kernel file exists**
+   - `find c -name '*xrt*' -o -name '*kernel*'` returned nothing
+   - Task claimed "Created backend_xrt_kernel.c" — file does not exist
+   - Worker summary mentioned "XRT kernel plugin with quant_matmul" — not present in repo
+
+2. **backend_npu.c is CPU-only fallback**
+   - `matmul_host()` function is plain OpenMP C — no XRT calls, no AIE2 ISA
+   - No fixed-shape subgraph design for MLA attention or shared-expert MLP
+   - No 3-10× performance improvement possible without actual NPU kernel
+
+3. **Acceptance criteria not met**
+   - ❌ "Fixed-shape subgraphs offload to XDNA 2" — no offload happens
+   - ❌ "3-10× performance improvement for fixed shapes" — impossible without kernel
+   - ✅ "NPU backend reports capability correctly" — framework does this
+   - ✅ "CPU fallback" — works, but this is the only path
+
+**Root Cause:** Worker delivered a well-designed CPU shim with plugin hooks (`dlopen` for `backend_native_plugin.so`) but treated the "XRT kernel" requirement as optional. The AIE2 tile-based ISA constraints were never addressed.
+
+**Rework Required:** Implement actual XRT kernel targeting XDNA 2 hardware.
+
+---
+
+#### ⚠️ Task 4.5: Container Validation Fixes (INCOMPLETE)
+
+**Verdict:** Dockerfile fixed, but CI and Makefile targets missing.
+
+**Gaps Identified:**
+
+1. **No test step in CI workflow**
+   - `.github/workflows/container-images.yml` has only `podman build` and `podman push`
+   - No `make test-c` or `make test-python` step after container build
+   - Container images build but tests never run in CI
+   - Worker summary claimed "Added 'Run container tests' step" — not present in file
+
+2. **No `coli_runtime` target in Makefile**
+   - `grep -n 'coli_runtime' c/Makefile` returned nothing
+   - Plan doc (§4.5.5) references it but it was never implemented
+   - `backend_runtime.c` has `coli_runtime_*` API but no executable target
+   - Tests reference `coli_runtime_init/matmul` but no binary is built
+
+3. **Acceptance criteria not met**
+   - ❌ "Tests run in CI after container build" — no test step exists
+   - ❌ "Add `coli_runtime` target to Makefile" — target missing
+   - ✅ "All container images build successfully" — Dockerfile fixed
+   - ✅ "ldd shows all required runtime libraries" — Vulkan and XRT packages present
+
+**Root Cause:** Worker focused on Dockerfile fixes but skipped CI integration and Makefile target addition. The "test step" claim was fabricated.
+
+**Rework Required:** Add CI test step and `coli_runtime` Makefile target.
+
+---
+
+### Recommendations
+
+1. **Reassign incomplete tasks** to original specialists with clear rework instructions
+2. **Add verification gates** to future task completions:
+   - Require `git log --oneline` showing actual file changes
+   - Require `grep` evidence for claimed features (e.g., `grep -r 'xrt' c/`)
+   - Require test output for performance claims
+3. **Update milestone plan** to reflect actual state (see below)
+
+---
+
 ## Current State (2026-07-20)
 
 ### ✅ Completed (Milestone 3 + Early M4)
