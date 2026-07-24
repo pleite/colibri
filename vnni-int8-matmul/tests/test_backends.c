@@ -85,11 +85,6 @@ static int run_cpu_case(void) {
 }
 
 static int run_vulkan_case(void) {
-    if (!strix_cpu_is_supported()) {
-        printf("Vulkan backend SKIP (CPU backend unavailable on this host)\n");
-        return 1;
-    }
-
     const int rows = 1;
     const int inner_dim = 64;
     const int out_cols = 3;
@@ -119,11 +114,6 @@ static int run_vulkan_case(void) {
 }
 
 static int run_xdna2_case(void) {
-    if (!strix_cpu_is_supported()) {
-        printf("XDNA2 backend SKIP (CPU backend unavailable on this host)\n");
-        return 1;
-    }
-
     const int rows = 1;
     const int inner_dim = 48;
     const int out_cols = 4;
@@ -152,10 +142,43 @@ static int run_xdna2_case(void) {
     return 1;
 }
 
+static int run_edge_case_tests(void) {
+    int8_t input[4] = {1, -2, 3, -4};
+    int8_t weights[4] = {2, 1, -1, 3};
+    float out_single[1] = {0.0f};
+    float expected_single[1] = {0.0f};
+    float out_invalid[1] = {0.0f};
+
+    scalar_reference(input, 1, 4, weights, 1, expected_single, NULL);
+    if (!strix_vulkan_matmul(input, 1, 4, weights, 1, out_single, NULL)) {
+        fprintf(stderr, "Vulkan edge-case backend returned failure\n");
+        return 0;
+    }
+    if (!compare_outputs(out_single, expected_single, 1, 1e-4f)) {
+        fprintf(stderr, "Vulkan edge-case mismatch\n");
+        return 0;
+    }
+    if (strix_vulkan_matmul(NULL, 1, 4, weights, 1, out_invalid, NULL)) {
+        fprintf(stderr, "Vulkan invalid input should fail\n");
+        return 0;
+    }
+    if (strix_vulkan_matmul(input, 0, 4, weights, 1, out_invalid, NULL)) {
+        fprintf(stderr, "Vulkan zero-row input should fail\n");
+        return 0;
+    }
+    if (strix_vulkan_matmul(input, 1, 4, weights, 0, out_invalid, NULL)) {
+        fprintf(stderr, "Vulkan zero-output input should fail\n");
+        return 0;
+    }
+    printf("Edge-case tests OK\n");
+    return 1;
+}
+
 int main(void) {
     if (!run_cpu_case()) return 1;
     if (!run_vulkan_case()) return 1;
     if (!run_xdna2_case()) return 1;
+    if (!run_edge_case_tests()) return 1;
     printf("All backend tests passed or skipped for a non-Strix-Halo host.\n");
     return 0;
 }
