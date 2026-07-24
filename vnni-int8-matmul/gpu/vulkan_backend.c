@@ -47,42 +47,6 @@ static void release_weights(float *weights_f32, int fmt) {
     }
 }
 
-static void cpu_matmul(float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O) {
-    const float *weights_f32 = (const float *)weights;
-    const int8_t *weights_i8 = (const int8_t *)weights;
-    for (int s = 0; s < S; ++s) {
-        for (int o = 0; o < O; ++o) {
-            float acc = 0.0f;
-            for (int i = 0; i < I; ++i) {
-                if (fmt == 0) {
-                    acc += x[(size_t)s * (size_t)I + i] * weights_f32[(size_t)o * (size_t)I + i];
-                } else {
-                    acc += x[(size_t)s * (size_t)I + i] * (float)weights_i8[(size_t)o * (size_t)I + i];
-                }
-            }
-            y[(size_t)s * (size_t)O + o] = acc * (scales && fmt != 0 ? scales[o] : 1.0f);
-        }
-    }
-}
-
-static void cpu_fallback_matmul(float *output,
-                                const int8_t *input,
-                                int rows,
-                                int inner_dim,
-                                const int8_t *weights,
-                                int out_cols,
-                                const float *scales) {
-    float *input_f32 = (float *)calloc((size_t)rows * (size_t)inner_dim, sizeof(float));
-    if (!input_f32) {
-        return;
-    }
-    for (int i = 0; i < rows * inner_dim; ++i) {
-        input_f32[i] = (float)input[i];
-    }
-    cpu_matmul(output, input_f32, weights, scales, 1, rows, inner_dim, out_cols);
-    free(input_f32);
-}
-
 static int read_shader_binary(const char *path, uint32_t **code, size_t *code_size) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
@@ -552,33 +516,29 @@ int strix_vulkan_matmul(const int8_t *input,
         if (!load_dispatch(&g_vulkan_dispatch)) {
             g_vulkan_available = 0;
             g_vulkan_initialized = 1;
-            cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
-            return 1;
+            return 0;
         }
         g_vulkan_available = 1;
         g_vulkan_initialized = 1;
     }
 
     if (!g_vulkan_available) {
-        cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
-        return 1;
+        return 0;
     }
 
     StrixVulkanContext ctx;
     if (!create_context(&ctx, &g_vulkan_dispatch)) {
-        cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
-        return 1;
+        return 0;
     }
 
     if (!run_vulkan_matmul(&ctx, input, weights, scales, 1, rows, inner_dim, out_cols, output)) {
         destroy_context(&ctx);
-        cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
-        return 1;
+        return 0;
     }
     destroy_context(&ctx);
     return 1;
 }
 
 const char *strix_vulkan_backend_name(void) {
-    return g_vulkan_available ? "vulkan-compute" : "vulkan-cpu-fallback";
+    return g_vulkan_available ? "vulkan-compute" : "vulkan-unavailable";
 }

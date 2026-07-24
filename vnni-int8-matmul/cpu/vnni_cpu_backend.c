@@ -1,29 +1,18 @@
 #include "vnni_cpu_backend.h"
 
+#include <immintrin.h>
 #include <stdint.h>
 #include <stdio.h>
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
-#include <immintrin.h>
-#define VNNI_CPU_HAS_INTRINS 1
-#else
-#define VNNI_CPU_HAS_INTRINS 0
-#endif
-
 static int has_vnni_support(void) {
-#if VNNI_CPU_HAS_INTRINS
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
-#else
-    return 0;
-#endif
 }
 
 int strix_cpu_is_supported(void) {
     return has_vnni_support();
 }
 
-#if VNNI_CPU_HAS_INTRINS
 static int32_t vnni_dot(const int8_t *a, const int8_t *b, int n) {
     __m512i acc = _mm512_setzero_si512();
     const __m512i zero = _mm512_setzero_si512();
@@ -49,15 +38,6 @@ static int32_t vnni_dot(const int8_t *a, const int8_t *b, int n) {
     }
     return sum;
 }
-#endif
-
-static int32_t scalar_dot(const int8_t *a, const int8_t *b, int n) {
-    int32_t sum = 0;
-    for (int i = 0; i < n; ++i) {
-        sum += (int32_t)a[i] * (int32_t)b[i];
-    }
-    return sum;
-}
 
 int strix_cpu_matmul(const int8_t *input,
                      int rows,
@@ -69,18 +49,15 @@ int strix_cpu_matmul(const int8_t *input,
     if (!input || !weights || !output || rows <= 0 || inner_dim <= 0 || out_cols <= 0) {
         return 0;
     }
+    if (!has_vnni_support()) {
+        return 0;
+    }
 
     for (int r = 0; r < rows; ++r) {
         const int8_t *row = input + (size_t)r * (size_t)inner_dim;
         for (int o = 0; o < out_cols; ++o) {
             const int8_t *wrow = weights + (size_t)o * (size_t)inner_dim;
-            int32_t sum = has_vnni_support() ?
-#if VNNI_CPU_HAS_INTRINS
-                vnni_dot(row, wrow, inner_dim)
-#else
-                scalar_dot(row, wrow, inner_dim)
-#endif
-                : scalar_dot(row, wrow, inner_dim);
+            int32_t sum = vnni_dot(row, wrow, inner_dim);
             output[(size_t)r * (size_t)out_cols + o] = (float)sum * (scales ? scales[o] : 1.0f);
         }
     }
@@ -88,5 +65,5 @@ int strix_cpu_matmul(const int8_t *input,
 }
 
 const char *strix_cpu_backend_name(void) {
-    return has_vnni_support() ? "avx512-vnni" : "scalar-fallback";
+    return has_vnni_support() ? "avx512-vnni" : "avx512-vnni-unavailable";
 }
