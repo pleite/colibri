@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+int strix_cpu_is_supported(void);
+
 int strix_cpu_matmul(const int8_t *input,
                      int rows,
                      int inner_dim,

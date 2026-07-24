@@ -21,7 +21,13 @@ cd vnni-int8-matmul
 make test
 ```
 
-The build uses GCC with AVX-512 VNNI flags when available and still runs on hosts without the instruction set because the CPU backend falls back to scalar execution.
+The CPU backend is Strix Halo-specific and requires AVX-512 VNNI. The default build enables the required flags for that target:
+
+```bash
+make test
+```
+
+If you are building on a non-Strix-Halo host, the runtime tests will report that the backend is unavailable rather than falling back to a generic scalar implementation.
 
 ## Notes
 

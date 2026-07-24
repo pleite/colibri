@@ -51,6 +51,11 @@ static void fill_weights(int8_t *buffer, int count) {
 }
 
 static int run_cpu_case(void) {
+    if (!strix_cpu_is_supported()) {
+        printf("CPU backend SKIP (requires AVX-512 VNNI on Strix Halo)\n");
+        return 1;
+    }
+
     const int rows = 2;
     const int inner_dim = 32;
     const int out_cols = 4;
@@ -80,6 +85,11 @@ static int run_cpu_case(void) {
 }
 
 static int run_vulkan_case(void) {
+    if (!strix_cpu_is_supported()) {
+        printf("Vulkan backend SKIP (CPU backend unavailable on this host)\n");
+        return 1;
+    }
+
     const int rows = 1;
     const int inner_dim = 64;
     const int out_cols = 3;
@@ -109,6 +119,11 @@ static int run_vulkan_case(void) {
 }
 
 static int run_xdna2_case(void) {
+    if (!strix_cpu_is_supported()) {
+        printf("XDNA2 backend SKIP (CPU backend unavailable on this host)\n");
+        return 1;
+    }
+
     const int rows = 1;
     const int inner_dim = 48;
     const int out_cols = 4;
@@ -141,6 +156,6 @@ int main(void) {
     if (!run_cpu_case()) return 1;
     if (!run_vulkan_case()) return 1;
     if (!run_xdna2_case()) return 1;
-    printf("All backend tests passed.\n");
+    printf("All backend tests passed or skipped for a non-Strix-Halo host.\n");
     return 0;
 }

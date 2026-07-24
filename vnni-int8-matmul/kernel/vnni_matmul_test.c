@@ -17,6 +17,11 @@ static void fill_weights(int8_t *dst, int n) {
 }
 
 int main(void) {
+    if (!strix_cpu_is_supported()) {
+        printf("Strix Halo AVX-512 VNNI is not available on this host; skipping demo.\n");
+        return 0;
+    }
+
     const int rows = 2;
     const int inner_dim = 96;
     const int out_cols = 4;

@@ -2,23 +2,20 @@
 
 #include <immintrin.h>
 #include <stdint.h>
-#include <string.h>
+#include <stdio.h>
 
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#if !defined(__AVX512VNNI__) || !defined(__AVX512BW__)
+#error "This backend requires AVX-512 VNNI support; build with -mavx512f -mavx512vnni -mavx512bw -mavx512dq"
+#endif
+
 static int has_vnni_support(void) {
     return __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
 }
-#endif
 
-static int32_t scalar_dot(const int8_t *a, const int8_t *b, int n) {
-    int32_t sum = 0;
-    for (int i = 0; i < n; ++i) {
-        sum += (int32_t)a[i] * (int32_t)b[i];
-    }
-    return sum;
+int strix_cpu_is_supported(void) {
+    return has_vnni_support();
 }
 
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 static int32_t vnni_dot(const int8_t *a, const int8_t *b, int n) {
     __m512i acc = _mm512_setzero_si512();
     const __m512i zero = _mm512_setzero_si512();
@@ -44,7 +41,6 @@ static int32_t vnni_dot(const int8_t *a, const int8_t *b, int n) {
     }
     return sum;
 }
-#endif
 
 int strix_cpu_matmul(const int8_t *input,
                      int rows,
@@ -56,30 +52,21 @@ int strix_cpu_matmul(const int8_t *input,
     if (!input || !weights || !output || rows <= 0 || inner_dim <= 0 || out_cols <= 0) {
         return 0;
     }
+    if (!has_vnni_support()) {
+        return 0;
+    }
 
     for (int r = 0; r < rows; ++r) {
         const int8_t *row = input + (size_t)r * (size_t)inner_dim;
         for (int o = 0; o < out_cols; ++o) {
-            const int8_t *col = weights + (size_t)o * (size_t)inner_dim;
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-            if (has_vnni_support() && inner_dim >= 64) {
-                int32_t sum = vnni_dot(row, col, inner_dim);
-                output[(size_t)r * (size_t)out_cols + o] = (float)sum * (scales ? scales[o] : 1.0f);
-            } else
-#endif
-            {
-                int32_t sum = scalar_dot(row, col, inner_dim);
-                output[(size_t)r * (size_t)out_cols + o] = (float)sum * (scales ? scales[o] : 1.0f);
-            }
+            const int8_t *wrow = weights + (size_t)o * (size_t)inner_dim;
+            int32_t sum = vnni_dot(row, wrow, inner_dim);
+            output[(size_t)r * (size_t)out_cols + o] = (float)sum * (scales ? scales[o] : 1.0f);
         }
     }
     return 1;
 }
 
 const char *strix_cpu_backend_name(void) {
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    return has_vnni_support() ? "avx512-vnni" : "scalar-fallback";
-#else
-    return "scalar-fallback";
-#endif
+    return has_vnni_support() ? "avx512-vnni" : "avx512-vnni-unavailable";
 }

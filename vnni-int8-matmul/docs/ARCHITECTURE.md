@@ -2,7 +2,7 @@
 
 ## CPU backend
 
-The CPU backend implements a row-major int8 matmul where each output element is the dot product of an input row and a weight row. It uses AVX-512 VNNI (`_mm512_dpbusd_epi32`) when the host exposes the instruction set and the vector length is large enough. Otherwise it uses a scalar implementation so the code remains testable on non-Strix-Halo hosts.
+The CPU backend implements a row-major int8 matmul where each output element is the dot product of an input row and a weight row. It is written specifically for Strix Halo and uses AVX-512 VNNI (`_mm512_dpbusd_epi32`) when the host exposes the instruction set. The implementation does not fall back to a generic scalar path because the target is a fixed Strix Halo deployment.
 
 ## GPU backend
 
