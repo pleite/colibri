@@ -100,9 +100,6 @@ static void destroy_context(StrixVulkanContext *ctx) {
 static int load_dispatch(VnnVulkanDispatch *dispatch) {
     memset(dispatch, 0, sizeof(*dispatch));
     void *handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-    }
     if (!handle) return 0;
     g_vulkan_handle = handle;
 
@@ -171,7 +168,7 @@ static int create_context(StrixVulkanContext *ctx, VnnVulkanDispatch *dispatch) 
     app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.pEngineName = "colibri";
     app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = 0;
+    app_info.apiVersion = VK_MAKE_VERSION(1, 0, 0);
 
     VkInstanceCreateInfo instance_info = {0};
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;

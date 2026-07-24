@@ -52,8 +52,8 @@ static void fill_weights(int8_t *buffer, int count) {
 
 static int run_cpu_case(void) {
     if (!strix_cpu_is_supported()) {
-        printf("CPU backend SKIP (requires AVX-512 VNNI on Strix Halo)\n");
-        return 1;
+        fprintf(stderr, "CPU backend FAILED (requires AVX-512 VNNI on Strix Halo)\n");
+        return 0;
     }
 
     const int rows = 2;
@@ -102,8 +102,8 @@ static int run_vulkan_case(void) {
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
     if (!strix_vulkan_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
-        printf("Vulkan backend SKIP (requires Vulkan runtime on Strix Halo)\n");
-        return 1;
+        fprintf(stderr, "Vulkan backend FAILED (requires Vulkan runtime on Strix Halo)\n");
+        return 0;
     }
     if (!compare_outputs(got, expected, rows * out_cols, 1e-4f)) {
         fprintf(stderr, "Vulkan backend mismatch\n");
@@ -131,8 +131,8 @@ static int run_xdna2_case(void) {
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
     if (!strix_xdna2_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
-        printf("XDNA2 backend SKIP (requires AVX-512 VNNI on Strix Halo)\n");
-        return 1;
+        fprintf(stderr, "XDNA2 backend FAILED (requires AVX-512 VNNI on Strix Halo)\n");
+        return 0;
     }
     if (!compare_outputs(got, expected, rows * out_cols, 1e-4f)) {
         fprintf(stderr, "XDNA2 backend mismatch\n");
@@ -151,8 +151,8 @@ static int run_edge_case_tests(void) {
 
     scalar_reference(input, 1, 4, weights, 1, expected_single, NULL);
     if (!strix_vulkan_matmul(input, 1, 4, weights, 1, out_single, NULL)) {
-        printf("Vulkan edge-case tests SKIP (requires Vulkan runtime on Strix Halo)\n");
-        return 1;
+        fprintf(stderr, "Vulkan edge-case tests FAILED (requires Vulkan runtime on Strix Halo)\n");
+        return 0;
     }
     if (!compare_outputs(out_single, expected_single, 1, 1e-4f)) {
         fprintf(stderr, "Vulkan edge-case mismatch\n");
