@@ -113,8 +113,9 @@ static int load_dispatch(VnnVulkanDispatch *dispatch) {
         return 0;
     }
 
-    dispatch->vkCreateInstance = (PFN_vkCreateInstance)get_proc_addr(NULL, "vkCreateInstance");
-    dispatch->vkDestroyInstance = (PFN_vkDestroyInstance)get_proc_addr(NULL, "vkDestroyInstance");
+    /* Static Vulkan entry points must be loaded via dlsym, not vkGetInstanceProcAddr */
+    dispatch->vkCreateInstance = (PFN_vkCreateInstance)dlsym(handle, "vkCreateInstance");
+    dispatch->vkDestroyInstance = (PFN_vkDestroyInstance)dlsym(handle, "vkDestroyInstance");
     dispatch->vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)get_proc_addr(NULL, "vkEnumeratePhysicalDevices");
     dispatch->vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)get_proc_addr(NULL, "vkGetPhysicalDeviceProperties");
     dispatch->vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)get_proc_addr(NULL, "vkGetPhysicalDeviceQueueFamilyProperties");
