@@ -100,9 +100,6 @@ static void destroy_context(StrixVulkanContext *ctx) {
 static int load_dispatch(VnnVulkanDispatch *dispatch) {
     memset(dispatch, 0, sizeof(*dispatch));
     void *handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-    }
     if (!handle) return 0;
     g_vulkan_handle = handle;
 

@@ -28,7 +28,7 @@ The CPU backend is Strix Halo-specific and requires AVX-512 VNNI support. The de
 make test
 ```
 
-If you are building on a non-Strix-Halo host, the runtime tests report that the backend is unavailable rather than attempting a generic fallback.
+If you are building on a non-Strix-Halo host, the runtime tests fail immediately when the required GPU/CPU backend cannot initialize.
 
 ## Notes
 
