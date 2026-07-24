@@ -2,24 +2,26 @@
 
 ## Status
 
-The isolated VNNI experiment is now handled with a correct portable signed-int8 dot-product kernel.
-The test harness no longer depends on `_mm512_dpbusd_epi32` for correctness, so it runs on systems that do not expose AVX-512/VNNI instructions.
+The standalone experiment is now a Strix-Halo-specific AVX-512/VNNI kernel. It targets AMD Zen 5 / Strix Halo CPUs and uses `_mm512_dpbusd_epi32` with the sign-flip trick so signed int8 dot-products remain correct while retaining the VNNI throughput advantage.
+
+The harness intentionally does not provide a generic fallback for other hosts. On unsupported hardware it exits with a clear message instead of pretending to be portable.
 
 ## What changed
 
-- `vnni_matmul_test.c` now uses a signed-int8 dot-product implementation that is correct for the test cases in this directory.
-- The test still covers positive, mixed, and negative inputs, plus a larger matrix-shaped dot-product case.
-- The implementation is intentionally simple and portable so the issue remains isolated from the rest of the codebase.
+- `vnni_matmul_test.c` now uses a Strix-Halo-oriented AVX-512/VNNI path for signed-int8 dot products.
+- The kernel is built around the VNNI instruction with the correct sign-flip transform for signed values.
+- The test still validates positive, mixed, negative, and larger matrix-shaped dot-product cases against a scalar reference.
+- The executable requires AVX-512 VNNI support and will refuse to run on other hosts.
 
 ## Compile and run
 
 ```bash
 cd /home/runner/work/colibri/colibri/c/vnni_kernels/
-gcc -O2 -Wall -Wextra -o vnni_matmul_test vnni_matmul_test.c -lm
+gcc -O3 -Wall -Wextra -mavx512f -mavx512vnni -mavx512bw -mavx512dq -o vnni_matmul_test vnni_matmul_test.c -lm
 ./vnni_matmul_test
 ```
 
 ## Files
 
-- `vnni_matmul_test.c` — Portable signed-int8 dot-product test harness
+- `vnni_matmul_test.c` — Strix-Halo-specific AVX-512/VNNI signed-int8 dot-product test harness
 - `vnni_kernels_readme.md` — This file

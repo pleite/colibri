@@ -1,12 +1,10 @@
 /*
  * vnni_matmul_test.c — Strix Halo optimized int8×int8 matmul test
  *
- * The signed-int8 dot-product is the core kernel for this test. On AMD Zen 5
- * (Strix Halo) the fastest path is AVX-512 VNNI via `_mm512_dpbusd_epi32`.
- * The important detail is the sign-flip trick: use `abs(w)` as the unsigned
- * operand and flip the sign of the `x` lane when `w` is negative. This keeps
- * the computation correct for signed int8 values while preserving the VNNI
- * throughput advantage.
+ * This kernel is intentionally target-specific: it is written for AMD Zen 5 /
+ * Strix Halo and uses AVX-512 VNNI (`_mm512_dpbusd_epi32`) to maximize
+ * throughput on that processor. The sign-flip trick is required to make the
+ * instruction behave correctly for signed int8 values.
  *
  * Build:
  *   gcc -O3 -mavx512f -mavx512vnni -mavx512bw -mavx512dq -o vnni_matmul_test vnni_matmul_test.c
@@ -78,10 +76,14 @@ static inline int32_t vnni_int8_dot(const int8_t *a, const int8_t *b, int n) {
 #endif
 
 static const char *dot_kernel_name(void) {
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
     return "avx512-vnni";
+}
+
+static int has_vnni_support(void) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    return __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
 #else
-    return "scalar";
+    return 0;
 #endif
 }
 
@@ -89,7 +91,7 @@ static int32_t signed_int8_dot(const int8_t *a, const int8_t *b, int n) {
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
     return vnni_int8_dot(a, b, n);
 #else
-    return scalar_int8_dot(a, b, n);
+#error "This benchmark requires AVX-512 VNNI support on AMD Strix Halo / Zen 5"
 #endif
 }
 
@@ -290,6 +292,11 @@ static void test_benchmark(void) {
  * MAIN
  * ========================================================================== */
 int main(void) {
+    if (!has_vnni_support()) {
+        fprintf(stderr, "This benchmark targets AMD Strix Halo / Zen 5 with AVX-512 VNNI support.\n");
+        return 1;
+    }
+
     printf("Signed int8 dot-product test for Strix Halo\n");
     printf("==========================================\n\n");
 
