@@ -1,27 +1,13 @@
 /*
- * vnni_matmul_test.c — VNNI int8×int8 matmul test for Strix Halo
+ * vnni_matmul_test.c — Strix Halo optimized int8×int8 matmul test
  *
- * PROBLEM:
- *   _mm512_dpbusd_epi32 (VNNI VPMADDUBSD) is producing incorrect results
- *   when used with sign-extended int8 data. The instruction works for small
- *   values (1, 100) but fails for values >= 128 (which overflow signed int8).
+ * This kernel is intentionally target-specific: it is written for AMD Zen 5 /
+ * Strix Halo and uses AVX-512 VNNI (`_mm512_dpbusd_epi32`) to maximize
+ * throughput on that processor. The sign-flip trick is required to make the
+ * instruction behave correctly for signed int8 values.
  *
- * HYPOTHESIS:
- *   The intrinsic may have a GCC 15.2 codegen bug, or we're misunderstanding
- *   how it interprets the int32 lanes (uint8 pairs vs uint16 pairs).
- *
- * GOAL:
- *   Isolate the exact behavior of _mm512_dpbusd_epi32 and determine the
- *   correct approach for int8×int8 matmul on Zen 5 (Strix Halo).
- *
- * Hardware: AMD Ryzen AI Max+ 395 (Strix Halo, Zen 5, RDNA 4, XDNA 2)
- * Compiler: GCC 15.2.1
- * Flags:    -O3 -mavx512f -mavx512vnni -mavx512bw -mavx512dq
- *
- * Compile:
+ * Build:
  *   gcc -O3 -mavx512f -mavx512vnni -mavx512bw -mavx512dq -o vnni_matmul_test vnni_matmul_test.c
- *
- * Location: /home/leite/colibri/c/vnni_kernels/
  */
 
 #include <stdio.h>
@@ -29,16 +15,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 
-/* ============================================================================
- * REFERENCE: signed int8 dot product (ground truth)
- *
- * The original VNNI experiment assumed `_mm512_dpbusd_epi32` would be the
- * correct path for signed int8 matmul. On the target hardware and in this
- * test harness that instruction is not used; instead we rely on a portable
- * scalar/unrolled kernel that is correct for signed int8 values and avoids
- * the unsupported/incorrect VNNI path.
- * ============================================================================ */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#endif
+
+/* ==========================================================================
+ * REFERENCE: scalar signed-int8 dot product (ground truth)
+ * ========================================================================== */
 static int32_t scalar_int8_dot(const int8_t *a, const int8_t *b, int n) {
     int32_t sum = 0;
     int i = 0;
@@ -61,13 +46,58 @@ static int32_t scalar_int8_dot(const int8_t *a, const int8_t *b, int n) {
     return sum;
 }
 
-/* ============================================================================
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static inline int32_t vnni_int8_dot(const int8_t *a, const int8_t *b, int n) {
+    int32_t sum = 0;
+    int i = 0;
+
+    /* Strix Halo / Zen 5 has AVX-512 VNNI; use a 64-byte block size to keep
+     * the dpbusd datapath fully occupied. The sign-flip trick makes the
+     * operation valid for signed int8 weights and activations. */
+    __m512i acc = _mm512_setzero_si512();
+    const __m512i zero = _mm512_setzero_si512();
+
+    for (; i + 64 <= n; i += 64) {
+        __m512i av = _mm512_loadu_si512((const void *)(a + i));
+        __m512i bv = _mm512_loadu_si512((const void *)(b + i));
+        __mmask64 neg = _mm512_movepi8_mask(bv);
+        __m512i xs = _mm512_mask_sub_epi8(av, neg, zero, av);
+        acc = _mm512_dpbusd_epi32(acc, _mm512_abs_epi8(bv), xs);
+    }
+
+    sum = _mm512_reduce_add_epi32(acc);
+
+    for (; i < n; ++i) {
+        sum += (int32_t)a[i] * (int32_t)b[i];
+    }
+
+    return sum;
+}
+#endif
+
+static const char *dot_kernel_name(void) {
+    return "avx512-vnni";
+}
+
+static int has_vnni_support(void) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    return __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512bw");
+#else
+    return 0;
+#endif
+}
+
+static int32_t signed_int8_dot(const int8_t *a, const int8_t *b, int n) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    return vnni_int8_dot(a, b, n);
+#else
+#error "This benchmark requires AVX-512 VNNI support on AMD Strix Halo / Zen 5"
+#endif
+}
+
+/* ==========================================================================
  * TEST 1: Signed int8 dot-product kernel
- *
- * Rather than relying on the VNNI instruction, we verify the portable signed
- * int8 dot-product kernel directly. This keeps the test runnable and correct
- * on systems without AVX-512/VNNI support.
- * ============================================================================ */
+ * ========================================================================== */
 static void test_intrinsic_behavior(void) {
     printf("=== TEST 1: Signed int8 dot-product kernel ===\n\n");
 
@@ -86,7 +116,7 @@ static void test_intrinsic_behavior(void) {
             b[i] = v8;
         }
 
-        int32_t got = scalar_int8_dot(a, b, 16);
+        int32_t got = signed_int8_dot(a, b, 16);
         int32_t expected = 16 * (int32_t)v8 * (int32_t)v8;
 
         printf("  v=%3d: dot(%d, %d) = %11d  expected=%11d  %s\n",
@@ -96,12 +126,9 @@ static void test_intrinsic_behavior(void) {
     printf("\n");
 }
 
-/* ============================================================================
+/* ==========================================================================
  * TEST 2: Signed int8 data
- *
- * Validate the portable signed int8 dot product over a few representative
- * cases (positive, mixed, and negative values).
- * ============================================================================ */
+ * ========================================================================== */
 static void test_sign_extended_int8(void) {
     printf("=== TEST 2: Signed int8 data ===\n\n");
 
@@ -115,7 +142,7 @@ static void test_sign_extended_int8(void) {
         }
 
         int32_t ref = scalar_int8_dot(a, b, N);
-        int32_t got = scalar_int8_dot(a, b, N);
+        int32_t got = signed_int8_dot(a, b, N);
 
         printf("  Case A (positive): ref=%d  got=%d  %s\n",
                ref, got, got == ref ? "OK" : "FAIL");
@@ -131,7 +158,7 @@ static void test_sign_extended_int8(void) {
         }
 
         int32_t ref = scalar_int8_dot(a, b, N);
-        int32_t got = scalar_int8_dot(a, b, N);
+        int32_t got = signed_int8_dot(a, b, N);
 
         printf("  Case B (mixed):    ref=%d  got=%d  %s\n",
                ref, got, got == ref ? "OK" : "FAIL");
@@ -147,7 +174,7 @@ static void test_sign_extended_int8(void) {
         }
 
         int32_t ref = scalar_int8_dot(a, b, N);
-        int32_t got = scalar_int8_dot(a, b, N);
+        int32_t got = signed_int8_dot(a, b, N);
 
         printf("  Case C (neg×neg):  ref=%d  got=%d  %s\n",
                ref, got, got == ref ? "OK" : "FAIL");
@@ -156,11 +183,9 @@ static void test_sign_extended_int8(void) {
     printf("\n");
 }
 
-/* ============================================================================
+/* ==========================================================================
  * TEST 3: Inspect intermediate values
- *
- * Print the input values and the resulting signed int8 dot product.
- * ============================================================================ */
+ * ========================================================================== */
 static void test_inspect_intermediates(void) {
     printf("=== TEST 3: Inspect intermediate values ===\n\n");
 
@@ -175,19 +200,16 @@ static void test_inspect_intermediates(void) {
     for (int i = 0; i < 16; i++) printf("%4d ", b[i]);
     printf("\n");
 
-    int32_t dot = scalar_int8_dot(a, b, 16);
+    int32_t dot = signed_int8_dot(a, b, 16);
     printf("  Signed int8 dot product: %d\n", dot);
     printf("  Expected sum of products: %d\n", 136);
 
     printf("\n");
 }
 
-/* ============================================================================
+/* ==========================================================================
  * TEST 4: Alternative approaches
- *
- * Keep the comparison simple: the portable signed int8 dot product is the
- * reference implementation for this isolated test case.
- * ============================================================================ */
+ * ========================================================================== */
 static void test_alternative_approaches(void) {
     printf("=== TEST 4: Alternative approaches ===\n\n");
 
@@ -201,13 +223,13 @@ static void test_alternative_approaches(void) {
     int32_t ref = scalar_int8_dot(a, b, N);
     printf("  Reference dot product: %d\n\n", ref);
 
-    printf("  Portable signed int8 dot product: %d\n", ref);
+    printf("  %s dot product: %d\n", dot_kernel_name(), signed_int8_dot(a, b, N));
     printf("\n");
 }
 
-/* ============================================================================
- * TEST 5: Test with larger matrix dimensions (simulating real matmul)
- * ============================================================================ */
+/* ==========================================================================
+ * TEST 5: Larger matrix dimensions (simulating real matmul)
+ * ========================================================================== */
 static void test_larger_matrix(void) {
     printf("=== TEST 5: Larger matrix (I=64, O=4) ===\n\n");
 
@@ -222,26 +244,59 @@ static void test_larger_matrix(void) {
     for (int o = 0; o < O; o++) scales[o] = 1.0f;
 
     float y_ref[O];
-    float y_portable[O];
+    float y_opt[O];
     for (int o = 0; o < O; o++) {
         int32_t sum = scalar_int8_dot(x, w + (size_t)o * I, I);
         y_ref[o] = (float)sum * scales[o];
-        y_portable[o] = y_ref[o];
+        y_opt[o] = (float)signed_int8_dot(x, w + (size_t)o * I, I) * scales[o];
     }
 
     for (int o = 0; o < O; o++) {
-        float err = fabsf(y_portable[o] - y_ref[o]);
-        printf("  row %d: ref=%.1f  portable=%.1f  err=%.1e  %s\n",
-               o, y_ref[o], y_portable[o], err, err < 1e-3f ? "OK" : "FAIL");
+        float err = fabsf(y_opt[o] - y_ref[o]);
+        printf("  row %d: ref=%.1f  opt=%.1f  err=%.1e  %s\n",
+               o, y_ref[o], y_opt[o], err, err < 1e-3f ? "OK" : "FAIL");
     }
 
     printf("\n");
 }
 
-/* ============================================================================
+/* ==========================================================================
+ * TEST 6: Performance sanity check
+ * ========================================================================== */
+static void test_benchmark(void) {
+    printf("=== TEST 6: Performance sanity check ===\n\n");
+
+    const int N = 4096;
+    int8_t a[N];
+    int8_t b[N];
+    for (int i = 0; i < N; i++) {
+        a[i] = (int8_t)(((i * 37 + 11) % 257) - 128);
+        b[i] = (int8_t)(((i * 19 - 13) % 257) - 128);
+    }
+
+    int32_t ref = scalar_int8_dot(a, b, N);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    int32_t got = signed_int8_dot(a, b, N);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    double elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
+                        (end.tv_nsec - start.tv_nsec) / 1000000.0;
+
+    printf("  kernel=%s  ref=%d  got=%d  elapsed=%.3f ms  %s\n",
+           dot_kernel_name(), ref, got, elapsed_ms, ref == got ? "OK" : "FAIL");
+    printf("\n");
+}
+
+/* ==========================================================================
  * MAIN
- * ============================================================================ */
+ * ========================================================================== */
 int main(void) {
+    if (!has_vnni_support()) {
+        fprintf(stderr, "This benchmark targets AMD Strix Halo / Zen 5 with AVX-512 VNNI support.\n");
+        return 1;
+    }
+
     printf("Signed int8 dot-product test for Strix Halo\n");
     printf("==========================================\n\n");
 
@@ -250,6 +305,7 @@ int main(void) {
     test_inspect_intermediates();
     test_alternative_approaches();
     test_larger_matrix();
+    test_benchmark();
 
     printf("==========================================\n");
     printf("Tests complete.\n");
