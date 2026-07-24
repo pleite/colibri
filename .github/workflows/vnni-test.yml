@@ -1,0 +1,71 @@
+name: VNNI GPU Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-vulkan:
+    name: VNNI self-hosted GPU tests
+    runs-on: [self-hosted, strix-halo, vulkan]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Vulkan environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /usr/share/vulkan/icd.d/radeon_icd.x86_64.json ]; then
+            echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json" >> "$GITHUB_ENV"
+          fi
+
+          if [ -x /usr/bin/ld.bfd ]; then
+            sudo ln -sf /usr/bin/ld.bfd /etc/alternatives/ld
+            sudo ln -sf /usr/bin/ld.bfd /usr/bin/ld
+          fi
+
+      - name: Build and run VNNI tests
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make
+          make test 2>&1 | tee test_output.log
+
+      - name: Publish test summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## VNNI test results"
+            echo ""
+            if [ -f vnni-int8-matmul/test_output.log ]; then
+              echo "### Test output"
+              echo ""
+              echo '```text'
+              tail -n 40 vnni-int8-matmul/test_output.log
+              echo '```'
+            else
+              echo "No test log was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnni-test-artifacts
+          path: |
+            vnni-int8-matmul/test_output.log
+            vnni-int8-matmul/tests/test_backends
+            vnni-int8-matmul/tests/vulkan_runtime_test

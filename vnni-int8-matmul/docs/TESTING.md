@@ -40,6 +40,6 @@ The wrappers also handle small workloads such as:
 
 ## Runtime behavior on unsupported hosts
 
-- The CPU backend is Strix Halo-specific and requires AVX-512 VNNI support. On unsupported hosts the CPU correctness test is skipped rather than attempting a generic fallback.
-- The Vulkan backend is implemented as a real compute-wrapper path when a Vulkan loader and driver are available on the Strix Halo target. When they are not, the wrapper reports that the backend is unavailable.
+- The CPU backend is Strix Halo-specific and requires AVX-512 VNNI support. On unsupported hosts the CPU correctness test fails rather than falling back to a generic implementation.
+- The Vulkan backend is implemented as a real compute-wrapper path when a Vulkan loader and driver are available on the Strix Halo target. When they are not, the wrapper fails the test immediately.
 - The XDNA2 wrapper remains a minimal shape-specific shim and is intended for the fixed `rows=1` / `out_cols=4` case.
