@@ -39,6 +39,7 @@ typedef struct {
 static void *g_vulkan_handle = NULL;
 static int g_vulkan_available = 0;
 static int g_vulkan_initialized = 0;
+static VnnVulkanDispatch g_vulkan_dispatch;
 
 static void release_weights(float *weights_f32, int fmt) {
     if (fmt != 0) {
@@ -548,8 +549,7 @@ int strix_vulkan_matmul(const int8_t *input,
     }
 
     if (!g_vulkan_initialized) {
-        VnnVulkanDispatch dispatch;
-        if (!load_dispatch(&dispatch)) {
+        if (!load_dispatch(&g_vulkan_dispatch)) {
             g_vulkan_available = 0;
             g_vulkan_initialized = 1;
             cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
@@ -565,7 +565,7 @@ int strix_vulkan_matmul(const int8_t *input,
     }
 
     StrixVulkanContext ctx;
-    if (!create_context(&ctx, &ctx.dispatch)) {
+    if (!create_context(&ctx, &g_vulkan_dispatch)) {
         cpu_fallback_matmul(output, input, rows, inner_dim, weights, out_cols, scales);
         return 1;
     }
