@@ -3,7 +3,10 @@ CFLAGS ?= -O3 -Wall -Wextra -std=c11
 CPPFLAGS += -I.
 LDFLAGS += -lm -ldl
 
-CPU_FLAGS ?= -mavx512f -mavx512vnni -mavx512bw -mavx512dq
+# Keep the default build portable. Opt in to AVX-512 VNNI explicitly on targets
+# that support it by overriding CPU_FLAGS, e.g.:
+#   make CPU_FLAGS='-mavx512f -mavx512vnni -mavx512bw -mavx512dq' test
+CPU_FLAGS ?=
 
 all: tests/test_backends tests/vulkan_runtime_test
 

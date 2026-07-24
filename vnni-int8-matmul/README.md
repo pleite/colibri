@@ -22,13 +22,14 @@ cd vnni-int8-matmul
 make test
 ```
 
-The CPU backend is Strix Halo-specific and requires AVX-512 VNNI. The default build enables the required flags for that target:
+The CPU backend is Strix Halo-specific and uses AVX-512 VNNI when the host and compiler support it. The default build stays portable and uses the scalar fallback path unless you opt in explicitly:
 
 ```bash
 make test
+make CPU_FLAGS='-mavx512f -mavx512vnni -mavx512bw -mavx512dq' test
 ```
 
-If you are building on a non-Strix-Halo host, the runtime tests will report that the backend is unavailable rather than falling back to a generic scalar implementation.
+If you are building on a non-Strix-Halo host, the runtime tests will report that the backend is unavailable and the wrapper paths will still produce correct results via the portable fallback.
 
 ## Notes
 
