@@ -171,7 +171,7 @@ static int create_context(StrixVulkanContext *ctx, VnnVulkanDispatch *dispatch) 
     app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.pEngineName = "colibri";
     app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = 0;
+    app_info.apiVersion = VK_API_VERSION_1_0;
 
     VkInstanceCreateInfo instance_info = {0};
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
