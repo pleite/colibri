@@ -1,0 +1,43 @@
+#version 450
+
+/*
+ * comp.comp — headless FP32 GEMM used by the Strix Halo Vulkan backend.
+ *
+ * This is the source for gpu/comp.spv. Regenerate with:
+ *
+ *     make gpu/comp.spv        # runs glslangValidator -V
+ *
+ * Interface contract (must stay in sync with gpu/vulkan_backend.c):
+ *   set 0, binding 0  MatrixA  A[rows][inner]        row-major
+ *   set 0, binding 1  MatrixB  B[inner][cols]        row-major (already transposed by the host)
+ *   set 0, binding 2  MatrixC  C[rows][cols]         row-major
+ *   push constants    { uint rows; uint cols; uint inner; }  at offsets 0/4/8
+ *   local_size        (16, 16, 1); x -> output column, y -> output row
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint inner;
+} constants;
+
+layout(std430, set = 0, binding = 0) buffer MatrixA { float a[]; };
+layout(std430, set = 0, binding = 1) buffer MatrixB { float b[]; };
+layout(std430, set = 0, binding = 2) buffer MatrixC { float c[]; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= constants.rows || col >= constants.cols) {
+        return;
+    }
+
+    float result = 0.0;
+    for (uint k = 0u; k < constants.inner; ++k) {
+        result += a[row * constants.inner + k] * b[k * constants.cols + col];
+    }
+    c[row * constants.cols + col] = result;
+}

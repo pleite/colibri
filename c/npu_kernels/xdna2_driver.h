@@ -4,10 +4,11 @@
 /**
  * xdna2_driver.h — DRM ioctl wrapper for AMD XDNA 2 NPU
  *
- * Pure C interface to the amdxdna kernel driver via /dev/dri/card1.
- * No XRT dependency required.
+ * Pure C interface to the in-tree `amdxdna` accel driver via /dev/accel/accel0
+ * (override with the XDNA2_DEVICE environment variable). No XRT dependency.
  *
- * Strix Halo: XDNA 2, 10 columns × 8 rows AIE array, ~30 TOPS INT8
+ * Strix Halo: XDNA 2, 10 columns x 8 rows AIE array, ~30 TOPS INT8.
+ * This wrapper is Strix Halo exclusive and has no software-emulation path.
  */
 
 #include <stdint.h>
@@ -22,27 +23,29 @@
 /* ── Opaque handles ── */
 
 typedef struct {
+    uint32_t handle;        /* DRM BO handle */
+    uint64_t size;          /* Buffer size in bytes */
+    uint32_t type;          /* Buffer type (enum amdxdna_bo_type) */
+    uint64_t map_offset;    /* Fake mmap() offset returned by the driver */
+    uint64_t vaddr;         /* Returned user VA (0 if the BO needs mmap) */
+    uint64_t xdna_addr;     /* XDNA device virtual address */
+    void *mapped;           /* Host pointer, valid after xdna2_map_bo() */
+    bool owns_mapping;      /* True when `mapped` came from mmap() */
+} xdna2_bo_t;
+
+typedef struct {
     int fd;                 /* /dev/accel/accel0 file descriptor */
     uint32_t hwctx_handle;  /* Hardware context handle from driver */
-    uint32_t umq_bo_handle; /* User mode queue BO handle */
-    uint32_t log_buf_bo;    /* Log buffer BO handle */
+    xdna2_bo_t umq_bo;      /* User mode queue BO, owned for the ctx lifetime */
+    xdna2_bo_t log_bo;      /* Log buffer BO, owned for the ctx lifetime */
     uint32_t umq_doorbell;  /* Doorbell offset */
     uint32_t num_tiles;     /* Number of AIE tiles allocated */
     uint32_t mem_size;      /* AIE tile memory size */
     uint32_t max_opc;       /* Max operations per cycle */
-    uint32_t syncobj_handle;/* Sync object for command completion */
+    uint32_t syncobj_handle;/* Syncobj returned at hwctx creation */
+    uint64_t last_seq;      /* Sequence number of the last submitted command */
     bool initialized;
 } xdna2_hwctx_t;
-
-typedef struct {
-    uint32_t handle;        /* DRM BO handle */
-    uint64_t size;          /* Buffer size in bytes */
-    uint32_t type;          /* Buffer type (AMDXDNA_BO_*) */
-    uint64_t map_offset;    /* Offset for mmap() */
-    uint64_t vaddr;         /* Returned user VA (0 if needs mmap) */
-    uint64_t xdna_addr;     /* XDNA device virtual address */
-    void *mapped;           /* Mapped pointer (if mmap'd) */
-} xdna2_bo_t;
 
 /* ── AIE metadata ── */
 
@@ -81,7 +84,7 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════ */
 
 /**
- * xdna2_open_device — Open /dev/dri/card1
+ * xdna2_open_device — Open the NPU accel node (/dev/accel/accel0)
  *
  * Returns 0 on success, -1 on failure.
  * Sets *fd_ptr to the file descriptor.
@@ -120,7 +123,7 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx);
 int xdna2_create_bo(int fd, xdna2_bo_t *bo, uint64_t size, uint32_t type);
 
 /**
- * xdna2_destroy_bo — Destroy a buffer object
+ * xdna2_destroy_bo — Unmap and release a buffer object (DRM_IOCTL_GEM_CLOSE)
  */
 int xdna2_destroy_bo(int fd, xdna2_bo_t *bo);
 
@@ -149,17 +152,24 @@ int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
 /**
  * xdna2_submit_command — Submit an exec buffer command
  *
- * Executes a pre-compiled kernel on the NPU.
+ * cmd_bo_handle:   handle of the AMDXDNA_BO_CMD buffer holding the packet.
+ * arg_bo_handles:  array of BO handles referenced by the command (may be NULL).
+ * arg_count:       number of entries in arg_bo_handles.
+ *
+ * On success the returned command sequence number is stored in ctx->last_seq.
  * Returns 0 on success, negative on failure.
  */
 int xdna2_submit_command(int fd, xdna2_hwctx_t *ctx,
-                         uint64_t cmd_handle, uint64_t *args,
+                         uint32_t cmd_bo_handle, uint32_t *arg_bo_handles,
                          uint32_t arg_count);
 
 /**
- * xdna2_wait_command — Wait for command completion via syncobj
+ * xdna2_wait_command — Block until ctx->last_seq has completed
+ *
+ * timeout_ms: milliseconds to wait; 0 means wait forever.
+ * Returns 0 on success, negative on failure or timeout.
  */
-int xdna2_wait_command(int fd, uint32_t syncobj_handle, uint64_t timeout_ns);
+int xdna2_wait_command(int fd, xdna2_hwctx_t *ctx, uint32_t timeout_ms);
 
 /* ═══════════════════════════════════════════════════════════
  * Device Query
@@ -179,7 +189,8 @@ int xdna2_query_resource_info(int fd, xdna2_resource_info_t *info);
  * xdna2_query_firmware_version — Get firmware version
  */
 int xdna2_query_firmware_version(int fd, uint32_t *major,
-                                  uint32_t *minor, uint32_t *patch);
+                                 uint32_t *minor, uint32_t *patch,
+                                 uint32_t *build);
 
 /**
  * xdna2_print_device_info — Print NPU device summary
