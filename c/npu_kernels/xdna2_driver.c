@@ -171,13 +171,32 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                     "find this client's device heap, not that the ioctl is "
                     "unsupported (that would be ENOTTY)\n");
         } else if (err == EINVAL) {
+            /* Report the geometry the driver derives the partition from rather
+             * than asserting a cause: the column count is only one of the ways
+             * context init can return -EINVAL, and guessing at the reason is
+             * how the previous revisions of this file went wrong. */
+            xdna2_aie_metadata_t meta;
+            if (xdna2_query_aie_metadata(fd, &meta) == 0 &&
+                meta.core.row_count != 0) {
+                unsigned core_rows = (unsigned)meta.core.row_count;
+                unsigned num_col = num_tiles / core_rows;
+                fprintf(stderr,
+                        "xdna2: AIE array is %u columns x %u rows, %u core rows; "
+                        "num_tiles=%u implies %u column(s)%s\n",
+                        (unsigned)meta.cols, (unsigned)meta.rows, core_rows,
+                        num_tiles, num_col,
+                        (num_tiles % core_rows) ? " (not a whole multiple of "
+                        "the core row count)" : "");
+                if (num_col != 0 && num_col <= (unsigned)meta.cols &&
+                    (num_tiles % core_rows) == 0) {
+                    fprintf(stderr,
+                            "xdna2: that partition is within range, so -EINVAL "
+                            "came from something other than the column count\n");
+                }
+            }
             fprintf(stderr,
-                    "xdna2: -EINVAL comes from the driver's context init: "
-                    "num_tiles must be non-zero and a multiple of the AIE core "
-                    "row count, and num_tiles / core rows must not exceed the "
-                    "column count; run with XDNA2_VERBOSE=1 for the array "
-                    "geometry and check `dmesg | grep amdxdna` for the exact "
-                    "rejection\n");
+                    "xdna2: the driver logs the exact rejection; check "
+                    "`dmesg | grep -i amdxdna` on the host\n");
         }
         return -1;
     }

@@ -25,6 +25,8 @@ c/tests/test_grammar
 vnni-int8-matmul/**/*.o
 vnni-int8-matmul/tests/test_backends
 vnni-int8-matmul/tests/vulkan_runtime_test
+vnni-int8-matmul/tests/vulkan_debug_harness
+vnni-int8-matmul/tests/npu_device_test
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
