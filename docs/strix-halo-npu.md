@@ -93,6 +93,17 @@ for both `vaddr` (until the BO is mapped) and `map_offset` (always, for
 `AMDXDNA_BO_DEV`). Treat that sentinel as "unset" or a mapping attempt hands
 out `(void *)-1`.
 
+Because a heap's user address exists only because this process mapped it,
+`xdna2_create_hwctx()` mmaps the heap unconditionally — an address reported
+before that is stale, not permission to skip the mapping — and then re-reads
+`GET_BO_INFO` to confirm the driver recorded it. The driver sets
+`mem.userptr` once, in `amdxdna_hmm_register()`, and never clears it, so a heap
+that has no address after a successful mmap is a hard failure and is reported
+as such rather than deferred to a bare `-EINVAL` from `CREATE_HWCTX`. When
+`CREATE_HWCTX` does fail with `-EINVAL`, the heap's address is read again and
+printed, which separates "the heap registration was lost" from "the firmware
+refused the partition".
+
 Completion is reported on the per-context **timeline** syncobj returned by
 `CREATE_HWCTX`: the kernel calls `drm_syncobj_add_point(syncobj, chain,
 out_fence, seq)` for every job, so the `seq` returned by `EXEC_CMD` is the

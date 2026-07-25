@@ -43,6 +43,22 @@ static int xdna2_ioctl(int fd, unsigned long cmd, void *arg) {
     return ret;
 }
 
+/*
+ * The user address the driver associates with a BO, exactly as GET_BO_INFO
+ * reports it: XDNA2_INVALID_ADDR when the driver holds no address, which is a
+ * meaningful state and must not be folded into 0 here.
+ */
+static int xdna2_bo_userptr(int fd, uint32_t handle, uint64_t *uva) {
+    struct amdxdna_drm_get_bo_info info;
+    memset(&info, 0, sizeof(info));
+    info.handle = handle;
+    if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &info) < 0) {
+        return -1;
+    }
+    if (uva) *uva = info.vaddr;
+    return 0;
+}
+
 /* ── Device Management ── */
 
 int xdna2_open_device(int *fd_ptr) {
@@ -77,6 +93,10 @@ void xdna2_close_device(int fd) {
 }
 
 /* ── Hardware Context ── */
+
+/* Defined with the other BO helpers below. `force_mmap` ignores any user
+ * address the driver already reports and insists on a real mmap(). */
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap);
 
 /*
  * The amdxdna client owns exactly one device heap. `aie2_hwctx_init()` fails
@@ -132,12 +152,35 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
      * with -EINVAL ("Invalid dev heap userptr") while that address is still
      * AMDXDNA_INVALID_ADDR. aie2_hwctx_init() allocates its command buffers
      * exactly that way, so an unmapped heap turns CREATE_HWCTX into -EINVAL.
+     *
+     * The mapping is forced: a heap's user address exists *because* this
+     * process mapped it, so an address reported before that has to be treated
+     * as stale rather than as permission to skip the mmap.
      */
-    if (xdna2_map_bo(fd, &heap_bo) < 0) {
+    if (xdna2_map_bo_ex(fd, &heap_bo, /* force_mmap */ true) < 0) {
         xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr,
                 "xdna2: failed to map the device heap; the driver needs the "
                 "heap's user address before it can carve device BOs out of it\n");
+        return -1;
+    }
+
+    /*
+     * Confirm the driver actually recorded that address. Without this the only
+     * evidence of a heap the kernel considers unmapped is a bare -EINVAL from
+     * CREATE_HWCTX several calls later, with the real cause visible only in
+     * dmesg on the host.
+     */
+    uint64_t heap_uva = XDNA2_INVALID_ADDR;
+    if (xdna2_bo_userptr(fd, heap_bo.handle, &heap_uva) < 0 ||
+        heap_uva == XDNA2_INVALID_ADDR) {
+        fprintf(stderr,
+                "xdna2: the device heap is mapped at %p but the driver still "
+                "reports no user address for it; every AMDXDNA_BO_DEV "
+                "allocation, and so CREATE_HWCTX, would fail with -EINVAL "
+                "(\"Invalid dev heap userptr\")\n",
+                heap_bo.mapped);
+        xdna2_destroy_bo(fd, &heap_bo);
         return -1;
     }
 
@@ -174,6 +217,11 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
 
     if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &create_ctx) < 0) {
         int err = errno;
+        /* Read the heap state the driver held at the moment it refused, before
+         * the BOs are released: whether the heap was still mapped decides
+         * between a client-side bookkeeping fault and a partitioning refusal. */
+        uint64_t heap_uva_now = XDNA2_INVALID_ADDR;
+        int heap_known = (xdna2_bo_userptr(fd, heap_bo.handle, &heap_uva_now) == 0);
         xdna2_destroy_bo(fd, &log_bo);
         xdna2_destroy_bo(fd, &umq_bo);
         xdna2_destroy_bo(fd, &heap_bo);
@@ -188,6 +236,20 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                     "find this client's device heap, not that the ioctl is "
                     "unsupported (that would be ENOTTY)\n");
         } else if (err == EINVAL) {
+            if (!heap_known || heap_uva_now == XDNA2_INVALID_ADDR) {
+                fprintf(stderr,
+                        "xdna2: the driver reports no user address for the "
+                        "device heap now, though it reported 0x%" PRIx64 " right "
+                        "after the mapping; the heap registration was dropped "
+                        "between the two calls\n",
+                        heap_uva);
+            } else {
+                fprintf(stderr,
+                        "xdna2: the device heap is still registered at "
+                        "0x%" PRIx64 ", so the rejection is not the "
+                        "\"Invalid dev heap userptr\" case\n",
+                        heap_uva_now);
+            }
             /* Report the geometry the driver derives the partition from rather
              * than asserting a cause: the column count is only one of the ways
              * context init can return -EINVAL, and guessing at the reason is
@@ -324,13 +386,14 @@ int xdna2_destroy_bo(int fd, xdna2_bo_t *bo) {
     return ret < 0 ? -1 : 0;
 }
 
-int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap) {
     if (!bo) return -1;
     if (bo->mapped) return 0;
 
     /* Some BO types are already mapped into the process by the driver and
-     * report the address directly. */
-    if (bo->vaddr) {
+     * report the address directly. A caller that owns the registration itself
+     * (the device heap) passes force_mmap and never takes this shortcut. */
+    if (bo->vaddr && !force_mmap) {
         bo->mapped = (void *)(uintptr_t)bo->vaddr;
         return 0;
     }
@@ -355,6 +418,10 @@ int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
     bo->mapped = addr;
     bo->owns_mapping = true;
     return 0;
+}
+
+int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
+    return xdna2_map_bo_ex(fd, bo, /* force_mmap */ false);
 }
 
 int xdna2_unmap_bo(xdna2_bo_t *bo) {
