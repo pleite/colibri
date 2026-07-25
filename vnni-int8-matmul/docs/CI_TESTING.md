@@ -112,35 +112,76 @@ git push origin main
 
 ### 3.3 Expected Output
 
+On a Strix Halo runner with the iGPU available and no `.npukernel` artifact
+loaded:
+
 ```
-Run make test
-  ./tests/test_backends
+Run make podman-test
+  --- toolchain ---
+  gcc (GCC) 15.x
+  GNU ld version 2.4x
+  --- kernel uapi ---
+  amdxdna UAPI present
+  --- test ---
   CPU backend OK (avx512-vnni)
-  Vulkan backend OK (vulkan-compute)
-  XDNA2 backend OK (xdna2-fixed-4x1)
+  Vulkan backend OK (vulkan-compute-strix-halo)
+  XDNA2 backend SKIP (no NPU kernel loaded for this shape)
   Edge-case tests OK
-  All backend tests passed.
-  ./tests/vulkan_runtime_test
-  Vulkan runtime test passed via vulkan-compute
 ```
 
-## Step 4: Containerized Testing (Optional)
+`SKIP` is the correct result for the NPU until an AIE-compiled `.npukernel`
+artifact is available; it must never become `OK`, because the only way a
+shapeless NPU path could produce numbers is a CPU fallback, which this tree
+forbids. Treat any NPU `OK` without a loaded artifact as a regression.
 
-For isolated testing, use Podman containers:
+## Step 4: The container the harness uses
+
+`make podman-test` builds `vnni-int8-matmul/Dockerfile.strix-halo-test` and runs
+the suite inside it. The image is layered on the community Strix Halo toolbox
+image (`docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv`), which provides a
+working RADV/Mesa stack for GFX1151 but is an inference runtime, not a build
+environment. On its own it is missing:
+
+| Missing | Symptom | Package |
+|---|---|---|
+| `ld` | `collect2: fatal error: cannot find 'ld'` | `binutils` |
+| `<drm/amdxdna_accel.h>` | NPU sources do not compile | `kernel-headers` (≥ 6.14) |
+| `<drm/drm.h>` | pulled in by the amdxdna header | `libdrm-devel` |
+| `<vulkan/vulkan.h>` | Vulkan backend does not compile | `vulkan-headers`, `vulkan-loader-devel` |
+
+Do **not** patch this up inside the test step with
+`ln -sf /usr/bin/ld.bfd /usr/bin/ld`. That was the shortcut an earlier run took;
+it makes the environment undocumented and unreproducible, and it does nothing
+about the missing headers. Change the Dockerfile instead — it asserts that `ld`
+and both headers exist, so a broken base image fails at image-build time rather
+than halfway through a test.
+
+Override the base image with `BASE_IMAGE` if the toolbox tag moves:
 
 ```yaml
-- name: Test in Podman container
-  run: |
-    podman run --rm \
-      --device /dev/dri \
-      --device /dev/kfd \
-      --security-opt label=disable \
-      --cap-add=SYS_PTRACE \
-      -v ${{ github.workspace }}/vnni-int8-matmul:/opt/vnni:rw \
-      -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
-      docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv \
-      bash -c 'cd /opt/vnni && ln -sf /usr/bin/ld.bfd /etc/alternatives/ld && ln -sf /usr/bin/ld.bfd /usr/bin/ld && make clean && make && make test'
+- name: Run the harness
+  working-directory: vnni-int8-matmul
+  env:
+    BASE_IMAGE: docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv
+    REQUIRE_NPU: "1"
+  run: make podman-test
 ```
+
+### NPU access from the container
+
+The NPU is the `amdxdna` accel node, not `/dev/dri`. The harness passes
+`--device /dev/accel/accel0` when it exists. Requirements on the runner:
+
+```bash
+lsmod | grep amdxdna              # module loaded (in-tree since Linux 6.14)
+ls -l /dev/accel/accel0           # node present
+ls /lib/firmware/amdnpu/17f0_11/  # Strix Halo NPU firmware installed
+```
+
+Set `REQUIRE_NPU=1` in CI so a missing node fails the job instead of silently
+turning the NPU tests into SKIPs. XRT is deliberately not installed in the
+image: `c/npu_kernels` issues DRM ioctls directly, and having XRT present would
+make it ambiguous which path a run exercised.
 
 ## Step 5: Add Test Reporting
 
@@ -183,6 +224,25 @@ Modify the test step to capture output:
 ```
 
 ## Troubleshooting
+
+### `cannot find 'ld'` / missing headers
+
+The job is running the bare toolbox image instead of the harness image. Run
+`make podman-test`, which builds `Dockerfile.strix-halo-test`, rather than
+invoking `podman run` against the base image directly.
+
+### NPU tests skip on a machine that has an NPU
+
+```bash
+lsmod | grep amdxdna
+ls -l /dev/accel/accel0
+sudo dmesg | grep -i amdxdna
+```
+
+`CREATE_HWCTX` failing with `ENOENT` is a userspace bug (no device heap
+allocated before the context), not a missing kernel feature; an unimplemented
+ioctl reports `ENOTTY`. See `vnni-int8-matmul/docs/TESTING.md` for the full
+errno table.
 
 ### Runner Not Appearing
 

@@ -22,9 +22,28 @@ jobs:
       - name: Run VNNI tests in Strix Halo podman harness
         working-directory: vnni-int8-matmul
         shell: bash
+        env:
+          # Fail the job if the amdxdna node is missing instead of letting the
+          # NPU tests degrade into silent SKIPs on a machine that has an NPU.
+          REQUIRE_NPU: "1"
         run: |
           set -euo pipefail
           make podman-test
+
+      - name: Assert no backend silently fell back
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f test_output.log || { echo "no test log produced" >&2; exit 1; }
+          # An NPU "OK" without a loaded .npukernel artifact can only come from
+          # a CPU fallback, which this tree forbids.
+          if grep -q 'XDNA2 backend OK' test_output.log && \
+             ! grep -q 'npukernel' test_output.log; then
+            echo "XDNA2 backend reported OK with no kernel artifact loaded" >&2
+            exit 1
+          fi
 
       - name: Publish test summary
         if: always()
