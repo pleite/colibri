@@ -57,7 +57,19 @@ All backend tests passed.
 Vulkan runtime test passed via vulkan-compute
 ```
 
-### 4. Test in Podman Container
+### 4. Use the dedicated debug harness
+
+A dedicated harness is available at `tests/vulkan_debug_harness` for reproducing the loader path in a single place. Enable verbose diagnostics with:
+
+```bash
+export VNNI_VULKAN_DEBUG=1
+make tests/vulkan_debug_harness
+./tests/vulkan_debug_harness
+```
+
+The harness will print the backend name and the exact failure point if initialization or execution fails.
+
+### 5. Test in Podman Container
 
 ```bash
 podman run -it --rm \

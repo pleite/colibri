@@ -52,8 +52,8 @@ static void fill_weights(int8_t *buffer, int count) {
 
 static int run_cpu_case(void) {
     if (!strix_cpu_is_supported()) {
-        fprintf(stderr, "CPU backend FAILED (requires AVX-512 VNNI on Strix Halo)\n");
-        return 0;
+        printf("CPU backend SKIP (requires AVX-512 VNNI on Strix Halo)\n");
+        return 1;
     }
 
     const int rows = 2;
@@ -101,6 +101,10 @@ static int run_vulkan_case(void) {
     }
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
+    if (strcmp(strix_vulkan_backend_name(), "vulkan-unavailable") == 0) {
+        printf("Vulkan backend SKIP (requires Vulkan runtime on Strix Halo)\n");
+        return 1;
+    }
     if (!strix_vulkan_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
         fprintf(stderr, "Vulkan backend FAILED (requires Vulkan runtime on Strix Halo)\n");
         return 0;
@@ -130,6 +134,10 @@ static int run_xdna2_case(void) {
     }
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
+    if (!strix_cpu_is_supported()) {
+        printf("XDNA2 backend SKIP (requires AVX-512 VNNI on Strix Halo)\n");
+        return 1;
+    }
     if (!strix_xdna2_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
         fprintf(stderr, "XDNA2 backend FAILED (requires AVX-512 VNNI on Strix Halo)\n");
         return 0;
@@ -150,6 +158,10 @@ static int run_edge_case_tests(void) {
     float out_invalid[1] = {0.0f};
 
     scalar_reference(input, 1, 4, weights, 1, expected_single, NULL);
+    if (strcmp(strix_vulkan_backend_name(), "vulkan-unavailable") == 0) {
+        printf("Vulkan edge-case tests SKIP (requires Vulkan runtime on Strix Halo)\n");
+        return 1;
+    }
     if (!strix_vulkan_matmul(input, 1, 4, weights, 1, out_single, NULL)) {
         fprintf(stderr, "Vulkan edge-case tests FAILED (requires Vulkan runtime on Strix Halo)\n");
         return 0;

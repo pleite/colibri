@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,19 @@ static void *g_vulkan_handle = NULL;
 static int g_vulkan_available = 0;
 static int g_vulkan_initialized = 0;
 static VnnVulkanDispatch g_vulkan_dispatch;
+
+static void vulkan_debugf(const char *fmt, ...) {
+    const char *enabled = getenv("VNNI_VULKAN_DEBUG");
+    if (!enabled || !enabled[0] || strcmp(enabled, "0") == 0) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[vulkan-debug] ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
 
 static void release_weights(float *weights_f32, int fmt) {
     if (fmt != 0) {
@@ -81,81 +95,147 @@ static uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t filt
 static void destroy_context(StrixVulkanContext *ctx) {
     if (!ctx) return;
     if (ctx->device) {
-        if (ctx->pipeline) ctx->dispatch.vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
-        if (ctx->pipeline_layout) ctx->dispatch.vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
-        if (ctx->shader_module) ctx->dispatch.vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
-        if (ctx->descriptor_layout) ctx->dispatch.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
-        if (ctx->descriptor_pool) ctx->dispatch.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
-        if (ctx->command_pool) ctx->dispatch.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
-        for (int i = 0; i < 3; ++i) {
-            if (ctx->buffers[i]) ctx->dispatch.vkDestroyBuffer(ctx->device, ctx->buffers[i], NULL);
-            if (ctx->memories[i]) ctx->dispatch.vkFreeMemory(ctx->device, ctx->memories[i], NULL);
+        if (ctx->pipeline && ctx->dispatch.vkDestroyPipeline) {
+            ctx->dispatch.vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
         }
-        ctx->dispatch.vkDestroyDevice(ctx->device, NULL);
+        if (ctx->pipeline_layout && ctx->dispatch.vkDestroyPipelineLayout) {
+            ctx->dispatch.vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
+        }
+        if (ctx->shader_module && ctx->dispatch.vkDestroyShaderModule) {
+            ctx->dispatch.vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
+        }
+        if (ctx->descriptor_layout && ctx->dispatch.vkDestroyDescriptorSetLayout) {
+            ctx->dispatch.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
+        }
+        if (ctx->descriptor_pool && ctx->dispatch.vkDestroyDescriptorPool) {
+            ctx->dispatch.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
+        }
+        if (ctx->command_pool && ctx->dispatch.vkDestroyCommandPool) {
+            ctx->dispatch.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (ctx->buffers[i] && ctx->dispatch.vkDestroyBuffer) {
+                ctx->dispatch.vkDestroyBuffer(ctx->device, ctx->buffers[i], NULL);
+            }
+            if (ctx->memories[i] && ctx->dispatch.vkFreeMemory) {
+                ctx->dispatch.vkFreeMemory(ctx->device, ctx->memories[i], NULL);
+            }
+        }
+        if (ctx->dispatch.vkDestroyDevice) {
+            ctx->dispatch.vkDestroyDevice(ctx->device, NULL);
+        }
     }
-    if (ctx->instance) ctx->dispatch.vkDestroyInstance(ctx->instance, NULL);
+    if (ctx->instance && ctx->dispatch.vkDestroyInstance) {
+        ctx->dispatch.vkDestroyInstance(ctx->instance, NULL);
+    }
     memset(ctx, 0, sizeof(*ctx));
 }
 
 static int load_dispatch(VnnVulkanDispatch *dispatch) {
     memset(dispatch, 0, sizeof(*dispatch));
-    void *handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!handle) return 0;
-    g_vulkan_handle = handle;
+    const char *candidates[] = {"libvulkan.so.1", "libvulkan.so"};
+    const char *loaded_name = NULL;
+    const char *load_error = "unknown";
 
-    PFN_vkGetInstanceProcAddr get_proc_addr = (PFN_vkGetInstanceProcAddr)dlsym(handle, "vkGetInstanceProcAddr");
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        dlerror();
+        void *handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (handle) {
+            g_vulkan_handle = handle;
+            loaded_name = candidates[i];
+            break;
+        }
+        load_error = dlerror();
+        vulkan_debugf("dlopen(%s) failed: %s", candidates[i], load_error ? load_error : "unknown");
+    }
+    if (!g_vulkan_handle) {
+        vulkan_debugf("failed to load Vulkan loader: %s", load_error ? load_error : "unknown");
+        return 0;
+    }
+
+    PFN_vkGetInstanceProcAddr get_proc_addr = (PFN_vkGetInstanceProcAddr)dlsym(g_vulkan_handle, "vkGetInstanceProcAddr");
     if (!get_proc_addr) {
-        dlclose(handle);
+        vulkan_debugf("vkGetInstanceProcAddr not found");
+        dlclose(g_vulkan_handle);
         g_vulkan_handle = NULL;
         return 0;
     }
 
-    /* Static Vulkan entry points must be loaded via dlsym, not vkGetInstanceProcAddr */
-    dispatch->vkCreateInstance = (PFN_vkCreateInstance)dlsym(handle, "vkCreateInstance");
-    dispatch->vkDestroyInstance = (PFN_vkDestroyInstance)dlsym(handle, "vkDestroyInstance");
-    dispatch->vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)dlsym(handle, "vkEnumeratePhysicalDevices");
-    dispatch->vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)dlsym(handle, "vkGetPhysicalDeviceProperties");
-    dispatch->vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)dlsym(handle, "vkGetPhysicalDeviceQueueFamilyProperties");
-    dispatch->vkGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)dlsym(handle, "vkGetPhysicalDeviceMemoryProperties");
-    dispatch->vkCreateDevice = (PFN_vkCreateDevice)dlsym(handle, "vkCreateDevice");
-    dispatch->vkDestroyDevice = (PFN_vkDestroyDevice)dlsym(handle, "vkDestroyDevice");
-    dispatch->vkGetDeviceQueue = (PFN_vkGetDeviceQueue)dlsym(handle, "vkGetDeviceQueue");
-    dispatch->vkCreateCommandPool = (PFN_vkCreateCommandPool)dlsym(handle, "vkCreateCommandPool");
-    dispatch->vkDestroyCommandPool = (PFN_vkDestroyCommandPool)dlsym(handle, "vkDestroyCommandPool");
-    dispatch->vkAllocateCommandBuffers = (PFN_vkAllocateCommandBuffers)dlsym(handle, "vkAllocateCommandBuffers");
-    dispatch->vkFreeCommandBuffers = (PFN_vkFreeCommandBuffers)dlsym(handle, "vkFreeCommandBuffers");
-    dispatch->vkBeginCommandBuffer = (PFN_vkBeginCommandBuffer)dlsym(handle, "vkBeginCommandBuffer");
-    dispatch->vkEndCommandBuffer = (PFN_vkEndCommandBuffer)dlsym(handle, "vkEndCommandBuffer");
-    dispatch->vkCreateDescriptorSetLayout = (PFN_vkCreateDescriptorSetLayout)dlsym(handle, "vkCreateDescriptorSetLayout");
-    dispatch->vkDestroyDescriptorSetLayout = (PFN_vkDestroyDescriptorSetLayout)dlsym(handle, "vkDestroyDescriptorSetLayout");
-    dispatch->vkCreateShaderModule = (PFN_vkCreateShaderModule)dlsym(handle, "vkCreateShaderModule");
-    dispatch->vkDestroyShaderModule = (PFN_vkDestroyShaderModule)dlsym(handle, "vkDestroyShaderModule");
-    dispatch->vkCreatePipelineLayout = (PFN_vkCreatePipelineLayout)dlsym(handle, "vkCreatePipelineLayout");
-    dispatch->vkDestroyPipelineLayout = (PFN_vkDestroyPipelineLayout)dlsym(handle, "vkDestroyPipelineLayout");
-    dispatch->vkCreateComputePipelines = (PFN_vkCreateComputePipelines)dlsym(handle, "vkCreateComputePipelines");
-    dispatch->vkDestroyPipeline = (PFN_vkDestroyPipeline)dlsym(handle, "vkDestroyPipeline");
-    dispatch->vkCreateDescriptorPool = (PFN_vkCreateDescriptorPool)dlsym(handle, "vkCreateDescriptorPool");
-    dispatch->vkDestroyDescriptorPool = (PFN_vkDestroyDescriptorPool)dlsym(handle, "vkDestroyDescriptorPool");
-    dispatch->vkAllocateDescriptorSets = (PFN_vkAllocateDescriptorSets)dlsym(handle, "vkAllocateDescriptorSets");
-    dispatch->vkUpdateDescriptorSets = (PFN_vkUpdateDescriptorSets)dlsym(handle, "vkUpdateDescriptorSets");
-    dispatch->vkCreateBuffer = (PFN_vkCreateBuffer)dlsym(handle, "vkCreateBuffer");
-    dispatch->vkDestroyBuffer = (PFN_vkDestroyBuffer)dlsym(handle, "vkDestroyBuffer");
-    dispatch->vkGetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements)dlsym(handle, "vkGetBufferMemoryRequirements");
-    dispatch->vkAllocateMemory = (PFN_vkAllocateMemory)dlsym(handle, "vkAllocateMemory");
-    dispatch->vkFreeMemory = (PFN_vkFreeMemory)dlsym(handle, "vkFreeMemory");
-    dispatch->vkBindBufferMemory = (PFN_vkBindBufferMemory)dlsym(handle, "vkBindBufferMemory");
-    dispatch->vkMapMemory = (PFN_vkMapMemory)dlsym(handle, "vkMapMemory");
-    dispatch->vkUnmapMemory = (PFN_vkUnmapMemory)dlsym(handle, "vkUnmapMemory");
-    dispatch->vkCmdBindPipeline = (PFN_vkCmdBindPipeline)dlsym(handle, "vkCmdBindPipeline");
-    dispatch->vkCmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)dlsym(handle, "vkCmdBindDescriptorSets");
-    dispatch->vkCmdPushConstants = (PFN_vkCmdPushConstants)dlsym(handle, "vkCmdPushConstants");
-    dispatch->vkCmdDispatch = (PFN_vkCmdDispatch)dlsym(handle, "vkCmdDispatch");
-    dispatch->vkQueueSubmit = (PFN_vkQueueSubmit)dlsym(handle, "vkQueueSubmit");
-    dispatch->vkWaitForFences = (PFN_vkWaitForFences)dlsym(handle, "vkWaitForFences");
-    dispatch->vkCreateFence = (PFN_vkCreateFence)dlsym(handle, "vkCreateFence");
-    dispatch->vkDestroyFence = (PFN_vkDestroyFence)dlsym(handle, "vkDestroyFence");
+    dispatch->vkCreateInstance = (PFN_vkCreateInstance)dlsym(g_vulkan_handle, "vkCreateInstance");
+    dispatch->vkDestroyInstance = (PFN_vkDestroyInstance)dlsym(g_vulkan_handle, "vkDestroyInstance");
+    dispatch->vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)dlsym(g_vulkan_handle, "vkEnumeratePhysicalDevices");
+    dispatch->vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)dlsym(g_vulkan_handle, "vkGetPhysicalDeviceProperties");
+    dispatch->vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)dlsym(g_vulkan_handle, "vkGetPhysicalDeviceQueueFamilyProperties");
+    dispatch->vkGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)dlsym(g_vulkan_handle, "vkGetPhysicalDeviceMemoryProperties");
+    dispatch->vkCreateDevice = (PFN_vkCreateDevice)dlsym(g_vulkan_handle, "vkCreateDevice");
+    dispatch->vkDestroyDevice = (PFN_vkDestroyDevice)dlsym(g_vulkan_handle, "vkDestroyDevice");
 
-    return dispatch->vkCreateInstance && dispatch->vkDestroyInstance && dispatch->vkEnumeratePhysicalDevices && dispatch->vkCreateDevice && dispatch->vkGetDeviceQueue && dispatch->vkCreateCommandPool && dispatch->vkCreateDescriptorSetLayout && dispatch->vkCreateShaderModule && dispatch->vkCreatePipelineLayout && dispatch->vkCreateComputePipelines && dispatch->vkCreateDescriptorPool && dispatch->vkAllocateDescriptorSets && dispatch->vkCreateBuffer && dispatch->vkAllocateMemory && dispatch->vkBindBufferMemory && dispatch->vkMapMemory && dispatch->vkUnmapMemory && dispatch->vkQueueSubmit && dispatch->vkWaitForFences && dispatch->vkCreateFence;
+    vulkan_debugf("loaded Vulkan dispatcher from %s", loaded_name ? loaded_name : "unknown");
+    return dispatch->vkCreateInstance && dispatch->vkDestroyInstance && dispatch->vkEnumeratePhysicalDevices && dispatch->vkGetPhysicalDeviceProperties && dispatch->vkGetPhysicalDeviceQueueFamilyProperties && dispatch->vkGetPhysicalDeviceMemoryProperties && dispatch->vkCreateDevice && dispatch->vkDestroyDevice;
+}
+
+static int resolve_device_dispatch(StrixVulkanContext *ctx) {
+    if (!g_vulkan_handle || !ctx || !ctx->instance || !ctx->device) {
+        return 0;
+    }
+    PFN_vkGetInstanceProcAddr get_proc_addr = (PFN_vkGetInstanceProcAddr)dlsym(g_vulkan_handle, "vkGetInstanceProcAddr");
+    if (!get_proc_addr) {
+        vulkan_debugf("vkGetInstanceProcAddr unavailable while resolving device functions");
+        return 0;
+    }
+    PFN_vkGetDeviceProcAddr get_device_proc_addr = (PFN_vkGetDeviceProcAddr)get_proc_addr(ctx->instance, "vkGetDeviceProcAddr");
+    if (!get_device_proc_addr) {
+        vulkan_debugf("vkGetDeviceProcAddr unavailable while resolving device functions");
+        return 0;
+    }
+
+#define RESOLVE_DEVICE_PROC(name)                                              \
+    do {                                                                       \
+        ctx->dispatch.name = (__typeof__(ctx->dispatch.name))get_device_proc_addr(ctx->device, #name); \
+        if (!ctx->dispatch.name) {                                              \
+            vulkan_debugf("failed to resolve device entry point %s", #name);   \
+            return 0;                                                           \
+        }                                                                       \
+    } while (0)
+
+    RESOLVE_DEVICE_PROC(vkGetDeviceQueue);
+    RESOLVE_DEVICE_PROC(vkCreateCommandPool);
+    RESOLVE_DEVICE_PROC(vkDestroyCommandPool);
+    RESOLVE_DEVICE_PROC(vkAllocateCommandBuffers);
+    RESOLVE_DEVICE_PROC(vkFreeCommandBuffers);
+    RESOLVE_DEVICE_PROC(vkBeginCommandBuffer);
+    RESOLVE_DEVICE_PROC(vkEndCommandBuffer);
+    RESOLVE_DEVICE_PROC(vkCreateDescriptorSetLayout);
+    RESOLVE_DEVICE_PROC(vkDestroyDescriptorSetLayout);
+    RESOLVE_DEVICE_PROC(vkCreateShaderModule);
+    RESOLVE_DEVICE_PROC(vkDestroyShaderModule);
+    RESOLVE_DEVICE_PROC(vkCreatePipelineLayout);
+    RESOLVE_DEVICE_PROC(vkDestroyPipelineLayout);
+    RESOLVE_DEVICE_PROC(vkCreateComputePipelines);
+    RESOLVE_DEVICE_PROC(vkDestroyPipeline);
+    RESOLVE_DEVICE_PROC(vkCreateDescriptorPool);
+    RESOLVE_DEVICE_PROC(vkDestroyDescriptorPool);
+    RESOLVE_DEVICE_PROC(vkAllocateDescriptorSets);
+    RESOLVE_DEVICE_PROC(vkUpdateDescriptorSets);
+    RESOLVE_DEVICE_PROC(vkCreateBuffer);
+    RESOLVE_DEVICE_PROC(vkDestroyBuffer);
+    RESOLVE_DEVICE_PROC(vkGetBufferMemoryRequirements);
+    RESOLVE_DEVICE_PROC(vkAllocateMemory);
+    RESOLVE_DEVICE_PROC(vkFreeMemory);
+    RESOLVE_DEVICE_PROC(vkBindBufferMemory);
+    RESOLVE_DEVICE_PROC(vkMapMemory);
+    RESOLVE_DEVICE_PROC(vkUnmapMemory);
+    RESOLVE_DEVICE_PROC(vkCmdBindPipeline);
+    RESOLVE_DEVICE_PROC(vkCmdBindDescriptorSets);
+    RESOLVE_DEVICE_PROC(vkCmdPushConstants);
+    RESOLVE_DEVICE_PROC(vkCmdDispatch);
+    RESOLVE_DEVICE_PROC(vkQueueSubmit);
+    RESOLVE_DEVICE_PROC(vkWaitForFences);
+    RESOLVE_DEVICE_PROC(vkCreateFence);
+    RESOLVE_DEVICE_PROC(vkDestroyFence);
+
+#undef RESOLVE_DEVICE_PROC
+    return 1;
 }
 
 static int create_context(StrixVulkanContext *ctx, VnnVulkanDispatch *dispatch) {
@@ -174,16 +254,19 @@ static int create_context(StrixVulkanContext *ctx, VnnVulkanDispatch *dispatch) 
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app_info;
     if (dispatch->vkCreateInstance(&instance_info, NULL, &ctx->instance) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateInstance failed");
         return 0;
     }
 
     uint32_t device_count = 0;
     if (dispatch->vkEnumeratePhysicalDevices(ctx->instance, &device_count, NULL) != VK_SUCCESS || device_count == 0) {
+        vulkan_debugf("create_context: vkEnumeratePhysicalDevices returned %u devices", device_count);
         destroy_context(ctx);
         return 0;
     }
     VkPhysicalDevice devices[8] = {0};
     if (dispatch->vkEnumeratePhysicalDevices(ctx->instance, &device_count, devices) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkEnumeratePhysicalDevices failed during device enumeration");
         destroy_context(ctx);
         return 0;
     }
@@ -220,16 +303,23 @@ found_device:
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     if (dispatch->vkCreateDevice(ctx->physical_device, &device_info, NULL, &ctx->device) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateDevice failed");
         destroy_context(ctx);
         return 0;
     }
-    dispatch->vkGetDeviceQueue(ctx->device, ctx->queue_family_index, 0, &ctx->queue);
+    if (!resolve_device_dispatch(ctx)) {
+        vulkan_debugf("create_context: failed to resolve device entry points");
+        destroy_context(ctx);
+        return 0;
+    }
+    ctx->dispatch.vkGetDeviceQueue(ctx->device, ctx->queue_family_index, 0, &ctx->queue);
 
     VkCommandPoolCreateInfo pool_info = {0};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.queueFamilyIndex = ctx->queue_family_index;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    if (dispatch->vkCreateCommandPool(ctx->device, &pool_info, NULL, &ctx->command_pool) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreateCommandPool(ctx->device, &pool_info, NULL, &ctx->command_pool) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateCommandPool failed");
         destroy_context(ctx);
         return 0;
     }
@@ -245,7 +335,8 @@ found_device:
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = 3;
     layout_info.pBindings = bindings;
-    if (dispatch->vkCreateDescriptorSetLayout(ctx->device, &layout_info, NULL, &ctx->descriptor_layout) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreateDescriptorSetLayout(ctx->device, &layout_info, NULL, &ctx->descriptor_layout) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateDescriptorSetLayout failed");
         destroy_context(ctx);
         return 0;
     }
@@ -260,7 +351,8 @@ found_device:
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_info.codeSize = shader_size;
     shader_info.pCode = shader_code;
-    if (dispatch->vkCreateShaderModule(ctx->device, &shader_info, NULL, &ctx->shader_module) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreateShaderModule(ctx->device, &shader_info, NULL, &ctx->shader_module) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateShaderModule failed");
         free(shader_code);
         destroy_context(ctx);
         return 0;
@@ -278,7 +370,8 @@ found_device:
     pipeline_layout_info.pSetLayouts = &ctx->descriptor_layout;
     pipeline_layout_info.pushConstantRangeCount = 1;
     pipeline_layout_info.pPushConstantRanges = &push_range;
-    if (dispatch->vkCreatePipelineLayout(ctx->device, &pipeline_layout_info, NULL, &ctx->pipeline_layout) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreatePipelineLayout(ctx->device, &pipeline_layout_info, NULL, &ctx->pipeline_layout) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreatePipelineLayout failed");
         destroy_context(ctx);
         return 0;
     }
@@ -293,7 +386,8 @@ found_device:
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.stage = stage;
     pipeline_info.layout = ctx->pipeline_layout;
-    if (dispatch->vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &ctx->pipeline) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &ctx->pipeline) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateComputePipelines failed");
         destroy_context(ctx);
         return 0;
     }
@@ -306,7 +400,8 @@ found_device:
     pool_info2.maxSets = 1;
     pool_info2.poolSizeCount = 1;
     pool_info2.pPoolSizes = pool_sizes;
-    if (dispatch->vkCreateDescriptorPool(ctx->device, &pool_info2, NULL, &ctx->descriptor_pool) != VK_SUCCESS) {
+    if (ctx->dispatch.vkCreateDescriptorPool(ctx->device, &pool_info2, NULL, &ctx->descriptor_pool) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkCreateDescriptorPool failed");
         destroy_context(ctx);
         return 0;
     }
@@ -316,7 +411,8 @@ found_device:
     alloc_info.descriptorPool = ctx->descriptor_pool;
     alloc_info.descriptorSetCount = 1;
     alloc_info.pSetLayouts = &ctx->descriptor_layout;
-    if (dispatch->vkAllocateDescriptorSets(ctx->device, &alloc_info, &ctx->descriptor_set) != VK_SUCCESS) {
+    if (ctx->dispatch.vkAllocateDescriptorSets(ctx->device, &alloc_info, &ctx->descriptor_set) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkAllocateDescriptorSets failed");
         destroy_context(ctx);
         return 0;
     }
@@ -326,7 +422,8 @@ found_device:
     cmd_alloc.commandPool = ctx->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmd_alloc.commandBufferCount = 1;
-    if (dispatch->vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
+    if (ctx->dispatch.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
+        vulkan_debugf("create_context: vkAllocateCommandBuffers failed");
         destroy_context(ctx);
         return 0;
     }
@@ -341,12 +438,16 @@ static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, VkBuffer *b
     info.size = size;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (ctx->dispatch.vkCreateBuffer(ctx->device, &info, NULL, buffer) != VK_SUCCESS) return 0;
+    if (ctx->dispatch.vkCreateBuffer(ctx->device, &info, NULL, buffer) != VK_SUCCESS) {
+        vulkan_debugf("create_buffer: vkCreateBuffer failed for size=%llu", (unsigned long long)size);
+        return 0;
+    }
 
     VkMemoryRequirements requirements = {0};
     ctx->dispatch.vkGetBufferMemoryRequirements(ctx->device, *buffer, &requirements);
     uint32_t index = find_memory_type(ctx->physical_device, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->dispatch);
     if (index == UINT32_MAX) {
+        vulkan_debugf("create_buffer: no suitable memory type found for %llu bytes", (unsigned long long)size);
         ctx->dispatch.vkDestroyBuffer(ctx->device, *buffer, NULL);
         return 0;
     }
@@ -355,10 +456,12 @@ static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, VkBuffer *b
     alloc.allocationSize = requirements.size;
     alloc.memoryTypeIndex = index;
     if (ctx->dispatch.vkAllocateMemory(ctx->device, &alloc, NULL, memory) != VK_SUCCESS) {
+        vulkan_debugf("create_buffer: vkAllocateMemory failed");
         ctx->dispatch.vkDestroyBuffer(ctx->device, *buffer, NULL);
         return 0;
     }
     if (ctx->dispatch.vkBindBufferMemory(ctx->device, *buffer, *memory, 0) != VK_SUCCESS) {
+        vulkan_debugf("create_buffer: vkBindBufferMemory failed");
         ctx->dispatch.vkFreeMemory(ctx->device, *memory, NULL);
         ctx->dispatch.vkDestroyBuffer(ctx->device, *buffer, NULL);
         return 0;
@@ -404,9 +507,18 @@ static int run_vulkan_matmul(StrixVulkanContext *ctx, const int8_t *input, const
         }
     }
 
-    if (!create_buffer(ctx, a_bytes, &ctx->buffers[0], &ctx->memories[0])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
-    if (!create_buffer(ctx, b_bytes, &ctx->buffers[1], &ctx->memories[1])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
-    if (!create_buffer(ctx, c_bytes, &ctx->buffers[2], &ctx->memories[2])) { free(weights_t); release_weights(weights_f32, fmt); return 0; }
+    if (!create_buffer(ctx, a_bytes, &ctx->buffers[0], &ctx->memories[0])) {
+        vulkan_debugf("run_vulkan_matmul: failed to create input buffer (%llu bytes)", (unsigned long long)a_bytes);
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
+    }
+    if (!create_buffer(ctx, b_bytes, &ctx->buffers[1], &ctx->memories[1])) {
+        vulkan_debugf("run_vulkan_matmul: failed to create weight buffer (%llu bytes)", (unsigned long long)b_bytes);
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
+    }
+    if (!create_buffer(ctx, c_bytes, &ctx->buffers[2], &ctx->memories[2])) {
+        vulkan_debugf("run_vulkan_matmul: failed to create output buffer (%llu bytes)", (unsigned long long)c_bytes);
+        free(weights_t); release_weights(weights_f32, fmt); return 0;
+    }
 
     void *mapped_a = NULL;
     void *mapped_b = NULL;
@@ -414,6 +526,7 @@ static int run_vulkan_matmul(StrixVulkanContext *ctx, const int8_t *input, const
     if (ctx->dispatch.vkMapMemory(ctx->device, ctx->memories[0], 0, a_bytes, 0, &mapped_a) != VK_SUCCESS ||
         ctx->dispatch.vkMapMemory(ctx->device, ctx->memories[1], 0, b_bytes, 0, &mapped_b) != VK_SUCCESS ||
         ctx->dispatch.vkMapMemory(ctx->device, ctx->memories[2], 0, c_bytes, 0, &mapped_c) != VK_SUCCESS) {
+        vulkan_debugf("run_vulkan_matmul: vkMapMemory failed while preparing buffers");
         ctx->dispatch.vkUnmapMemory(ctx->device, ctx->memories[0]);
         ctx->dispatch.vkUnmapMemory(ctx->device, ctx->memories[1]);
         ctx->dispatch.vkUnmapMemory(ctx->device, ctx->memories[2]);
@@ -445,6 +558,7 @@ static int run_vulkan_matmul(StrixVulkanContext *ctx, const int8_t *input, const
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (ctx->dispatch.vkBeginCommandBuffer(ctx->command_buffer, &begin) != VK_SUCCESS) {
+        vulkan_debugf("run_vulkan_matmul: vkBeginCommandBuffer failed");
         free(input_f32); free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     ctx->dispatch.vkCmdBindPipeline(ctx->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
@@ -455,6 +569,7 @@ static int run_vulkan_matmul(StrixVulkanContext *ctx, const int8_t *input, const
     const uint32_t group_y = (S + 15) / 16;
     ctx->dispatch.vkCmdDispatch(ctx->command_buffer, group_x, group_y, 1);
     if (ctx->dispatch.vkEndCommandBuffer(ctx->command_buffer) != VK_SUCCESS) {
+        vulkan_debugf("run_vulkan_matmul: vkEndCommandBuffer failed");
         free(input_f32); free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
 
@@ -466,11 +581,15 @@ static int run_vulkan_matmul(StrixVulkanContext *ctx, const int8_t *input, const
     VkFenceCreateInfo fence_info = {0};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (ctx->dispatch.vkCreateFence(ctx->device, &fence_info, NULL, &fence) != VK_SUCCESS) {
+        vulkan_debugf("run_vulkan_matmul: vkCreateFence failed");
         free(input_f32); free(weights_t); release_weights(weights_f32, fmt); return 0;
     }
     int ok = (ctx->dispatch.vkQueueSubmit(ctx->queue, 1, &submit, fence) == VK_SUCCESS && ctx->dispatch.vkWaitForFences(ctx->device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
     ctx->dispatch.vkDestroyFence(ctx->device, fence, NULL);
-    if (!ok) { free(input_f32); free(weights_t); release_weights(weights_f32, fmt); return 0; }
+    if (!ok) {
+        vulkan_debugf("run_vulkan_matmul: queue submission or fence wait failed");
+        free(input_f32); free(weights_t); release_weights(weights_f32, fmt); return 0;
+    }
 
     void *mapped_out = NULL;
     if (ctx->dispatch.vkMapMemory(ctx->device, ctx->memories[2], 0, c_bytes, 0, &mapped_out) != VK_SUCCESS) {
@@ -512,6 +631,7 @@ int strix_vulkan_matmul(const int8_t *input,
 
     if (!g_vulkan_initialized) {
         if (!load_dispatch(&g_vulkan_dispatch)) {
+            vulkan_debugf("strix_vulkan_matmul: Vulkan loader unavailable");
             g_vulkan_available = 0;
             g_vulkan_initialized = 1;
             return 0;
@@ -526,10 +646,14 @@ int strix_vulkan_matmul(const int8_t *input,
 
     StrixVulkanContext ctx;
     if (!create_context(&ctx, &g_vulkan_dispatch)) {
+        vulkan_debugf("strix_vulkan_matmul: Vulkan context creation failed");
+        g_vulkan_available = 0;
         return 0;
     }
 
     if (!run_vulkan_matmul(&ctx, input, weights, scales, 1, rows, inner_dim, out_cols, output)) {
+        vulkan_debugf("strix_vulkan_matmul: Vulkan execution failed");
+        g_vulkan_available = 0;
         destroy_context(&ctx);
         return 0;
     }

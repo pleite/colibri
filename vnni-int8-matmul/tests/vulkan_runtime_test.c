@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../gpu/vulkan_backend.h"
 
@@ -56,6 +57,10 @@ int main(void) {
     }
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
+    if (strcmp(strix_vulkan_backend_name(), "vulkan-unavailable") == 0) {
+        printf("Vulkan runtime test SKIP (requires Vulkan runtime on Strix Halo)\n");
+        return 0;
+    }
     if (!strix_vulkan_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
         fprintf(stderr, "Vulkan runtime test FAILED (requires Vulkan runtime on Strix Halo)\n");
         return 1;

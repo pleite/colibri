@@ -8,12 +8,15 @@ LDFLAGS += -lm -ldl
 # toolchain configuration.
 CPU_FLAGS ?= -mavx512f -mavx512vnni -mavx512bw -mavx512dq
 
-all: tests/test_backends tests/vulkan_runtime_test
+all: tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness
 
 tests/test_backends: tests/test_backends.o cpu/vnni_cpu_backend.o gpu/vulkan_backend.o npu/xdna2_backend.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 tests/vulkan_runtime_test: tests/vulkan_runtime_test.o gpu/vulkan_backend.o cpu/vnni_cpu_backend.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+tests/vulkan_debug_harness: tests/vulkan_debug_harness.o gpu/vulkan_backend.o cpu/vnni_cpu_backend.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 cpu/vnni_cpu_backend.o: cpu/vnni_cpu_backend.c cpu/vnni_cpu_backend.h
@@ -31,11 +34,15 @@ tests/test_backends.o: tests/test_backends.c cpu/vnni_cpu_backend.h gpu/vulkan_b
 tests/vulkan_runtime_test.o: tests/vulkan_runtime_test.c gpu/vulkan_backend.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-test: tests/test_backends tests/vulkan_runtime_test
+tests/vulkan_debug_harness.o: tests/vulkan_debug_harness.c gpu/vulkan_backend.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+test: tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness
 	./tests/test_backends
 	./tests/vulkan_runtime_test
+	./tests/vulkan_debug_harness
 
 clean:
-	rm -f tests/test_backends tests/vulkan_runtime_test tests/*.o cpu/*.o npu/*.o gpu/*.o
+	rm -f tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness tests/*.o cpu/*.o npu/*.o gpu/*.o
 
 .PHONY: all test clean
