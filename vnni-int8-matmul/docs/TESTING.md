@@ -9,37 +9,67 @@ make
 make test
 ```
 
-The test target builds and runs both of the standalone harnesses:
+`make test` builds and runs three harnesses:
 
 ```bash
-./tests/test_backends
-./tests/vulkan_runtime_test
+./tests/test_backends        # cross-backend correctness
+./tests/vulkan_runtime_test  # Vulkan backend end to end
+./tests/npu_device_test      # NPU probe and no-fallback assertion
 ```
+
+`make shader` regenerates `gpu/comp.spv` from `gpu/comp.comp`; it needs
+`glslangValidator` and is only required if the shader source changes.
+
+## Headless testing on the Strix Halo host
+
+```bash
+./scripts/strix-halo-podman-test.sh
+```
+
+The container gets `/dev/dri`, `/dev/kfd` and `/dev/accel/accel0`, and the
+repository root is mounted because the NPU backend compiles sources from
+`c/npu_kernels/`. No display server is passed in and none is needed: the Vulkan
+backend requests zero instance extensions. Do not add Xvfb, `DISPLAY` or
+`XAUTHORITY` to this script — an earlier revision had them and they were pure
+noise.
 
 ## What the tests cover
 
-- A correctness check for the CPU backend against a scalar reference implementation.
-- A correctness check for the Vulkan backend against a scalar reference implementation.
-- A correctness check for the XDNA2 wrapper against the same reference.
-- A dedicated runtime test for the Vulkan backend that exercises the real wrapper entry point.
-- Edge-case checks for invalid arguments and small shapes.
+* CPU, Vulkan and XDNA 2 results checked against a scalar int8 reference.
+* A dedicated Vulkan runtime test that exercises the real dispatch path.
+* Argument-validation and small-shape edge cases.
+* An explicit assertion that an unsupported NPU shape is **rejected** rather than
+  computed on the CPU.
+* int4 → int8 weight expansion, which is host-side and always runs.
 
 ## Edge cases
 
-The backends intentionally reject invalid inputs instead of silently producing partial results:
+The backends reject invalid input instead of producing partial results:
 
-- `NULL` input, weights, output, or scales pointers
-- non-positive `rows`, `inner_dim`, or `out_cols`
-- zero-sized output shapes
+* `NULL` input, weights, output or scales pointers
+* non-positive `rows`, `inner_dim` or `out_cols`
+* zero-sized output shapes
 
-The wrappers also handle small workloads such as:
+and handle a single output column, a single input row, and negative int8 values.
 
-- a single output column
-- a single input row
-- negative int8 values in the inputs and weights
+## Behaviour on a host that is not Strix Halo
 
-## Runtime behavior on unsupported hosts
+Every hardware-bound test reports an explicit SKIP with a reason and the suite
+exits 0. Nothing crashes and nothing is silently computed somewhere else:
 
-- The CPU backend is Strix Halo-specific and requires AVX-512 VNNI support. On unsupported hosts the CPU correctness test fails rather than falling back to a generic implementation.
-- The Vulkan backend is implemented as a real compute-wrapper path when a Vulkan loader and driver are available on the Strix Halo target. When they are not, the wrapper fails the test immediately.
-- The XDNA2 wrapper remains a minimal shape-specific shim and is intended for the fixed `rows=1` / `out_cols=4` case.
+```
+CPU backend SKIP (requires AVX-512 VNNI on Strix Halo)
+Vulkan backend SKIP (vkCreateInstance failed)
+XDNA2 backend SKIP (cannot open /dev/accel/accel0 ...)
+int4 -> int8 expansion OK
+```
+
+A SKIP means "this silicon is absent". If any of these ever turns into a PASS on
+a non-Strix host, a fallback has been reintroduced and must be removed.
+
+## Diagnostics
+
+```bash
+VNNI_VULKAN_DEBUG=1 ./tests/vulkan_debug_harness
+XDNA2_VERBOSE=1     ./tests/npu_device_test
+```

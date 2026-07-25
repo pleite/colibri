@@ -1,125 +1,107 @@
 # NPU Kernels — XDNA 2 (Strix Halo)
 
-## Overview
+DRM-level runtime for the AMD XDNA 2 NPU in the Ryzen AI Max+ 395 "Strix Halo".
+Strix Halo exclusive, headless, and with **no CPU fallback**.
 
-This directory contains the NPU backend implementation for AMD XDNA 2 on Strix Halo.
-The NPU provides ~30 TOPS INT8 inference via the AIE-2 (AI Engine) array.
+The authoritative document for this backend is
+[`docs/strix-halo-npu.md`](../../docs/strix-halo-npu.md) in the repository root:
+device model, execution lifecycle, the `.npukernel` artifact format, the driver
+bugs that were fixed, and the guardrails. This file is the directory-level quick
+reference only.
 
 ## Hardware
 
-- **NPU**: AMD XDNA 2 (Ryzen AI Max+ 395)
-- **AIE Array**: 10 columns × 8 rows (80 AIE cores), partitionable
-- **Memory**: 24MB on-chip SRAM (tile memory) + unified 65GB host DRAM
-- **Clock**: H-clock up to 1.3 GHz, NPU clock up to 1.1 GHz
-- **Performance**: ~30 TOPS INT8, ~15 TOPS INT4
-- **Constraint**: Fixed-shape kernels only (AIE-2 tile ISA)
+| Property | Value |
+|---|---|
+| NPU | AMD XDNA 2 (AIE-2), Ryzen AI Max+ 395 |
+| AIE array | 10 columns × 8 rows, partitionable |
+| Memory | on-chip tile SRAM plus unified host DRAM |
+| Throughput | ~50 TOPS INT8 |
+| Datapath | INT8 MAC only — **no INT4 MAC** |
+| Shapes | fixed-shape kernels only (AIE-2 tile ISA) |
+| Device node | `/dev/accel/accel0` (override with `XDNA2_DEVICE`) |
+| Kernel driver | `amdxdna`, in-tree since Linux 6.14 |
 
-## Architecture
+`/dev/dri/*` is the iGPU, not the NPU. XRT is not required; this code issues DRM
+ioctls directly.
+
+## Stack
 
 ```
-Host (Strix Halo CPU)
-  backend_npu.c (dispatcher)
-    coli_npu_matmul()
-    Tensor upload/eviction
-      |
-  npu_kernels/xdna2_driver.c (DRM ioctl)
-    - Hardware context management
-    - Buffer object allocation
-    - Command submission
-      |
-  Kernel: amdxdna (Linux DRM driver) via /dev/dri/card1
-    - Partition management
-    - DMA scheduling
-      |
-  XDNA 2 NPU Hardware
-    - AIE-2 tile array (10x8)
-    - Fixed-shape kernel execution
-    - Doorbell-based command submission
+c/backend_npu.c            coli_npu_* dispatcher
+  xdna2_matmul.c           fixed-shape INT8 matmul: kernel loading, BOs, ERT packet, dispatch
+    xdna2_driver.c         DRM ioctls: device, hwctx, BO alloc/map/sync, exec, wait, queries
+      amdxdna (kernel)     partition management, DMA scheduling  — /dev/accel/accel0
+        XDNA 2 hardware    AIE-2 tile array
 ```
 
 ## Files
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `xdna2_driver.h` | 210 | DRM ioctl wrapper API, buffer management, command submission |
-| `xdna2_driver.c` | 409 | Implementation of DRM ioctl wrapper |
-| `xdna2_matmul.h` | 155 | NPU matmul kernel interface |
-| `xdna2_matmul.c` | 317 | NPU matmul kernel (CPU fallback, NPU path stub) |
-| `npu_runtime.h` | 159 | Runtime integration header (coli_npu_* API) |
-| `CMakeLists.txt` | 64 | Build system |
-| `tests/test_npu.c` | 296 | Test harness (6 test cases) |
+| File | Purpose |
+|---|---|
+| `xdna2_driver.h/.c` | DRM ioctl wrapper: device, hardware context, buffer objects, submit, wait, queries |
+| `xdna2_matmul.h/.c` | Fixed-shape INT8 matmul runtime, `.npukernel` loading, int4 → int8 expansion |
+| `npu_runtime.h` | `coli_npu_*` integration surface used by `c/backend_npu.c` |
+| `CMakeLists.txt` | Build; fails hard if `<drm/amdxdna_accel.h>` is missing |
+| `tests/test_npu.c` | Device/runtime probe suite |
 
-## Compilation
+All ioctl structures come from `<drm/amdxdna_accel.h>` (kernel headers ≥ 6.14).
+There is no vendored copy and no local re-declaration: if the header is absent
+the build fails.
 
-### Direct gcc (no CMake):
+## Build and test
+
 ```bash
-cd /home/leite/colibri
-gcc -O3 -march=native -std=c11 -Wall     -I c/npu_kernels     c/npu_kernels/xdna2_driver.c     c/npu_kernels/xdna2_matmul.c     c/npu_kernels/tests/test_npu.c     -o c/npu_kernels/test_npu     -ldl -lpthread -lm
+gcc -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE -I c/npu_kernels \
+    c/npu_kernels/xdna2_driver.c \
+    c/npu_kernels/xdna2_matmul.c \
+    c/npu_kernels/tests/test_npu.c \
+    -o c/npu_kernels/test_npu -ldl -lpthread -lm
+./c/npu_kernels/test_npu
 ```
 
-### With CMake:
+With CMake:
+
 ```bash
-cd /home/leite/colibri
 mkdir -p build-npu && cd build-npu
 cmake ../c -DCOLI_NPU=ON
 make test_npu
 ```
 
-## Testing
+Check the device:
 
 ```bash
-# Run tests
-./c/npu_kernels/test_npu
-
-# Verify NPU is accessible
-ls -la /dev/dri/card1
-cat /sys/class/accel/accel0/device/driver/module/version
 lsmod | grep amdxdna
+ls -la /dev/accel/accel0
+XDNA2_VERBOSE=1 ./c/npu_kernels/test_npu
 ```
 
-## Implementation Status
+Without hardware, the device tests report explicit SKIPs and the host-side
+arithmetic tests still pass. A SKIP means "no NPU here" — it must never become a
+PASS produced by computing the result somewhere else.
 
-### Complete (ready to compile and test):
-- [x] DRM ioctl wrapper (`xdna2_driver.h/c`) — full C API
-- [x] Matmul kernel interface (`xdna2_matmul.h/c`) — CPU fallback working
-- [x] Runtime integration header (`npu_runtime.h`) — matches backend_npu.c API
-- [x] Build system (`CMakeLists.txt`)
-- [x] Test harness (`tests/test_npu.c`) — 6 test cases
+## Status
 
-### Pending (requires aiecompiler):
-- [ ] AIE kernel compilation (`xdna2_compile_kernel`)
-- [ ] NPU kernel execution path (currently CPU fallback)
-- [ ] Pre-compiled kernel binaries for common shapes
+Implemented:
 
-### aiecompiler acquisition:
-The `aiecompiler` is NOT included in the base XRT install.
-It must be downloaded from AMD's XRT GitHub releases:
-```
-https://github.com/amd/XRT/releases
-```
-Look for `aiecompiler` in the release assets, or install via:
-```bash
-pip install aiecompiler  # if available
-# or download the standalone binary from AMD XRT releases
-```
+* DRM ioctl wrapper against the real UAPI — device, hwctx, BO alloc/map/sync,
+  `EXEC_CMD`, `WAIT_CMD`, `GET_INFO`.
+* Fixed-shape INT8 matmul dataflow: kernel lookup, BO upload, cache maintenance,
+  ERT packet construction, submission, wait, readback, per-column scaling.
+* int4 → int8 weight expansion (`xdna2_dequant_int4`), host side.
+* Hard rejection (`-ENOENT`) of shapes with no matching kernel.
 
-## NPU vs CPU vs GPU Decision Matrix
+Requires the AMD AIE toolchain:
 
-| Operation | Shape | Best Backend | Reason |
-|-----------|-------|-------------|--------|
-| int8 matmul (large) | 4096x4096 | GPU (HIP) | Highest throughput |
-| int8 matmul (small) | 1x4096 | NPU or CPU | NPU has latency advantage |
-| int4 matmul | variable | CPU | int4 needs dequant first |
-| RMSNorm | 4096 | CPU | Too small for NPU/GPU overhead |
-| Softmax | 4096 | CPU | Element-wise, CPU is fastest |
-| Router (top-k) | 512x60 | CPU | Very small |
-| Shared expert | 4096x4096 | NPU | Fixed shape, high TOPS |
+* Producing the `.npukernel` artifacts themselves. `aiecompiler` is not part of
+  the base XRT install; see <https://github.com/amd/XRT/releases>.
+* Confirming the ERT opcode for the compiled kernels. The opcode currently
+  travels inside the artifact precisely so that nothing has to be guessed in C.
 
 ## References
 
-- AMD XDNA driver: `/usr/include/drm/amdxdna_accel.h`
-- XRT headers: `/opt/xrt/include/`
-- XRT libs: `/opt/xrt/lib64/`
-- XRT version: 2.19.0 (Apr 2025)
-- Kernel module: `amdxdna` (CONFIG_DRM_ACCEL_AMDXDNA=m)
-- Firmware: `/lib/firmware/amdnpu/17f0_11/`
+* `include/uapi/drm/amdxdna_accel.h` (Linux ≥ 6.14) — ioctls, `enum
+  amdxdna_drm_get_param`, `enum amdxdna_bo_type`, `struct amdxdna_drm_wait_cmd`
+* `drivers/accel/amdxdna/` — the in-tree kernel driver
+* <https://github.com/amd/xdna-driver>, <https://github.com/amd/XRT>
+* Firmware: `/lib/firmware/amdnpu/17f0_11/`
