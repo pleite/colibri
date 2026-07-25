@@ -3,11 +3,16 @@
 # strix-halo-podman-test.sh — build and run the Strix Halo building blocks
 # inside a headless Podman container.
 #
-# The container is built from Dockerfile.strix-halo-test, which layers the build
-# toolchain (ld, kernel UAPI headers, Vulkan headers) on top of the community
-# Strix Halo toolbox image. The toolbox image alone cannot compile this tree:
-# it has no linker and no kernel headers. Do not work around that with an
-# ad-hoc `ln -sf /usr/bin/ld.bfd /usr/bin/ld` in the test step — fix the image.
+# The container is built from Dockerfile.strix-halo-test, which guarantees the
+# build toolchain (ld, amdxdna kernel UAPI headers, Vulkan headers) on top of a
+# base image. The default base is this repository's own colibri-vulkan image;
+# the community Strix Halo toolbox image also works as a base:
+#
+#   BASE_IMAGE=docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv make podman-test
+#
+# The toolbox image alone cannot compile this tree — it has no linker and no
+# kernel headers. Do not work around that with an ad-hoc
+# `ln -sf /usr/bin/ld.bfd /usr/bin/ld` in the test step; fix the image.
 #
 # Headless by design: the Vulkan backend requests zero instance extensions, so
 # no X11 socket, no Wayland socket, no DISPLAY and no Xvfb are needed. Passing a
@@ -32,7 +37,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vnni_dir="$(cd "${script_dir}/.." && pwd)"
 repo_dir="$(cd "${vnni_dir}/.." && pwd)"
-base_image="${BASE_IMAGE:-docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv}"
+base_image="${BASE_IMAGE:-ghcr.io/pleite/colibri-vulkan:latest}"
 harness_image="${CONTAINER_IMAGE:-localhost/colibri-strix-halo-test:latest}"
 container_name="${CONTAINER_NAME:-colibri-vnni-strix-halo-test}"
 log_path="${vnni_dir}/test_output.log"
