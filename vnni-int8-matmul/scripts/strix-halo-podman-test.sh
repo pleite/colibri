@@ -139,6 +139,11 @@ make clean
 make
 echo "--- test ---"
 make test
+echo "--- profile ---"
+# The placement policy is only allowed to be data-driven on the machine that
+# has the silicon. Absent engines record a skip comment, never a guess.
+./bench/backend_bench data/strix_halo_profile.csv
+cat data/strix_halo_profile.csv
 ')
 
 : > "${log_path}"

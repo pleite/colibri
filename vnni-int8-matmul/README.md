@@ -20,11 +20,19 @@ cannot.
 | `gpu/vulkan_dispatch.h` | Dispatch tables built only from `<vulkan/vulkan_core.h>` |
 | `gpu/comp.comp`, `gpu/comp.spv` | GEMM compute shader source and compiled SPIR-V |
 | `npu/xdna2_backend.[ch]` | XDNA 2 NPU backend, driving `c/npu_kernels/` |
+| `sched/shape_profile.[ch]` | The measured per-shape, per-engine cost table |
+| `sched/npu_shapes.[ch]` | Qwen 3.6 MoE shape enumeration and host-side row tiling |
+| `sched/backend_placement.[ch]` | `coli_choose_backend()`, the one placement decision |
+| `sched/moe_schedule.[ch]` | Router grouping, lane caps, expert weight residency |
+| `bench/backend_bench.c` | Sweeps the shapes and writes the measured table |
+| `data/` | Where the measured table lives; see `data/README.md` |
 | `kernel/vnni_matmul_test.c` | Small CPU-backend demo |
 | `tests/test_backends.c` | Cross-backend correctness tests |
 | `tests/vulkan_runtime_test.c` | Vulkan backend runtime test |
 | `tests/vulkan_debug_harness.c` | Verbose Vulkan device enumeration and dispatch |
 | `tests/npu_device_test.c` | NPU probe, AIE version check, no-fallback assertion |
+| `tests/test_placement.c` | Profile table, shape set and placement policy, host-only |
+| `tests/test_moe_schedule.c` | Expert grouping, lane caps and residency, host-only |
 | `scripts/strix-halo-podman-test.sh` | Headless Podman harness for the Strix Halo host |
 
 ## Build requirements
@@ -40,6 +48,18 @@ cannot.
 make
 make test
 ```
+
+Placement is decided from a measured table, which only the Strix Halo machine
+can produce:
+
+```bash
+make bench/backend_bench
+./bench/backend_bench data/strix_halo_profile.csv
+```
+
+With no table present, `coli_choose_backend()` still decides, but labels the
+decision `structural` so it cannot be mistaken for a measurement. See
+[docs/placement-policy.md](../docs/placement-policy.md).
 
 On the Strix Halo host, headless, in a container:
 
@@ -66,6 +86,14 @@ XDNA2_VERBOSE=1     ./tests/npu_device_test        # AIE metadata, resource info
 | `XDNA2_VERBOSE` | dump NPU device info at init |
 | `COLI_NPU_KERNEL_DIR` | where `*.npukernel` artifacts are found |
 | `COLI_NPU_KERNELS` | colon-separated artifacts to preload |
+| `COLI_PLACEMENT` | pin an engine: `auto` (default), `cpu`, `gpu`, `npu` |
+| `COLI_PLACEMENT_PROFILE` | measured table to load (default `data/strix_halo_profile.csv`) |
+| `COLI_PLACEMENT_REQUIRE_PROFILE` | refuse any placement weaker than a measurement |
+| `COLI_PLACEMENT_MIN_REUSE` | arithmetic-reuse threshold for the structural default |
+| `COLI_MOE_CPU_LANES`, `COLI_MOE_GPU_LANES` | concurrent expert groups per engine |
+| `COLI_BENCH_ITERS`, `COLI_BENCH_MAX_MIB`, `COLI_BENCH_OUTPUT` | benchmark sweep controls |
+
+There is no `COLI_MOE_NPU_LANES`: one AIE partition means one hardware context.
 
 `VNNI_STRIX_DEVICE_NAME` can only add an accepted device name. The AMD vendor ID
 and `INTEGRATED_GPU` checks are unconditional, so it cannot be used to run this
@@ -83,6 +111,8 @@ bugs that motivated them.
 3. Headless: zero Vulkan instance extensions, no display server, no Xvfb.
 4. No fallbacks. Not to lavapipe, not to a discrete GPU, not to the CPU.
 5. Fixed-shape NPU kernels only, matched exactly on (rows, inner, out, fmt).
+6. Placement is measured, never asserted. A decision made without a measurement
+   says so, and can be refused outright.
 
 For a full runbook with test commands and edge-case notes, see
 [docs/TESTING.md](docs/TESTING.md).

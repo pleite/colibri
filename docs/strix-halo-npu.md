@@ -125,6 +125,21 @@ and silently submits malformed packets to the hardware — the exact failure mod
 that made the Vulkan backend so hard to debug (see
 `docs/vulkan_debug_attempts.md`).
 
+**Which shapes to compile.** The set is enumerated, not discovered: see
+`vnni-int8-matmul/sched/npu_shapes.c`. Qwen 3.6 MoE collapses to five distinct
+`(inner, out)` pairs — attention q, k/v and o projections, the expert gate/up
+projection and the expert down projection — and each is compiled at three row
+tiles (256 for bulk prefill, 32 for small prefill, 1 for decode). That is 15
+artifacts, which is what `XDNA2_MAX_KERNELS` is sized from; the number follows
+from the enumeration rather than the other way round.
+
+Any row count is then covered host-side by `coli_npu_plan_tiles()`, which
+splits it greedily into those exact tiles, so every dispatch hits a compiled
+kernel and the loader never has to widen a match.
+
+**Where the shapes run** is a separate question, answered from measurement by
+`coli_choose_backend()`; see `docs/placement-policy.md`.
+
 ---
 
 ### Control plane: DRM ioctls, optionally validated through XRT

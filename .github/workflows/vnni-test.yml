@@ -121,6 +121,34 @@ jobs:
             exit 1
           fi
 
+      - name: Assert the placement profile was measured, not invented
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile=data/strix_halo_profile.csv
+          test -f "${profile}" || {
+            echo "the benchmark produced no profile table" >&2
+            exit 1
+          }
+          # Records only; comments carry the skip reasons for absent engines.
+          records=$(grep -vc '^\(#\|backend,\|$\)' "${profile}" || true)
+          echo "profile records: ${records}"
+          # On the machine that has the silicon an empty table means the sweep
+          # measured nothing, which is a failure rather than a quiet pass.
+          if [ "${REQUIRE_NPU}" = "1" ] && [ "${SKIP_NPU}" != "1" ] && \
+             [ "${records}" -eq 0 ]; then
+            echo "no engine produced a measurement on a runner that has the hardware" >&2
+            exit 1
+          fi
+          # An NPU row can only exist when an exact-shape kernel artifact ran.
+          if grep -q '^npu,' "${profile}" && \
+             ! grep -q 'npukernel' test_output.log; then
+            echo "the profile has NPU rows with no kernel artifact loaded" >&2
+            exit 1
+          fi
+
       - name: Publish test summary
         if: always()
         shell: bash
@@ -149,3 +177,4 @@ jobs:
             vnni-int8-matmul/test_output.log
             vnni-int8-matmul/tests/test_backends
             vnni-int8-matmul/tests/vulkan_runtime_test
+            vnni-int8-matmul/data/strix_halo_profile.csv
