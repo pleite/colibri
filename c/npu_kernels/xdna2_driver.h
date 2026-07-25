@@ -32,6 +32,10 @@
 #define XDNA2_DEV_HEAP_ALIGN      (32u * 1024u)
 #define XDNA2_DEV_HEAP_MAX_BYTES  (64ull * 1024ull * 1024ull)
 
+/* The driver reports "no such address" as ~0, not 0 (AMDXDNA_INVALID_ADDR in
+ * the kernel's own headers, which do not export it to userspace). */
+#define XDNA2_INVALID_ADDR        (~0ull)
+
 /* ── Opaque handles ── */
 
 typedef struct {

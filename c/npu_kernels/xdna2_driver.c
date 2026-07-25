@@ -124,6 +124,23 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
         return -1;
     }
 
+    /*
+     * The heap must also be mapped into this process before the context is
+     * created. The driver only records the heap's user address in its mmap
+     * path (amdxdna_gem_obj_mmap -> amdxdna_hmm_register sets mem.userptr),
+     * and amdxdna_drm_alloc_dev_bo() rejects every AMDXDNA_BO_DEV allocation
+     * with -EINVAL ("Invalid dev heap userptr") while that address is still
+     * AMDXDNA_INVALID_ADDR. aie2_hwctx_init() allocates its command buffers
+     * exactly that way, so an unmapped heap turns CREATE_HWCTX into -EINVAL.
+     */
+    if (xdna2_map_bo(fd, &heap_bo) < 0) {
+        xdna2_destroy_bo(fd, &heap_bo);
+        fprintf(stderr,
+                "xdna2: failed to map the device heap; the driver needs the "
+                "heap's user address before it can carve device BOs out of it\n");
+        return -1;
+    }
+
     /* The user mode queue and log buffer BOs must stay alive for as long as
      * the hardware context references them, so they are owned by the context
      * and released in xdna2_destroy_hwctx(). */
@@ -162,11 +179,43 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
         xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr, "xdna2: failed to create hardware context: %s\n",
                 strerror(err));
+        fprintf(stderr,
+                "xdna2: requested num_tiles=%u mem_size=%u max_opc=%u qos=%u\n",
+                num_tiles, mem_size, max_opc, qos);
         if (err == ENOENT) {
             fprintf(stderr,
                     "xdna2: -ENOENT from CREATE_HWCTX means the driver could not "
                     "find this client's device heap, not that the ioctl is "
                     "unsupported (that would be ENOTTY)\n");
+        } else if (err == EINVAL) {
+            /* Report the geometry the driver derives the partition from rather
+             * than asserting a cause: the column count is only one of the ways
+             * context init can return -EINVAL, and guessing at the reason is
+             * how the previous revisions of this file went wrong. */
+            xdna2_aie_metadata_t meta;
+            if (xdna2_query_aie_metadata(fd, &meta) == 0 &&
+                meta.core.row_count != 0) {
+                unsigned core_rows = (unsigned)meta.core.row_count;
+                unsigned num_col = num_tiles / core_rows;
+                fprintf(stderr,
+                        "xdna2: AIE array is %u columns x %u rows, %u core rows; "
+                        "num_tiles=%u implies %u column(s)%s\n",
+                        (unsigned)meta.cols, (unsigned)meta.rows, core_rows,
+                        num_tiles, num_col,
+                        (num_tiles % core_rows) ? " (not a whole multiple of "
+                        "the core row count)" : "");
+                if (num_col != 0 && num_col <= (unsigned)meta.cols &&
+                    (num_tiles % core_rows) == 0) {
+                    fprintf(stderr,
+                            "xdna2: that partition is within range, so -EINVAL "
+                            "came from something other than the column count\n");
+                }
+            }
+            fprintf(stderr,
+                    "xdna2: the driver logs the exact rejection; check "
+                    "`dmesg | grep -i amdxdna` on the host. "
+                    "\"Invalid dev heap userptr\" there means the device heap "
+                    "was not mapped before the context was created\n");
         }
         return -1;
     }
@@ -241,8 +290,16 @@ int xdna2_create_bo(int fd, xdna2_bo_t *bo, uint64_t size, uint32_t type) {
         xdna2_destroy_bo(fd, bo);
         return -1;
     }
-    bo->map_offset = get_info.map_offset;
-    bo->vaddr = get_info.vaddr;
+    /*
+     * The driver reports "no address" as AMDXDNA_INVALID_ADDR (~0), not 0:
+     * `vaddr` is that sentinel until the BO is mmap()ed, and `map_offset` is
+     * that sentinel for AMDXDNA_BO_DEV, which is a sub-allocation of the heap
+     * and has no mmap offset of its own. Storing the sentinel verbatim made
+     * xdna2_map_bo() hand out (void *)-1 as a host pointer.
+     */
+    bo->map_offset = (get_info.map_offset == XDNA2_INVALID_ADDR)
+                         ? 0 : get_info.map_offset;
+    bo->vaddr = (get_info.vaddr == XDNA2_INVALID_ADDR) ? 0 : get_info.vaddr;
     bo->xdna_addr = get_info.xdna_addr;
 
     return 0;
@@ -276,6 +333,14 @@ int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
     if (bo->vaddr) {
         bo->mapped = (void *)(uintptr_t)bo->vaddr;
         return 0;
+    }
+
+    if (bo->map_offset == 0) {
+        fprintf(stderr,
+                "xdna2: BO %u (type %u) has neither a user address nor an mmap "
+                "offset; a device BO is only reachable through its heap\n",
+                bo->handle, bo->type);
+        return -1;
     }
 
     void *addr = mmap(NULL, (size_t)bo->size,
