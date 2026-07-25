@@ -289,8 +289,18 @@ sudo dmesg | grep -i amdxdna
 
 `CREATE_HWCTX` failing with `ENOENT` is a userspace bug (no device heap
 allocated before the context), not a missing kernel feature; an unimplemented
-ioctl reports `ENOTTY`. See `vnni-int8-matmul/docs/TESTING.md` for the full
-errno table.
+ioctl reports `ENOTTY`. `EINVAL` comes from the driver's context init — the
+requested `num_tiles` must be non-zero, a multiple of the AIE core row count and
+no wider than the array — and the reason is printed in the kernel log. See
+`vnni-int8-matmul/docs/TESTING.md` for the full errno table.
+
+### `no test log produced`
+
+`test_output.log` is written on the host by `scripts/strix-halo-podman-test.sh`
+while the container builds and tests inside the same bind-mounted directory.
+Nothing running in the container may delete it: `tee` goes on writing to the
+unlinked inode, so the run looks fine and the log is gone afterwards. This is
+why `make clean` does not remove `test_output.log`.
 
 ### Runner Not Appearing
 

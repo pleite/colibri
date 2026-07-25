@@ -100,6 +100,37 @@ jobs:
           set -euo pipefail
           make podman-test
 
+      # The NPU can only fail inside the amdxdna driver, and the driver reports
+      # why in the kernel log. The output goes to the job log and the artifact
+      # as well as the summary: a step summary is easy to miss and cannot be
+      # downloaded. This step reports, it never gates.
+      - name: Capture amdxdna kernel messages
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -uo pipefail
+          if dmesg >/tmp/dmesg.txt 2>/dev/null || sudo -n dmesg >/tmp/dmesg.txt 2>/dev/null; then
+            # Filtered separately from the capture so that an unreadable kernel
+            # log is never mistaken for "no amdxdna messages".
+            grep -i -e amdxdna -e aie2 /tmp/dmesg.txt | tail -n 40 > amdxdna.log
+            if [ ! -s amdxdna.log ]; then
+              echo "kernel log readable, but it holds no amdxdna messages" > amdxdna.log
+            fi
+          else
+            echo "kernel log not readable by the runner user (kernel.dmesg_restrict=1)" > amdxdna.log
+            echo "grant CAP_SYSLOG or a NOPASSWD sudoers rule for dmesg to capture it" >> amdxdna.log
+          fi
+          echo "--- amdxdna kernel messages ---"
+          cat amdxdna.log
+          {
+            echo "## amdxdna kernel messages"
+            echo ""
+            echo '```text'
+            cat amdxdna.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Assert no backend silently fell back
         if: always()
         working-directory: vnni-int8-matmul
@@ -175,6 +206,7 @@ jobs:
           name: vnni-test-artifacts
           path: |
             vnni-int8-matmul/test_output.log
+            vnni-int8-matmul/amdxdna.log
             vnni-int8-matmul/tests/test_backends
             vnni-int8-matmul/tests/vulkan_runtime_test
             vnni-int8-matmul/data/strix_halo_profile.csv

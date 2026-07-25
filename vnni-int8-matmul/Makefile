@@ -122,8 +122,13 @@ test: $(TESTS)
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
 
+# test_output.log is deliberately NOT removed here. It is written on the host by
+# scripts/strix-halo-podman-test.sh with `tee`, while the container runs
+# `make clean` in the same bind-mounted directory: removing it unlinks the file
+# the running `tee` still holds open, so the harness finishes with no log on
+# disk and CI reports "no test log produced".
 clean:
 	rm -f $(TESTS) $(TOOLS) tests/*.o cpu/*.o npu/*.o gpu/*.o sched/*.o bench/*.o \
-	      $(NPU_DIR)/*.o test_output.log
+	      $(NPU_DIR)/*.o
 
 .PHONY: all shader test podman-test clean

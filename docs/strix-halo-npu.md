@@ -68,6 +68,8 @@ strix_xdna2_matmul()
 xdna2_open_device()                       /dev/accel/accel0
   └─ xdna2_create_hwctx()
        ├─ xdna2_create_bo(AMDXDNA_BO_DEV_HEAP)   one heap per open fd, ≤ 64 MiB
+       ├─ xdna2_map_bo(heap)                     mmap it: the driver records the
+       │                                         heap user address only on mmap
        ├─ xdna2_create_bo(AMDXDNA_BO_CMD) × 2    UMQ + log buffers
        └─ DRM_IOCTL_AMDXDNA_CREATE_HWCTX         → handle, timeline syncobj
 ```
@@ -77,6 +79,19 @@ The device heap is not optional. `aie2_hwctx_init()` looks up
 `AMDXDNA_BO_DEV` allocation (the DPU instruction streams) is sub-allocated from
 it. `-ENOENT` here means "no device heap", not "ioctl unsupported" — an
 unsupported ioctl returns `ENOTTY`.
+
+Creating the heap is not enough: it must also be mapped. The driver sets
+`heap->mem.userptr` in its mmap path (`amdxdna_gem_obj_mmap()` →
+`amdxdna_hmm_register()`), and `amdxdna_drm_alloc_dev_bo()` rejects every
+`AMDXDNA_BO_DEV` allocation with `-EINVAL` and logs "Invalid dev heap userptr"
+while that address is still `AMDXDNA_INVALID_ADDR`. `aie2_hwctx_init()`
+allocates its command buffers that way, so an unmapped heap makes
+`CREATE_HWCTX` fail with `-EINVAL` even though the AIE partition is valid.
+
+`GET_BO_INFO` reports "no address" as `AMDXDNA_INVALID_ADDR` (`~0`), not `0`,
+for both `vaddr` (until the BO is mapped) and `map_offset` (always, for
+`AMDXDNA_BO_DEV`). Treat that sentinel as "unset" or a mapping attempt hands
+out `(void *)-1`.
 
 Completion is reported on the per-context **timeline** syncobj returned by
 `CREATE_HWCTX`: the kernel calls `drm_syncobj_add_point(syncobj, chain,
@@ -187,6 +202,8 @@ hand-copied kernel structures and magic constants instead of the UAPI.
 | `ctx->syncobj_handle = exec_cmd.seq` | a 64-bit sequence number truncated into the syncobj handle, destroying it | Store `seq` in `ctx->last_seq` |
 | `xdna2_wait_command()` returned success unconditionally | results read before the NPU finished | Wait on the hardware context's timeline syncobj at point `last_seq` |
 | `CREATE_HWCTX` issued without a device heap | `aie2_hwctx_init()` returns `-ENOENT` ("The client dev heap object not exist"), so the NPU never initialises | `xdna2_create_hwctx()` allocates an `AMDXDNA_BO_DEV_HEAP` first and owns it for the context lifetime |
+| Device heap created but never mapped | `amdxdna_drm_alloc_dev_bo()` logs "Invalid dev heap userptr" and `CREATE_HWCTX` fails with `-EINVAL` | `xdna2_create_hwctx()` mmaps the heap before creating the context |
+| `GET_BO_INFO`'s `AMDXDNA_INVALID_ADDR` (`~0`) stored as a real address | `xdna2_map_bo()` returned `(void *)-1` as the host pointer for an unmapped BO | Normalise the sentinel to 0 and refuse to map a BO with no offset |
 | `DRM_AMDXDNA_QUERY_RESOURCE_INFO` and `AMDXDNA_QOS_*` used unconditionally | build failure on every shipping kernel-headers package — both post-date Linux 6.18 | Build-system probe defines `COLI_HAVE_XDNA2_RESOURCE_INFO`; the QoS hint falls back to the driver default |
 | `xdna2_runtime_init()` created the hwctx in a stack local | hwctx and device fd leaked on every init | Runtime owns the hwctx; `shutdown` releases it |
 | Every matmul path ended in `strix_cpu_matmul()` | NPU benchmarks silently measured the CPU | Removed; unsupported shapes return `-ENOENT` |
