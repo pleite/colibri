@@ -20,9 +20,17 @@ permissions:
 env:
   REGISTRY: ghcr.io
 
+# Only one run per ref. The self-hosted runner is a single machine and this
+# workflow fans out into a five-way matrix, so without this a period of runner
+# downtime leaves a queue of superseded runs that takes hours to drain.
+concurrency:
+  group: container-images-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +45,9 @@ jobs:
       - name: Install Git and container tooling
         run: |
           set -euo pipefail
-          sudo dnf upgrade -y --setopt=install_weak_deps=False
+          # Deliberately no `dnf upgrade`: this workflow runs five matrix jobs
+          # per push on one self-hosted machine, and a full system upgrade per
+          # job dominated the queue time. Install only what the build needs.
           sudo dnf install -y --setopt=install_weak_deps=False \
             git curl tar gzip bzip2 ca-certificates podman
 
