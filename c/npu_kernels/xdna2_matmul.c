@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ── ERT command packet ──────────────────────────────────────────────────────
  *
@@ -269,10 +270,33 @@ static int alloc_and_map(int fd, xdna2_bo_t *bo, size_t bytes, uint32_t type) {
     return 0;
 }
 
+/* CLOCK_MONOTONIC, so the stage costs are wall clock and comparable with the
+ * CPU and Vulkan backends measured by the same harness. */
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t xdna2_timing_fixed_ns(const xdna2_matmul_timing_t *timing) {
+    if (!timing) return 0;
+    return timing->alloc_ns + timing->upload_ns + timing->submit_ns +
+           timing->readback_ns + timing->teardown_ns;
+}
+
 int xdna2_matmul_int8(xdna2_runtime_t *runtime,
                       const int8_t *x, const int8_t *weights,
                       const float *scales, float *y,
                       int S, int I, int O) {
+    return xdna2_matmul_int8_timed(runtime, x, weights, scales, y, S, I, O, NULL);
+}
+
+int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
+                            const int8_t *x, const int8_t *weights,
+                            const float *scales, float *y,
+                            int S, int I, int O,
+                            xdna2_matmul_timing_t *timing) {
+    if (timing) memset(timing, 0, sizeof(*timing));
     if (!runtime || !x || !weights || !y || S <= 0 || I <= 0 || O <= 0) {
         return -EINVAL;
     }
@@ -300,12 +324,15 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
     memset(&bos, 0, sizeof(bos));
     int fd = runtime->device_fd;
     int ret;
+    const uint64_t t_start = now_ns();
+    uint64_t t_mark = t_start;
 
     /* AMDXDNA_BO_SHMEM is the canonical name in enum amdxdna_bo_type; the
      * AMDXDNA_BO_SHARE alias (same value) only exists in newer headers. */
     if ((ret = alloc_and_map(fd, &bos.x, x_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
     if ((ret = alloc_and_map(fd, &bos.w, w_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
     if ((ret = alloc_and_map(fd, &bos.y, y_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
+    if (timing) { uint64_t t = now_ns(); timing->alloc_ns = t - t_mark; t_mark = t; }
 
     memcpy(bos.x.mapped, x, x_bytes);
     memcpy(bos.w.mapped, weights, w_bytes);
@@ -317,6 +344,7 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
         ret = -EIO;
         goto out;
     }
+    if (timing) { uint64_t t = now_ns(); timing->upload_ns = t - t_mark; t_mark = t; }
 
     /*
      * ERT payload: instruction stream address and word count, then the
@@ -347,10 +375,13 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
         ret = -EIO;
         goto out;
     }
+    if (timing) { uint64_t t = now_ns(); timing->submit_ns = t - t_mark; t_mark = t; }
+
     if (xdna2_wait_command(fd, &runtime->hwctx, runtime->timeout_ms) < 0) {
         ret = -ETIMEDOUT;
         goto out;
     }
+    if (timing) { uint64_t t = now_ns(); timing->wait_ns = t - t_mark; t_mark = t; }
 
     if (xdna2_sync_bo(fd, &bos.y, SYNC_DIRECT_FROM_DEVICE, 0, y_bytes) < 0) {
         ret = -EIO;
@@ -365,10 +396,16 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
             }
         }
     }
+    if (timing) { uint64_t t = now_ns(); timing->readback_ns = t - t_mark; t_mark = t; }
     ret = 0;
 
 out:
     free_bos(fd, &bos);
+    if (timing) {
+        uint64_t t = now_ns();
+        timing->teardown_ns = t - t_mark;
+        timing->total_ns = t - t_start;
+    }
     return ret;
 }
 

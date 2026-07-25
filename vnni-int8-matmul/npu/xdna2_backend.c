@@ -12,7 +12,6 @@
 #include <string.h>
 #include <errno.h>
 
-#include "../../c/npu_kernels/xdna2_matmul.h"
 
 static xdna2_runtime_t g_runtime;
 static int g_init_attempted = 0;
@@ -107,6 +106,18 @@ int strix_xdna2_matmul(const int8_t *input,
                        int out_cols,
                        float *output,
                        const float *scales) {
+    return strix_xdna2_matmul_timed(input, rows, inner_dim, weights, out_cols,
+                                    output, scales, NULL);
+}
+
+int strix_xdna2_matmul_timed(const int8_t *input,
+                             int rows,
+                             int inner_dim,
+                             const int8_t *weights,
+                             int out_cols,
+                             float *output,
+                             const float *scales,
+                             xdna2_matmul_timing_t *timing) {
     if (!input || !weights || !output || rows <= 0 || inner_dim <= 0 || out_cols <= 0) {
         return 0;
     }
@@ -120,8 +131,8 @@ int strix_xdna2_matmul(const int8_t *input,
                 rows, inner_dim, out_cols);
         return 0;
     }
-    return xdna2_matmul_int8(&g_runtime, input, weights, scales, output,
-                             rows, inner_dim, out_cols) == 0;
+    return xdna2_matmul_int8_timed(&g_runtime, input, weights, scales, output,
+                                   rows, inner_dim, out_cols, timing) == 0;
 }
 
 const char *strix_xdna2_backend_name(void) {
