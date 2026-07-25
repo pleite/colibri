@@ -275,9 +275,9 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
     int fd = runtime->device_fd;
     int ret;
 
-    if ((ret = alloc_and_map(fd, &bos.x, x_bytes, AMDXDNA_BO_SHARE)) < 0) goto out;
-    if ((ret = alloc_and_map(fd, &bos.w, w_bytes, AMDXDNA_BO_SHARE)) < 0) goto out;
-    if ((ret = alloc_and_map(fd, &bos.y, y_bytes, AMDXDNA_BO_SHARE)) < 0) goto out;
+    if ((ret = alloc_and_map(fd, &bos.x, x_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
+    if ((ret = alloc_and_map(fd, &bos.w, w_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
+    if ((ret = alloc_and_map(fd, &bos.y, y_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
 
     memcpy(bos.x.mapped, x, x_bytes);
     memcpy(bos.w.mapped, weights, w_bytes);
