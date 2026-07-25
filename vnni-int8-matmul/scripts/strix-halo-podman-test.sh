@@ -3,10 +3,10 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vnni_dir="$(cd "${script_dir}/.." && pwd)"
-repo_root="$(cd "${vnni_dir}/.." && pwd)"
 container_image="${CONTAINER_IMAGE:-docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv}"
 container_name="${CONTAINER_NAME:-colibri-vnni-strix-halo-test}"
 log_path="${vnni_dir}/test_output.log"
+container_vulkan_icd="${VNNI_VULKAN_ICD:-/usr/share/vulkan/icd.d/radeon_icd.x86_64.json}"
 
 if ! command -v podman >/dev/null 2>&1; then
     echo "podman is required for the Strix Halo Vulkan test harness" >&2
@@ -23,24 +23,12 @@ if [[ ! -f "${vnni_dir}/Makefile" ]]; then
     exit 1
 fi
 
-if [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-    echo "This harness is intentionally Strix Halo-only and requires an active graphical session; no DISPLAY or WAYLAND_DISPLAY is set." >&2
-    exit 1
-fi
-
-if [[ -n "${DISPLAY:-}" ]] && [[ ! -d /tmp/.X11-unix ]]; then
-    echo "Expected X11 socket directory /tmp/.X11-unix for DISPLAY=${DISPLAY}" >&2
-    exit 1
-fi
-
-if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
-    VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
-fi
-
-if [[ ! -f "${VK_ICD_FILENAMES}" ]]; then
-    echo "Expected AMD Vulkan ICD at ${VK_ICD_FILENAMES}" >&2
-    exit 1
-fi
+for required_device in /dev/dri /dev/kfd; do
+    if [[ ! -e "${required_device}" ]]; then
+        echo "this harness expects ${required_device} to be available on the Strix Halo host" >&2
+        exit 1
+    fi
+done
 
 if ! podman image exists "${container_image}" 2>/dev/null; then
     echo "Pulling Strix Halo Vulkan container image: ${container_image}"
@@ -54,8 +42,10 @@ podman_args=(
     --device /dev/kfd
     --security-opt label=disable
     --cap-add=SYS_PTRACE
-    --env VK_ICD_FILENAMES="${VK_ICD_FILENAMES}"
+    --env VK_ICD_FILENAMES="${container_vulkan_icd}"
     --env VNNI_VULKAN_DEBUG=1
+    --env HSA_OVERRIDE_GFX_VERSION=11.5.1
+    --env GGML_HIP_ENABLE_UNIFIED_MEMORY=1
     --env DISPLAY="${DISPLAY:-}"
     --env WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
     --env XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
@@ -63,7 +53,7 @@ podman_args=(
     --workdir /work/vnni-int8-matmul
 )
 
-if [[ -n "${DISPLAY:-}" ]]; then
+if [[ -n "${DISPLAY:-}" ]] && [[ -d /tmp/.X11-unix ]]; then
     podman_args+=(--volume /tmp/.X11-unix:/tmp/.X11-unix:ro)
 fi
 

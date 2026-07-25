@@ -77,16 +77,8 @@ jobs:
       - name: Run VNNI tests in the Strix Halo podman harness
         working-directory: vnni-int8-matmul
         shell: bash
-        env:
-          DISPLAY: ${{ env.DISPLAY }}
-          WAYLAND_DISPLAY: ${{ env.WAYLAND_DISPLAY }}
-          XDG_RUNTIME_DIR: ${{ env.XDG_RUNTIME_DIR }}
         run: |
           set -euo pipefail
-          if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-            echo "This workflow requires an active graphical session on the Strix Halo runner." >&2
-            exit 1
-          fi
           make podman-test
 
       - name: Upload test results

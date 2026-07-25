@@ -65,8 +65,8 @@ This is a **known limitation** of AMDGPU on Linux when running headless. The ICD
 ## What Copilot Should Do
 
 1. **Merge PR #68** — The debug infrastructure is solid and will make future issues obvious
-2. **Add a Strix Halo-only Podman harness** — Use `vnni-int8-matmul/scripts/strix-halo-podman-test.sh` to run the build and tests in the AMD toolbox container with a graphical session
-3. **Treat the display requirement as a hard prerequisite** — The harness should fail fast in TTY/SSH-only environments instead of attempting portable fallbacks
+2. **Add a Strix Halo-only Podman harness** — Use `vnni-int8-matmul/scripts/strix-halo-podman-test.sh` to run the build and tests in the AMD toolbox container using the same headless container pattern as llama-server and the Strix Halo toolboxes
+3. **Treat the GPU device access as the hard prerequisite** — The harness should fail fast when `/dev/dri` or `/dev/kfd` are not available instead of attempting portable fallbacks
 
 ## Verification
 
