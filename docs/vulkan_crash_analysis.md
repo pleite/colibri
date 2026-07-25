@@ -65,8 +65,8 @@ This is a **known limitation** of AMDGPU on Linux when running headless. The ICD
 ## What Copilot Should Do
 
 1. **Merge PR #68** — The debug infrastructure is solid and will make future issues obvious
-2. **Add a note to VULKAN_DEBUG.md** — Document that the GPU backend requires a display server
-3. **No code changes needed** — The crash is environmental, not a bug in the code
+2. **Add a Strix Halo-only Podman harness** — Use `vnni-int8-matmul/scripts/strix-halo-podman-test.sh` to run the build and tests in the AMD toolbox container with a graphical session
+3. **Treat the display requirement as a hard prerequisite** — The harness should fail fast in TTY/SSH-only environments instead of attempting portable fallbacks
 
 ## Verification
 
