@@ -1,37 +1,88 @@
-# VNNI int8×int8 matmul — Strix Halo multi-backend prototype
+# VNNI int8 matmul — Strix Halo building blocks
 
-This subproject is a small, self-contained implementation of int8 matmul for AMD Strix Halo. It focuses on three minimal backends:
+Self-contained INT8 matmul building blocks for AMD Ryzen AI Max+ 395
+"Strix Halo". Three backends, one machine, headless, no portability layer and
+**no fallbacks**: each backend either runs on its own hardware or reports why it
+cannot.
 
-- CPU: AVX-512 VNNI on Strix Halo hardware.
-- GPU: a Vulkan-facing wrapper that requires the Vulkan runtime on the Strix Halo target.
-- NPU: a fixed-shape XDNA2 wrapper that accepts one input row and four output columns.
+| Backend | Hardware | Reports when unusable |
+|---|---|---|
+| CPU | AVX-512 VNNI (Zen 5) | `avx512-vnni-unavailable` |
+| GPU | RADV GFX1151 iGPU, headless Vulkan compute | `strix_vulkan_failure_reason()` |
+| NPU | XDNA 2 via the `amdxdna` accel driver | `strix_xdna2_failure_reason()` |
 
 ## Layout
 
-- `cpu/vnni_cpu_backend.[ch]` — optimized CPU kernel for Strix Halo AVX-512 VNNI.
-- `gpu/vulkan_backend.[ch]` — Vulkan-fronted wrapper for the Strix Halo target.
-- `npu/xdna2_backend.[ch]` — fixed-shape XDNA2 wrapper that uses the CPU path.
-- `kernel/vnni_matmul_test.c` — tiny demo program that exercises the CPU backend.
-- `tests/test_backends.c` — correctness tests for all three paths.
-- `tests/vulkan_runtime_test.c` — standalone runtime test that exercises the Vulkan backend directly.
+| Path | Purpose |
+|---|---|
+| `cpu/vnni_cpu_backend.[ch]` | AVX-512 VNNI kernel (`_mm512_dpbusd_epi32`) |
+| `gpu/vulkan_backend.[ch]` | Headless Vulkan compute, Strix Halo exclusive |
+| `gpu/vulkan_dispatch.h` | Dispatch tables built only from `<vulkan/vulkan_core.h>` |
+| `gpu/comp.comp`, `gpu/comp.spv` | GEMM compute shader source and compiled SPIR-V |
+| `npu/xdna2_backend.[ch]` | XDNA 2 NPU backend, driving `c/npu_kernels/` |
+| `kernel/vnni_matmul_test.c` | Small CPU-backend demo |
+| `tests/test_backends.c` | Cross-backend correctness tests |
+| `tests/vulkan_runtime_test.c` | Vulkan backend runtime test |
+| `tests/vulkan_debug_harness.c` | Verbose Vulkan device enumeration and dispatch |
+| `tests/npu_device_test.c` | NPU probe, AIE version check, no-fallback assertion |
+| `scripts/strix-halo-podman-test.sh` | Headless Podman harness for the Strix Halo host |
+
+## Build requirements
+
+* gcc with AVX-512 VNNI support
+* Vulkan headers and loader — `vulkan-headers` / `libvulkan-dev`
+* Linux kernel headers ≥ 6.14, for `<drm/amdxdna_accel.h>`
+* `glslangValidator`, only to regenerate `gpu/comp.spv` (`make shader`)
 
 ## Build and test
 
 ```bash
-cd vnni-int8-matmul
+make
 make test
 ```
 
-The CPU backend is Strix Halo-specific and requires AVX-512 VNNI support. The default build uses the required flags for that target:
+On the Strix Halo host, headless, in a container:
 
 ```bash
-make test
+./scripts/strix-halo-podman-test.sh
 ```
 
-If you are building on a non-Strix-Halo host, the runtime tests fail immediately when the required GPU/CPU backend cannot initialize.
+On any other host the suite still builds and runs; every hardware-bound test
+reports an explicit SKIP with the reason, and nothing crashes.
 
-## Notes
+## Diagnostics
 
-The Vulkan and XDNA2 implementations are intentionally minimal and do not attempt to be a general-purpose abstraction. They are meant to be the smallest possible backend shims for this Strix Halo-focused prototype.
+```bash
+VNNI_VULKAN_DEBUG=1 ./tests/vulkan_debug_harness   # enumerate and explain device selection
+XDNA2_VERBOSE=1     ./tests/npu_device_test        # AIE metadata, resource info, firmware
+```
 
-For a full runbook with test commands and edge-case notes, see [docs/TESTING.md](docs/TESTING.md).
+| Variable | Purpose |
+|---|---|
+| `VNNI_VULKAN_DEBUG` | verbose Vulkan device enumeration and dispatch resolution |
+| `VNNI_VULKAN_SHADER` | override the path to `comp.spv` |
+| `VNNI_STRIX_DEVICE_NAME` | allowlist one extra Strix Halo device-name substring |
+| `XDNA2_DEVICE` | NPU accel node (default `/dev/accel/accel0`) |
+| `XDNA2_VERBOSE` | dump NPU device info at init |
+| `COLI_NPU_KERNEL_DIR` | where `*.npukernel` artifacts are found |
+| `COLI_NPU_KERNELS` | colon-separated artifacts to preload |
+
+`VNNI_STRIX_DEVICE_NAME` can only add an accepted device name. The AMD vendor ID
+and `INTEGRATED_GPU` checks are unconditional, so it cannot be used to run this
+code on a discrete GPU or a software rasteriser.
+
+## Design rules
+
+These are load-bearing. See `docs/vulkan_debug_attempts.md` and
+`docs/strix-halo-npu.md` in the repository root for the full rationale and the
+bugs that motivated them.
+
+1. Never hand-write a Vulkan or kernel UAPI type. Include the official header or
+   fail the build.
+2. `dlsym` is used for `vkGetInstanceProcAddr` and nothing else.
+3. Headless: zero Vulkan instance extensions, no display server, no Xvfb.
+4. No fallbacks. Not to lavapipe, not to a discrete GPU, not to the CPU.
+5. Fixed-shape NPU kernels only, matched exactly on (rows, inner, out, fmt).
+
+For a full runbook with test commands and edge-case notes, see
+[docs/TESTING.md](docs/TESTING.md).
