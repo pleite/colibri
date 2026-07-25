@@ -146,3 +146,13 @@ printf 'Running headless Strix Halo Podman harness with image %s\n' "${harness_i
 {
     podman "${podman_args[@]}"
 } 2>&1 | tee -a "${log_path}"
+
+# The repository root is bind-mounted into the container, so anything the
+# container removes under it removes the host's copy too. `tee` keeps writing to
+# an unlinked inode without complaining, which used to leave CI with a passing
+# test run and no log at all.
+if [[ ! -f "${log_path}" ]]; then
+    echo "the harness log ${log_path} was deleted while the run was in progress" >&2
+    echo "nothing running inside the container may remove it (see the 'clean' target)" >&2
+    exit 1
+fi

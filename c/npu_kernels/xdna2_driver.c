@@ -162,11 +162,22 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
         xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr, "xdna2: failed to create hardware context: %s\n",
                 strerror(err));
+        fprintf(stderr,
+                "xdna2: requested num_tiles=%u mem_size=%u max_opc=%u qos=%u\n",
+                num_tiles, mem_size, max_opc, qos);
         if (err == ENOENT) {
             fprintf(stderr,
                     "xdna2: -ENOENT from CREATE_HWCTX means the driver could not "
                     "find this client's device heap, not that the ioctl is "
                     "unsupported (that would be ENOTTY)\n");
+        } else if (err == EINVAL) {
+            fprintf(stderr,
+                    "xdna2: -EINVAL comes from the driver's context init: "
+                    "num_tiles must be non-zero and a multiple of the AIE core "
+                    "row count, and num_tiles / core rows must not exceed the "
+                    "column count; run with XDNA2_VERBOSE=1 for the array "
+                    "geometry and check `dmesg | grep amdxdna` for the exact "
+                    "rejection\n");
         }
         return -1;
     }
