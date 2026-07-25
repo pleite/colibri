@@ -42,7 +42,10 @@ test: tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness
 	./tests/vulkan_runtime_test
 	./tests/vulkan_debug_harness
 
-clean:
-	rm -f tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness tests/*.o cpu/*.o npu/*.o gpu/*.o
+podman-test: scripts/strix-halo-podman-test.sh
+	./scripts/strix-halo-podman-test.sh
 
-.PHONY: all test clean
+clean:
+	rm -f tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness tests/*.o cpu/*.o npu/*.o gpu/*.o test_output.log
+
+.PHONY: all test podman-test clean

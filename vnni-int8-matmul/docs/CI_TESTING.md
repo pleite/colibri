@@ -69,24 +69,18 @@ on:
 jobs:
   test-vulkan:
     runs-on: [self-hosted, strix-halo, vulkan]
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Setup Vulkan environment
-        run: |
-          echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json" >> $GITHUB_ENV
-          sudo ln -sf /usr/bin/ld.bfd /etc/alternatives/ld
-          sudo ln -sf /usr/bin/ld.bfd /usr/bin/ld
-      
-      - name: Run VNNI tests
+
+      - name: Run VNNI tests in the Strix Halo podman harness
         working-directory: vnni-int8-matmul
+        shell: bash
         run: |
-          make clean
-          make
-          make test
-      
+          set -euo pipefail
+          make podman-test
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -95,7 +89,7 @@ jobs:
           path: |
             vnni-int8-matmul/tests/test_backends
             vnni-int8-matmul/tests/vulkan_runtime_test
-            vnni-int8-matmul/*.log
+            vnni-int8-matmul/test_output.log
 ```
 
 ## Step 3: Test Workflow

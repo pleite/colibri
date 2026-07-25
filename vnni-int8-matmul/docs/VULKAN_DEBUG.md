@@ -1,128 +1,63 @@
 # Vulkan Backend Debug Guide
 
-## Problem
+## Scope
 
-The Vulkan backend in `vnni-int8-matmul/gpu/vulkan_backend.c` fails to load on Strix Halo headless systems because:
+The Vulkan backend in `vnni-int8-matmul/gpu/vulkan_backend.c` is tested only on Strix Halo. The harness in `vnni-int8-matmul/scripts/strix-halo-podman-test.sh` uses the same headless container pattern as the Strix Halo toolbox and llama-server workflows and does not attempt portable fallbacks.
 
-1. **Static Vulkan entry points**: `vkCreateInstance` and `vkDestroyInstance` are static entry points that must be loaded via `dlsym()`, not `vkGetInstanceProcAddr()`
-2. **Headless environment**: Without a display server, `vkEnumeratePhysicalDevices` may return 0 devices unless `VK_ICD_FILENAMES` is set
+## Prerequisites
 
-## Solution
+The Strix Halo test harness requires:
 
-### 1. Fix Vulkan Loading (Already Applied)
+- access to `/dev/dri` and `/dev/kfd` from Podman
+- the `docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv` container image
+- the AMD RADV ICD inside the container at `/usr/share/vulkan/icd.d/radeon_icd.x86_64.json`
 
-The `load_dispatch()` function now loads static entry points correctly:
+The harness does not require a host-side X server. If a display is available, it will pass that through; otherwise it runs in the same headless container context used by the toolbox and llama-server workflows.
 
-```c
-// Static entry points via dlsym
-dispatch->vkCreateInstance = (PFN_vkCreateInstance)dlsym(handle, "vkCreateInstance");
-dispatch->vkDestroyInstance = (PFN_vkDestroyInstance)dlsym(handle, "vkDestroyInstance");
+## What the harness does
 
-// All other functions via vkGetInstanceProcAddr
-dispatch->vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)get_proc_addr(NULL, "vkEnumeratePhysicalDevices");
-// ... rest of the functions
+The Podman harness:
+
+1. verifies that Podman is available and usable
+2. requires a graphical session before it starts
+3. mounts the checked-out `vnni-int8-matmul` tree into the container
+4. runs the build and test suite inside the Strix Halo toolbox container
+5. writes a `test_output.log` file next to the source tree for CI artifacts
+
+## Run it
+
+```bash
+cd /home/runner/work/colibri/colibri/vnni-int8-matmul
+make podman-test
 ```
 
-### 2. Set VK_ICD_FILENAMES for Headless Systems
+Or directly:
 
-For headless environments (containers, CI runners), set the Vulkan ICD file:
+```bash
+./scripts/strix-halo-podman-test.sh
+```
+
+## Debugging steps
+
+If the harness fails, inspect the generated `test_output.log` first. The script also leaves the container output in the log so you can see whether the failure happened during the build, the debug harness, or the runtime tests.
+
+Useful checks from the host:
 
 ```bash
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+vulkaninfo --summary | grep -A5 "GPU0"
 ```
 
-This tells the Vulkan loader to use only the RADV driver, avoiding crashes from other ICDs.
-
-### 3. Test Locally on Strix Halo
+Useful checks inside the container:
 
 ```bash
-cd /home/leite/colibri/vnni-int8-matmul
-
-# Build
-make clean && make
-
-# Run tests (Vulkan will work if VK_ICD_FILENAMES is set)
-make test
-```
-
-Expected output:
-```
-./tests/test_backends
-CPU backend OK (avx512-vnni)
-Vulkan backend OK (vulkan-compute)
-XDNA2 backend OK (xdna2-fixed-4x1)
-Edge-case tests OK
-All backend tests passed.
-./tests/vulkan_runtime_test
-Vulkan runtime test passed via vulkan-compute
-```
-
-### 4. Use the dedicated debug harness
-
-A dedicated harness is available at `tests/vulkan_debug_harness` for reproducing the loader path in a single place. Enable verbose diagnostics with:
-
-```bash
-export VNNI_VULKAN_DEBUG=1
-make tests/vulkan_debug_harness
-./tests/vulkan_debug_harness
-```
-
-The harness will print the backend name and the exact failure point if initialization or execution fails.
-
-### 5. Test in Podman Container
-
-```bash
-podman run -it --rm \
-  --device /dev/dri \
-  --device /dev/kfd \
-  --security-opt label=disable \
-  --cap-add=SYS_PTRACE \
-  -v /home/leite/colibri/vnni-int8-matmul:/opt/vnni:rw \
-  -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
+podman run --rm --device /dev/dri --device /dev/kfd \
+  --security-opt label=disable --cap-add=SYS_PTRACE \
+  --env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
   docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv \
-  bash -c 'cd /opt/vnni && ln -sf /usr/bin/ld.bfd /etc/alternatives/ld && ln -sf /usr/bin/ld.bfd /usr/bin/ld && make clean && make && make test'
+  bash -lc 'ls -la /dev/dri && vulkaninfo --summary | head'
 ```
 
-## Debugging Steps
+## Notes for the backend
 
-If tests still skip, check:
-
-1. **Vulkan library loads**:
-   ```bash
-   ldd ./tests/test_backends | grep vulkan
-   ```
-
-2. **Physical devices enumerate**:
-   ```bash
-   vulkaninfo --summary | grep -A5 "GPU0"
-   ```
-
-3. **Backend name**:
-   ```bash
-   ./tests/test_backends 2>&1 | grep "Vulkan backend"
-   # Should say "OK (vulkan-compute)" not "SKIP"
-   ```
-
-4. **Container GPU access**:
-   ```bash
-   podman exec <container> ls -la /dev/dri/
-   # Should show card0 and renderD128
-   ```
-
-## Common Errors
-
-### "vkDestroyInstance not found"
-**Fix**: Use `dlsym()` instead of `vkGetInstanceProcAddr()` for static entry points.
-
-### "vkEnumeratePhysicalDevices returns 0"
-**Fix**: Set `VK_ICD_FILENAMES` environment variable.
-
-### "ld: cannot find"
-**Fix**: Create symlink: `ln -sf /usr/bin/ld.bfd /etc/alternatives/ld`
-
-### "Segmentation fault"
-**Fix**: Ensure `VK_ICD_FILENAMES` is set to avoid loading incompatible ICDs.
-
-## CI Integration
-
-See `docs/CI_TESTING.md` for GitHub Actions workflow to test on Strix Halo.
+The backend still uses explicit Vulkan loader checks and the debug harness remains available for targeted failures. The important change here is that testing is now anchored to a Strix Halo Podman workflow instead of optional host-side fallback behavior.
