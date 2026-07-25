@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+#
+# Test harness image for the Strix Halo INT8 building blocks.
+#
+# The default base is this repository's own colibri-vulkan image, built from
+# Dockerfile.colibri. The community Strix Halo toolbox image
+# (https://github.com/kyuz0/amd-strix-halo-toolboxes) also works and ships a
+# known-good RADV/Mesa stack for GFX1151, but it is an *inference runtime*
+# image, not a build image: it has gcc but no `ld`, no kernel UAPI headers and
+# no Vulkan headers. Building the harness in it fails with
+# "collect2: fatal error: cannot find 'ld'" and, once that is fixed,
+# "<drm/amdxdna_accel.h>: No such file or directory".
+#
+# Symlinking /usr/bin/ld by hand inside the test step is not a fix — it hides
+# the missing toolchain behind an undocumented side effect. This image installs
+# the packages instead and asserts they are present, so a base image that
+# regresses fails here rather than halfway through a test run.
+#
+# Build:
+#   podman build -f Dockerfile.strix-halo-test -t colibri-strix-halo-test .
+#   podman build --build-arg BASE_IMAGE=docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv ...
+#
+# The image builds nothing itself: sources are bind-mounted at run time by
+# scripts/strix-halo-podman-test.sh so a test run always reflects the checkout.
+
+ARG BASE_IMAGE=ghcr.io/pleite/colibri-vulkan:latest
+FROM ${BASE_IMAGE}
+
+# binutils        -> ld; absent from the community toolbox image
+# kernel-headers  -> <drm/amdxdna_accel.h>, the amdxdna UAPI (Linux >= 6.14)
+# libdrm-devel    -> <drm/drm.h>, pulled in by the amdxdna header
+# vulkan-*/glslang-> Vulkan compute backend and shader regeneration
+# vulkan-tools    -> vulkaninfo, for diagnosing ICD problems
+RUN set -eux; \
+    dnf install -y --setopt=install_weak_deps=False \
+        binutils gcc glibc-devel make findutils diffutils \
+        kernel-headers libdrm-devel \
+        vulkan-headers vulkan-loader-devel vulkan-tools glslang \
+        pciutils; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# Fail at build time rather than in the middle of a test run.
+RUN set -eux; \
+    command -v ld; \
+    test -f /usr/include/drm/amdxdna_accel.h; \
+    test -f /usr/include/vulkan/vulkan.h; \
+    echo 'int main(void){return 0;}' > /tmp/probe.c; \
+    gcc /tmp/probe.c -o /tmp/probe; \
+    rm -f /tmp/probe.c /tmp/probe
+
+# The NPU is reached through the amdxdna accel node, not through XRT and not
+# through /dev/dri. Nothing extra needs installing for it — only the UAPI header
+# at build time and `--device /dev/accel/accel0` at run time. XRT is
+# deliberately not installed: c/npu_kernels issues DRM ioctls directly and
+# pulling in XRT would make it ambiguous which path was exercised.
+ENV XDNA2_DEVICE=/dev/accel/accel0
+
+WORKDIR /work/vnni-int8-matmul
+CMD ["bash"]

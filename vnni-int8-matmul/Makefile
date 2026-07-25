@@ -22,6 +22,14 @@ GLSLANG ?= glslangValidator
 
 NPU_DIR := ../c/npu_kernels
 
+# DRM_AMDXDNA_QUERY_RESOURCE_INFO landed in the amdxdna UAPI after Linux 6.18.
+# Probe for it instead of assuming it exists; the driver reports the query as
+# unavailable when the running headers predate it.
+HAVE_XDNA2_RESOURCE_INFO := $(shell echo 'int main(void){return (int)DRM_AMDXDNA_QUERY_RESOURCE_INFO;}' | $(CC) $(CPPFLAGS) -include drm/amdxdna_accel.h -x c - -o /dev/null >/dev/null 2>&1 && echo 1 || echo 0)
+ifeq ($(HAVE_XDNA2_RESOURCE_INFO),1)
+CPPFLAGS += -DCOLI_HAVE_XDNA2_RESOURCE_INFO
+endif
+
 TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
          tests/npu_device_test
 

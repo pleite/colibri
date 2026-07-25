@@ -10,10 +10,11 @@
  *   2. the AIE array reported by the driver looks like XDNA 2 on Strix Halo,
  *   3. requesting a matmul with no kernel loaded fails instead of silently
  *      falling back to the CPU,
- *   4. int4 -> int8 weight expansion is correct (pure host arithmetic).
+ *   4. int4 -> int8 weight expansion is correct (pure host arithmetic),
+ *   5. the command wait refuses to report success without actually waiting.
  *
  * Steps 1-3 are skipped, not failed, when no NPU is present, so the harness is
- * usable in CI. Step 4 always runs.
+ * usable in CI. Steps 4 and 5 always run.
  */
 
 #include <stdint.h>
@@ -103,10 +104,43 @@ static int test_no_cpu_fallback(void) {
     return 1;
 }
 
+static int test_wait_never_fakes_success(void) {
+    /* Regression guard: xdna2_wait_command() was once stubbed to `return 0`
+     * because DRM_IOCTL_AMDXDNA_WAIT_CMD is absent from mainline headers. A
+     * wait that reports success without asking the kernel makes every matmul
+     * read the output buffer before the NPU has written it. This runs on any
+     * host: no device is touched, because a context with no completion syncobj
+     * must be rejected outright. */
+    xdna2_hwctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.initialized = true;
+    ctx.syncobj_handle = 0; /* CREATE_HWCTX never returned one */
+    ctx.last_seq = 1;
+
+    if (xdna2_wait_command(-1, &ctx, 1) == 0) {
+        fprintf(stderr,
+                "xdna2_wait_command() reported success without a completion "
+                "syncobj; it must never claim a command finished\n");
+        return 0;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    if (xdna2_wait_command(-1, &ctx, 1) == 0) {
+        fprintf(stderr,
+                "xdna2_wait_command() reported success for an uninitialised "
+                "hardware context\n");
+        return 0;
+    }
+
+    printf("wait-never-fakes-success OK\n");
+    return 1;
+}
+
 int main(void) {
     int failed = 0;
 
     if (!test_int4_expansion()) failed = 1;
+    if (!test_wait_never_fakes_success()) failed = 1;
     if (!test_device_probe()) failed = 1;
     if (!test_no_cpu_fallback()) failed = 1;
 

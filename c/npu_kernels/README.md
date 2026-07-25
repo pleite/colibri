@@ -42,7 +42,7 @@ c/backend_npu.c            coli_npu_* dispatcher
 | `xdna2_driver.h/.c` | DRM ioctl wrapper: device, hardware context, buffer objects, submit, wait, queries |
 | `xdna2_matmul.h/.c` | Fixed-shape INT8 matmul runtime, `.npukernel` loading, int4 → int8 expansion |
 | `npu_runtime.h` | `coli_npu_*` integration surface used by `c/backend_npu.c` |
-| `CMakeLists.txt` | Build; fails hard if `<drm/amdxdna_accel.h>` is missing |
+| `CMakeLists.txt` | Build; fails hard if `<drm/amdxdna_accel.h>` is missing, probes for post-6.18 UAPI additions |
 | `tests/test_npu.c` | Device/runtime probe suite |
 
 All ioctl structures come from `<drm/amdxdna_accel.h>` (kernel headers ≥ 6.14).
@@ -80,12 +80,20 @@ Without hardware, the device tests report explicit SKIPs and the host-side
 arithmetic tests still pass. A SKIP means "no NPU here" — it must never become a
 PASS produced by computing the result somewhere else.
 
+Some UAPI symbols (`DRM_AMDXDNA_QUERY_RESOURCE_INFO`, `AMDXDNA_QOS_*`,
+`AMDXDNA_BO_SHARE`, `DRM_IOCTL_AMDXDNA_WAIT_CMD`) post-date Linux 6.18 or live
+only in AMD's out-of-tree `xdna-driver` headers. The build probes for them; a
+missing symbol degrades a *query*, never the correctness of a dispatch. Do not
+stub a wait or a submit to make a build pass.
+
 ## Status
 
 Implemented:
 
-* DRM ioctl wrapper against the real UAPI — device, hwctx, BO alloc/map/sync,
-  `EXEC_CMD`, `WAIT_CMD`, `GET_INFO`.
+* DRM ioctl wrapper against the real UAPI — device, device heap, hwctx, BO
+  alloc/map/sync, `EXEC_CMD`, `GET_INFO`, and completion via
+  `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` on the context's timeline syncobj (the
+  mainline UAPI has no `WAIT_CMD` ioctl).
 * Fixed-shape INT8 matmul dataflow: kernel lookup, BO upload, cache maintenance,
   ERT packet construction, submission, wait, readback, per-column scaling.
 * int4 → int8 weight expansion (`xdna2_dequant_int4`), host side.
@@ -101,7 +109,9 @@ Requires the AMD AIE toolchain:
 ## References
 
 * `include/uapi/drm/amdxdna_accel.h` (Linux ≥ 6.14) — ioctls, `enum
-  amdxdna_drm_get_param`, `enum amdxdna_bo_type`, `struct amdxdna_drm_wait_cmd`
+  amdxdna_drm_get_param`, `enum amdxdna_bo_type`
+* `include/uapi/drm/drm.h` — `DRM_IOCTL_GEM_CLOSE`,
+  `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`
 * `drivers/accel/amdxdna/` — the in-tree kernel driver
 * <https://github.com/amd/xdna-driver>, <https://github.com/amd/XRT>
 * Firmware: `/lib/firmware/amdnpu/17f0_11/`

@@ -19,11 +19,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── Local ioctl helpers ── */
@@ -75,6 +78,34 @@ void xdna2_close_device(int fd) {
 
 /* ── Hardware Context ── */
 
+/*
+ * The amdxdna client owns exactly one device heap. `aie2_hwctx_init()` fails
+ * with -ENOENT ("The client dev heap object not exist") when DRM_IOCTL_
+ * AMDXDNA_CREATE_HWCTX is issued before that heap exists, and every
+ * AMDXDNA_BO_DEV allocation (the instruction streams) is carved out of it.
+ * The heap must therefore be created first and outlive the context.
+ *
+ * The kernel caps the heap at dev_info->dev_mem_size, which is 64 MiB
+ * (AIE2_DEVM_SIZE) on every AIE2 part including Strix Halo, and rounds device
+ * allocations to dev_mem_buf_shift = 32 KiB.
+ */
+static uint64_t xdna2_dev_heap_bytes(void) {
+    const char *env = getenv("XDNA2_HEAP_BYTES");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long value = strtoull(env, &end, 0);
+        if (end && *end == '\0' && value >= XDNA2_DEV_HEAP_ALIGN &&
+            value <= XDNA2_DEV_HEAP_MAX_BYTES) {
+            return (uint64_t)(value & ~(uint64_t)(XDNA2_DEV_HEAP_ALIGN - 1));
+        }
+        fprintf(stderr,
+                "xdna2: ignoring XDNA2_HEAP_BYTES='%s' (expected %u..%llu bytes)\n",
+                env, XDNA2_DEV_HEAP_ALIGN,
+                (unsigned long long)XDNA2_DEV_HEAP_MAX_BYTES);
+    }
+    return XDNA2_DEV_HEAP_MAX_BYTES;
+}
+
 int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                        uint32_t num_tiles, uint32_t mem_size,
                        uint32_t max_opc, uint32_t qos) {
@@ -82,11 +113,23 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
     memset(ctx, 0, sizeof(*ctx));
     ctx->fd = -1;
 
+    /* Device heap first: without it CREATE_HWCTX returns -ENOENT. */
+    xdna2_bo_t heap_bo;
+    if (xdna2_create_bo(fd, &heap_bo, xdna2_dev_heap_bytes(),
+                        AMDXDNA_BO_DEV_HEAP) < 0) {
+        fprintf(stderr,
+                "xdna2: failed to create the %llu-byte device heap; the driver "
+                "allows one heap per open file descriptor\n",
+                (unsigned long long)xdna2_dev_heap_bytes());
+        return -1;
+    }
+
     /* The user mode queue and log buffer BOs must stay alive for as long as
      * the hardware context references them, so they are owned by the context
      * and released in xdna2_destroy_hwctx(). */
     xdna2_bo_t umq_bo;
     if (xdna2_create_bo(fd, &umq_bo, 4096, AMDXDNA_BO_CMD) < 0) {
+        xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr, "xdna2: failed to create UMQ BO\n");
         return -1;
     }
@@ -94,6 +137,7 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
     xdna2_bo_t log_bo;
     if (xdna2_create_bo(fd, &log_bo, 4096, AMDXDNA_BO_CMD) < 0) {
         xdna2_destroy_bo(fd, &umq_bo);
+        xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr, "xdna2: failed to create log BO\n");
         return -1;
     }
@@ -112,14 +156,24 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
     create_ctx.mem_size = mem_size;
 
     if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &create_ctx) < 0) {
-        xdna2_destroy_bo(fd, &umq_bo);
+        int err = errno;
         xdna2_destroy_bo(fd, &log_bo);
-        fprintf(stderr, "xdna2: failed to create hardware context\n");
+        xdna2_destroy_bo(fd, &umq_bo);
+        xdna2_destroy_bo(fd, &heap_bo);
+        fprintf(stderr, "xdna2: failed to create hardware context: %s\n",
+                strerror(err));
+        if (err == ENOENT) {
+            fprintf(stderr,
+                    "xdna2: -ENOENT from CREATE_HWCTX means the driver could not "
+                    "find this client's device heap, not that the ioctl is "
+                    "unsupported (that would be ENOTTY)\n");
+        }
         return -1;
     }
 
     ctx->fd = fd;
     ctx->hwctx_handle = create_ctx.handle;
+    ctx->dev_heap_bo = heap_bo;
     ctx->umq_bo = umq_bo;
     ctx->log_bo = log_bo;
     ctx->umq_doorbell = create_ctx.umq_doorbell;
@@ -144,9 +198,11 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx) {
 
     int ret = xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &destroy_ctx);
 
-    /* Release the BOs the context was holding. */
+    /* Release the BOs the context was holding. The device heap is released
+     * last: device BOs are sub-allocations of it. */
     xdna2_destroy_bo(fd, &ctx->log_bo);
     xdna2_destroy_bo(fd, &ctx->umq_bo);
+    xdna2_destroy_bo(fd, &ctx->dev_heap_bo);
 
     ctx->initialized = false;
     ctx->hwctx_handle = 0;
@@ -294,11 +350,59 @@ int xdna2_submit_command(int fd, xdna2_hwctx_t *ctx,
 int xdna2_wait_command(int fd, xdna2_hwctx_t *ctx, uint32_t timeout_ms) {
     if (!ctx || !ctx->initialized) return -1;
 
-    /* TODO: Implement when kernel supports DRM_IOCTL_AMDXDNA_WAIT_CMD */
-    /* For now, assume command completed immediately */
+    /*
+     * Completion is reported through the per-context *timeline* syncobj whose
+     * handle CREATE_HWCTX returned: the kernel calls
+     * drm_syncobj_add_point(syncobj, chain, out_fence, seq) for every job, so
+     * the sequence number returned by EXEC_CMD is the timeline point to wait
+     * on. This is the only wait mechanism the in-tree driver exposes —
+     * DRM_IOCTL_AMDXDNA_WAIT_CMD does not exist in the mainline UAPI (it is an
+     * out-of-tree amd/xdna-driver addition), which is why building against
+     * distribution kernel headers fails to find it.
+     *
+     * Returning success without waiting is never an option: the caller reads
+     * the output BO immediately afterwards and would silently consume whatever
+     * happened to be in memory.
+     */
+    if (ctx->syncobj_handle == 0 || ctx->syncobj_handle == UINT32_MAX) {
+        fprintf(stderr,
+                "xdna2: hardware context has no completion syncobj; cannot wait "
+                "for command seq %" PRIu64 "\n", (uint64_t)ctx->last_seq);
+        return -1;
+    }
+
+    /* drm_syncobj_timeline_wait takes an absolute CLOCK_MONOTONIC deadline. */
+    int64_t deadline_ns = INT64_MAX;
+    if (timeout_ms != 0) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            fprintf(stderr, "xdna2: clock_gettime failed: %s\n", strerror(errno));
+            return -1;
+        }
+        deadline_ns = (int64_t)now.tv_sec * 1000000000ll + (int64_t)now.tv_nsec +
+                      (int64_t)timeout_ms * 1000000ll;
+    }
+
+    uint32_t handle = ctx->syncobj_handle;
+    uint64_t point = ctx->last_seq;
+
+    struct drm_syncobj_timeline_wait wait;
+    memset(&wait, 0, sizeof(wait));
+    wait.handles = (__u64)(uintptr_t)&handle;
+    wait.points = (__u64)(uintptr_t)&point;
+    wait.timeout_nsec = deadline_ns;
+    wait.count_handles = 1;
+    wait.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+
+    if (xdna2_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait) < 0) {
+        fprintf(stderr,
+                "xdna2: wait for command seq %" PRIu64 " failed after %u ms\n",
+                point, timeout_ms);
+        return -1;
+    }
     return 0;
 }
-
 
 
 
@@ -361,6 +465,15 @@ int xdna2_query_aie_metadata(int fd, xdna2_aie_metadata_t *meta) {
     return 0;
 }
 
+/*
+ * DRM_AMDXDNA_QUERY_RESOURCE_INFO and struct amdxdna_drm_get_resource_info
+ * were added to the amdxdna UAPI after Linux 6.18, so they are absent from
+ * every currently shipping kernel-headers package. The build system probes for
+ * them and defines COLI_HAVE_XDNA2_RESOURCE_INFO when present; nothing is
+ * re-declared locally, and when the query is unavailable the function reports
+ * an explicit failure instead of inventing values.
+ */
+#ifdef COLI_HAVE_XDNA2_RESOURCE_INFO
 int xdna2_query_resource_info(int fd, xdna2_resource_info_t *info) {
     if (!info) return -1;
 
@@ -378,6 +491,17 @@ int xdna2_query_resource_info(int fd, xdna2_resource_info_t *info) {
     info->npu_task_curr = raw.npu_task_curr;
     return 0;
 }
+#else
+int xdna2_query_resource_info(int fd, xdna2_resource_info_t *info) {
+    (void)fd;
+    if (!info) return -1;
+    memset(info, 0, sizeof(*info));
+    fprintf(stderr,
+            "xdna2: DRM_AMDXDNA_QUERY_RESOURCE_INFO is not present in these "
+            "kernel headers; resource info is unavailable\n");
+    return -1;
+}
+#endif
 
 int xdna2_query_firmware_version(int fd, uint32_t *major,
                                  uint32_t *minor, uint32_t *patch,
