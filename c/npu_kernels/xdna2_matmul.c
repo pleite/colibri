@@ -174,11 +174,29 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
     runtime->device_fd = -1;
     runtime->timeout_ms = 5000;
 
+    /*
+     * Pick the control plane before touching the device. This decides how the
+     * NPU is validated (DRM ioctls only, or the official XRT + XDNA shim
+     * stack); the fixed-shape dispatch below is DRM in both cases, because the
+     * `.npukernel` artifacts are not xclbins. It never selects a CPU path.
+     */
+    xdna2_control_plane_t requested = XDNA2_CONTROL_PLANE_AUTO;
+    if (xdna2_control_plane_from_env(&requested) < 0) {
+        return -EINVAL;
+    }
+    int ret = xdna2_control_plane_resolve(requested, &runtime->control_plane);
+    if (ret < 0) {
+        return ret;
+    }
+
     if (xdna2_open_device(&runtime->device_fd) < 0) {
         return -ENODEV;
     }
 
     if (getenv("XDNA2_VERBOSE")) {
+        printf("  Control plane: %s (%s)\n",
+               xdna2_control_plane_name(runtime->control_plane),
+               xdna2_xrt_status());
         xdna2_print_device_info(runtime->device_fd);
     }
 

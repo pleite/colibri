@@ -49,16 +49,22 @@ cpu/vnni_cpu_backend.o: cpu/vnni_cpu_backend.c cpu/vnni_cpu_backend.h
 gpu/vulkan_backend.o: gpu/vulkan_backend.c gpu/vulkan_backend.h gpu/vulkan_dispatch.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h
+npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_xrt_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(NPU_DIR)/xdna2_driver.o: $(NPU_DIR)/xdna2_driver.c $(NPU_DIR)/xdna2_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h
+$(NPU_DIR)/xdna2_xrt_driver.o: $(NPU_DIR)/xdna2_xrt_driver.c $(NPU_DIR)/xdna2_xrt_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o $(NPU_DIR)/xdna2_matmul.o
+$(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h $(NPU_DIR)/xdna2_xrt_driver.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# The vnni building blocks never link XRT: xdna2_xrt_driver.c compiles to the
+# "no XRT" probe unless the build explicitly defines COLI_NPU_XRT_AVAILABLE.
+NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o \
+            $(NPU_DIR)/xdna2_xrt_driver.o $(NPU_DIR)/xdna2_matmul.o
 
 tests/%.o: tests/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@

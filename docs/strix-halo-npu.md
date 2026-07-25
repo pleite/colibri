@@ -30,6 +30,7 @@ DRM ioctls. XRT remains relevant only if you use AMD's own runtime instead.
 ```
 c/npu_kernels/
   xdna2_driver.{c,h}   DRM ioctl wrapper: device, hwctx, BOs, submit, wait, queries
+  xdna2_xrt_driver.{c,h} XRT / XDNA shim control plane: availability probe only
   xdna2_matmul.{c,h}   Fixed-shape INT8 matmul runtime: kernel loading, DMA, dispatch
   npu_runtime.h        coli_npu_* integration surface used by c/backend_npu.c
   tests/test_npu.c     Device/runtime probe suite
@@ -126,6 +127,37 @@ that made the Vulkan backend so hard to debug (see
 
 ---
 
+### Control plane: DRM ioctls, optionally validated through XRT
+
+The AMD stack drives the NPU through XRT plus the XDNA shim
+(`libxrt_driver_xdna`), which is what teaches XRT to talk to
+`/dev/accel/accel0`; see [`xdna_shim_guide.md`](xdna_shim_guide.md). This
+repository dispatches with DRM ioctls instead, and that stays true:
+
+* the `.npukernel` container carries a DPU instruction stream and an ERT
+  opcode, not an `.xclbin` plus a kernel argument convention, so there is
+  nothing for `xrtKernelOpen()` / `xrtRunStart()` to run;
+* an XRT submit/wait path written against artifacts that do not exist would be
+  a guessed ABI, which guardrail 2 and guardrail 5 below forbid.
+
+What *is* implemented is the part that can be verified on hardware today:
+`xdna2_xrt_driver.c` opens and closes the NPU through the official XRT C API
+(`<xrt/xrt_device.h>`, compiled only when the build found XRT and defined
+`COLI_NPU_XRT_AVAILABLE`) and reports the outcome. `XDNA2_DRIVER` selects the
+policy:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | probe XRT when compiled in, record the result, continue on DRM either way |
+| `drm` | never touch XRT |
+| `xrt` | require the XRT + shim stack; `xdna2_runtime_init()` returns `-ENOSYS` when it is missing |
+
+`xrt` is the useful one on a production Strix Halo box: it turns "the shim was
+never installed" into a loud failure instead of a silent difference in stack.
+No value of `XDNA2_DRIVER` ever enables a CPU path.
+
+---
+
 ## 4. Bugs fixed in this pass
 
 The XDNA 2 driver wrapper had the same class of defect as the Vulkan shim:
@@ -183,6 +215,8 @@ backend requests zero instance extensions and the NPU path never needed one.
 | Variable | Default | Purpose |
 |---|---|---|
 | `XDNA2_DEVICE` | `/dev/accel/accel0` | NPU accel node |
+| `XDNA2_DRIVER` | `auto` | control plane: `auto`, `drm`, or `xrt` (see §3.4) |
+| `XDNA2_XRT_DEVICE_INDEX` | `0` | device index passed to `xrtDeviceOpen()` |
 | `XDNA2_VERBOSE` | unset | print AIE metadata, resource info and firmware version at init |
 | `COLI_NPU_KERNEL_DIR` | `npu/kernels` | where `*.npukernel` artifacts are looked up |
 | `COLI_NPU_KERNELS` | unset | colon-separated artifacts to preload |
@@ -226,7 +260,10 @@ been reintroduced and must be removed.
    (`/dev/accel/accel0`); `/dev/dri` is the iGPU.
 7. **No INT4 MACs.** AIE-2 has no int4 datapath. Expand with
    `xdna2_dequant_int4()` and run an INT8 kernel.
-8. **Do not widen the shape match.** Kernel lookup is an exact match on
+8. **No XRT execution path without XRT artifacts.** `XDNA2_DRIVER=xrt`
+   validates the official stack; it does not pretend to dispatch through it.
+   An XRT run path may only be added together with real `.xclbin` artifacts.
+9. **Do not widen the shape match.** Kernel lookup is an exact match on
    (rows, inner_dim, out_cols, fmt). Approximate matching would dispatch a
    kernel against a buffer it was not compiled for.
 

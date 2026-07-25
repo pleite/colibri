@@ -36,6 +36,10 @@ endif()
 
 if(DEFINED ENV{XILINX_XRT})
     set(XRT_DIR "$ENV{XILINX_XRT}")
+elseif(EXISTS "/opt/xilinx/xrt")
+    # Default prefix of an XRT build installed together with the XDNA shim
+    # plugin (libxrt_driver_xdna); see docs/xdna_shim_guide.md.
+    set(XRT_DIR "/opt/xilinx/xrt")
 elseif(EXISTS "/opt/xrt")
     set(XRT_DIR "/opt/xrt")
 else()
@@ -50,6 +54,17 @@ if(XRT_DIR)
         add_definitions(-DCOLI_NPU_XRT_AVAILABLE)
         include_directories(${XRT_INCLUDE_DIRS})
         link_directories(${XRT_LINK_DIRS})
+        # The shim is what teaches XRT to drive /dev/accel/accel0. Its absence
+        # is not fatal: the XRT probe then reports the device as unusable and
+        # the DRM ioctl control plane stays in charge.
+        file(GLOB XDNA_SHIM_LIBS "${XRT_DIR}/lib64/libxrt_driver_xdna.so*"
+                                 "${XRT_DIR}/lib/libxrt_driver_xdna.so*")
+        if(XDNA_SHIM_LIBS)
+            message(STATUS "XDNA shim found: ${XDNA_SHIM_LIBS}")
+        else()
+            message(STATUS "XDNA shim (libxrt_driver_xdna) not installed — "
+                           "XRT will not open the NPU")
+        endif()
     else()
         message(STATUS "XRT not found — NPU will use DRM ioctl path only")
     endif()
@@ -61,11 +76,13 @@ endif()
 
 set(NPU_SOURCES
     npu_kernels/xdna2_driver.c
+    npu_kernels/xdna2_xrt_driver.c
     npu_kernels/xdna2_matmul.c
 )
 
 set(NPU_HEADERS
     npu_kernels/xdna2_driver.h
+    npu_kernels/xdna2_xrt_driver.h
     npu_kernels/xdna2_matmul.h
     npu_kernels/npu_runtime.h
 )

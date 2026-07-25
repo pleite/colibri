@@ -22,6 +22,7 @@
 #include <stdbool.h>
 
 #include "xdna2_driver.h"
+#include "xdna2_xrt_driver.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +88,9 @@ typedef struct {
     xdna2_kernel_t  kernels[XDNA2_MAX_KERNELS];
     int             kernel_count;
     uint32_t        timeout_ms;   /* Command wait timeout, default 5000 */
+    /* Control plane the device was validated through (never AUTO). Dispatch
+     * itself is always DRM ioctls; see xdna2_xrt_driver.h. */
+    xdna2_control_plane_t control_plane;
     bool            initialized;
 } xdna2_runtime_t;
 
@@ -96,6 +100,10 @@ typedef struct {
 
 /**
  * xdna2_runtime_init — open the NPU, create a hardware context.
+ *
+ * The control plane is chosen from XDNA2_DRIVER (auto, drm, xrt); see
+ * xdna2_xrt_driver.h. Returns -EINVAL for an unknown value and -ENOSYS when
+ * XDNA2_DRIVER=xrt but the XRT/XDNA shim stack is unusable.
  *
  * Returns 0 on success, negative on failure. On failure the runtime owns no
  * resources and must not be shut down.

@@ -8,6 +8,32 @@ Complete guide for building and integrating the XDNA shim library that teaches X
 
 ---
 
+## Status in this repository (validated)
+
+The guide below is upstream material. Only the part of it that can be verified
+against hardware has been implemented:
+
+* **Implemented** — `c/npu_kernels/xdna2_xrt_driver.{c,h}`: an XRT availability
+  probe built against the official `<xrt/xrt_device.h>` (only when the build
+  finds XRT and defines `COLI_NPU_XRT_AVAILABLE`), plus the `XDNA2_DRIVER=auto|drm|xrt`
+  policy consumed by `xdna2_runtime_init()`. `XDNA2_DRIVER=xrt` fails with
+  `-ENOSYS` when XRT or the shim is missing.
+* **Not implemented, deliberately** — an XRT dispatch path
+  (`xrtKernelOpen` / `xrtRunStart` / `xrtRunWait`). It needs `.xclbin`
+  artifacts and a kernel argument convention from the AIE toolchain; this
+  repository only has the `.npukernel` container that the DRM path consumes.
+  Writing submit/wait against artifacts that do not exist would be a guessed
+  ABI, which the NPU guardrails forbid
+  (`docs/strix-halo-npu.md` §6). Add it *with* the artifacts, not before.
+* **Unchanged** — the DRM ioctl path remains the only dataflow, and the
+  Strix Halo exclusivity and the no-CPU-fallback rule are untouched. The
+  `vnni-int8-matmul` tree links the probe but never links XRT.
+
+The "Files to Create/Modify" and "Testing Strategy" sections below therefore
+describe the *remaining* work, not the current state.
+
+---
+
 ## What is the XDNA Shim?
 
 The XDNA shim is a **SHIM library** that bridges XRT (Xilinx Runtime) to the /dev/accel/accel0 device. XRT itself doesn't know how to drive the NPU device - it needs this shim library.

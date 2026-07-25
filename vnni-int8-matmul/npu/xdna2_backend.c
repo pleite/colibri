@@ -51,10 +51,24 @@ static int ensure_runtime(void) {
 
     int ret = xdna2_runtime_init(&g_runtime);
     if (ret < 0) {
-        g_failure_reason = (ret == -ENODEV)
-            ? "cannot open /dev/accel/accel0 (is the amdxdna module loaded and "
-              "the device passed into the container?)"
-            : "failed to create an XDNA 2 hardware context";
+        switch (ret) {
+            case -ENODEV:
+                g_failure_reason =
+                    "cannot open /dev/accel/accel0 (is the amdxdna module loaded "
+                    "and the device passed into the container?)";
+                break;
+            case -ENOSYS:
+                g_failure_reason =
+                    "XDNA2_DRIVER=xrt was requested but the XRT/XDNA shim stack "
+                    "is unusable on this host";
+                break;
+            case -EINVAL:
+                g_failure_reason = "XDNA2_DRIVER is not auto, drm or xrt";
+                break;
+            default:
+                g_failure_reason = "failed to create an XDNA 2 hardware context";
+                break;
+        }
         return 0;
     }
 
