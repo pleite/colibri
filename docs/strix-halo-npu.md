@@ -49,15 +49,41 @@ vnni-int8-matmul/tests/
 strix_xdna2_matmul()
   └─ xdna2_matmul_int8()
        ├─ xdna2_find_kernel(shape)          fixed-shape lookup; NULL ⇒ hard fail
-       ├─ xdna2_create_bo() × 3             activations, weights, output (AMDXDNA_BO_SHARE)
+       ├─ xdna2_create_bo() × 3             activations, weights, output (AMDXDNA_BO_SHMEM)
        ├─ xdna2_map_bo()  + memcpy          host writes
        ├─ xdna2_sync_bo(TO_DEVICE)          cache maintenance
        ├─ build ERT packet in an AMDXDNA_BO_CMD buffer
        ├─ xdna2_submit_command()            DRM_IOCTL_AMDXDNA_EXEC_CMD → seq
-       ├─ xdna2_wait_command()              DRM_IOCTL_AMDXDNA_WAIT_CMD on that seq
+       ├─ xdna2_wait_command()              DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT at point seq
        ├─ xdna2_sync_bo(FROM_DEVICE)
        └─ memcpy out + per-column scale
 ```
+
+### Context lifetime
+
+`xdna2_runtime_init()` must set up the client before any work is submitted:
+
+```
+xdna2_open_device()                       /dev/accel/accel0
+  └─ xdna2_create_hwctx()
+       ├─ xdna2_create_bo(AMDXDNA_BO_DEV_HEAP)   one heap per open fd, ≤ 64 MiB
+       ├─ xdna2_create_bo(AMDXDNA_BO_CMD) × 2    UMQ + log buffers
+       └─ DRM_IOCTL_AMDXDNA_CREATE_HWCTX         → handle, timeline syncobj
+```
+
+The device heap is not optional. `aie2_hwctx_init()` looks up
+`client->dev_heap` and fails with `-ENOENT` if it is absent, and every
+`AMDXDNA_BO_DEV` allocation (the DPU instruction streams) is sub-allocated from
+it. `-ENOENT` here means "no device heap", not "ioctl unsupported" — an
+unsupported ioctl returns `ENOTTY`.
+
+Completion is reported on the per-context **timeline** syncobj returned by
+`CREATE_HWCTX`: the kernel calls `drm_syncobj_add_point(syncobj, chain,
+out_fence, seq)` for every job, so the `seq` returned by `EXEC_CMD` is the
+timeline point to wait on. The mainline UAPI has no `WAIT_CMD` ioctl;
+`DRM_IOCTL_AMDXDNA_WAIT_CMD` exists only in AMD's out-of-tree `xdna-driver`
+headers, which is why building against distribution kernel headers cannot find
+it.
 
 ### Kernel artifacts
 
@@ -112,7 +138,9 @@ hand-copied kernel structures and magic constants instead of the UAPI.
 | `xdna2_destroy_bo()` never issued `DRM_IOCTL_GEM_CLOSE` | one GEM handle leaked per allocation until the handle table filled | Issue `GEM_CLOSE` |
 | UMQ and log BOs destroyed immediately after `CREATE_HWCTX` | context referenced BOs whose handles were already closed | Context owns both BOs for its lifetime |
 | `ctx->syncobj_handle = exec_cmd.seq` | a 64-bit sequence number truncated into the syncobj handle, destroying it | Store `seq` in `ctx->last_seq` |
-| `xdna2_wait_command()` returned success unconditionally | results read before the NPU finished | `DRM_IOCTL_AMDXDNA_WAIT_CMD` on `last_seq` |
+| `xdna2_wait_command()` returned success unconditionally | results read before the NPU finished | Wait on the hardware context's timeline syncobj at point `last_seq` |
+| `CREATE_HWCTX` issued without a device heap | `aie2_hwctx_init()` returns `-ENOENT` ("The client dev heap object not exist"), so the NPU never initialises | `xdna2_create_hwctx()` allocates an `AMDXDNA_BO_DEV_HEAP` first and owns it for the context lifetime |
+| `DRM_AMDXDNA_QUERY_RESOURCE_INFO` and `AMDXDNA_QOS_*` used unconditionally | build failure on every shipping kernel-headers package — both post-date Linux 6.18 | Build-system probe defines `COLI_HAVE_XDNA2_RESOURCE_INFO`; the QoS hint falls back to the driver default |
 | `xdna2_runtime_init()` created the hwctx in a stack local | hwctx and device fd leaked on every init | Runtime owns the hwctx; `shutdown` releases it |
 | Every matmul path ended in `strix_cpu_matmul()` | NPU benchmarks silently measured the CPU | Removed; unsupported shapes return `-ENOENT` |
 | Local re-declarations of every ioctl struct | fragile against UAPI evolution | Use `struct amdxdna_drm_*` throughout |
@@ -192,7 +220,8 @@ been reintroduced and must be removed.
    before hardcoding anything.
 5. **No silent waits.** Every submission must be followed by
    `xdna2_wait_command()`. A wait that returns success without asking the kernel
-   is worse than no wait at all.
+   is worse than no wait at all — stubbing it out to make a build pass turns a
+   loud failure into silently wrong numerics.
 6. **No `/dev/dri/card1` for the NPU.** The NPU is an accel node
    (`/dev/accel/accel0`); `/dev/dri` is the iGPU.
 7. **No INT4 MACs.** AIE-2 has no int4 datapath. Expand with
@@ -206,10 +235,12 @@ been reintroduced and must be removed.
 ## 7. References
 
 * Linux kernel UAPI: `include/uapi/drm/amdxdna_accel.h` — ioctl numbers,
-  `enum amdxdna_drm_get_param`, `enum amdxdna_bo_type`, `enum amdxdna_cmd_type`,
-  `struct amdxdna_drm_wait_cmd`.
+  `enum amdxdna_drm_get_param`, `enum amdxdna_bo_type`, `enum amdxdna_cmd_type`.
 * Linux kernel driver: `drivers/accel/amdxdna/` (in-tree since 6.14).
-* Linux DRM UAPI: `include/uapi/drm/drm.h` — `DRM_IOCTL_GEM_CLOSE`.
+  `aie2_ctx.c` shows the device-heap requirement and `drm_syncobj_add_point()`
+  signalling that makes `seq` a timeline point.
+* Linux DRM UAPI: `include/uapi/drm/drm.h` — `DRM_IOCTL_GEM_CLOSE`,
+  `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`, `struct drm_syncobj_timeline_wait`.
 * AMD XDNA driver and XRT userspace: <https://github.com/amd/xdna-driver>,
   <https://github.com/amd/XRT>.
 * `docs/vulkan_debug_attempts.md` — the iGPU counterpart, and the origin of the

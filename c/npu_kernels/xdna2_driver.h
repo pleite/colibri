@@ -20,6 +20,18 @@
  * in the .c file for the actual definitions.
  */
 
+/* ── Device heap ──
+ *
+ * The amdxdna driver gives each open file descriptor a single device heap and
+ * carves every AMDXDNA_BO_DEV allocation out of it. It must exist before
+ * DRM_IOCTL_AMDXDNA_CREATE_HWCTX, which otherwise fails with -ENOENT
+ * ("The client dev heap object not exist"). The kernel caps it at
+ * AIE2_DEVM_SIZE (64 MiB) and aligns device allocations to dev_mem_buf_shift
+ * (32 KiB). Override the size with the XDNA2_HEAP_BYTES environment variable.
+ */
+#define XDNA2_DEV_HEAP_ALIGN      (32u * 1024u)
+#define XDNA2_DEV_HEAP_MAX_BYTES  (64ull * 1024ull * 1024ull)
+
 /* ── Opaque handles ── */
 
 typedef struct {
@@ -36,14 +48,15 @@ typedef struct {
 typedef struct {
     int fd;                 /* /dev/accel/accel0 file descriptor */
     uint32_t hwctx_handle;  /* Hardware context handle from driver */
+    xdna2_bo_t dev_heap_bo; /* Client device heap, required before CREATE_HWCTX */
     xdna2_bo_t umq_bo;      /* User mode queue BO, owned for the ctx lifetime */
     xdna2_bo_t log_bo;      /* Log buffer BO, owned for the ctx lifetime */
     uint32_t umq_doorbell;  /* Doorbell offset */
     uint32_t num_tiles;     /* Number of AIE tiles allocated */
     uint32_t mem_size;      /* AIE tile memory size */
     uint32_t max_opc;       /* Max operations per cycle */
-    uint32_t syncobj_handle;/* Syncobj returned at hwctx creation */
-    uint64_t last_seq;      /* Sequence number of the last submitted command */
+    uint32_t syncobj_handle;/* Timeline syncobj returned at hwctx creation */
+    uint64_t last_seq;      /* Timeline point of the last submitted command */
     bool initialized;
 } xdna2_hwctx_t;
 
@@ -99,7 +112,9 @@ void xdna2_close_device(int fd);
 /**
  * xdna2_create_hwctx — Create hardware context via DRM ioctl
  *
- * Allocates AIE tiles and sets up the user mode queue.
+ * Allocates the client device heap (see XDNA2_DEV_HEAP_MAX_BYTES), then the
+ * AIE tiles and the user mode queue. The heap is owned by the context and
+ * released by xdna2_destroy_hwctx().
  * Returns 0 on success, negative on failure.
  */
 int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
@@ -118,7 +133,9 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx);
 /**
  * xdna2_create_bo — Create a buffer object
  *
- * type: AMDXDNA_BO_SHARE (host-visible) or AMDXDNA_BO_DEV (device heap)
+ * type: one of enum amdxdna_bo_type — AMDXDNA_BO_SHMEM (host-visible; the
+ * AMDXDNA_BO_SHARE alias only exists in newer headers), AMDXDNA_BO_DEV_HEAP,
+ * AMDXDNA_BO_DEV (carved out of the heap) or AMDXDNA_BO_CMD.
  */
 int xdna2_create_bo(int fd, xdna2_bo_t *bo, uint64_t size, uint32_t type);
 
@@ -166,8 +183,11 @@ int xdna2_submit_command(int fd, xdna2_hwctx_t *ctx,
 /**
  * xdna2_wait_command — Block until ctx->last_seq has completed
  *
+ * Waits on the hardware context's timeline syncobj at point ctx->last_seq;
+ * the mainline amdxdna UAPI exposes no WAIT_CMD ioctl.
  * timeout_ms: milliseconds to wait; 0 means wait forever.
- * Returns 0 on success, negative on failure or timeout.
+ * Returns 0 on success, negative on failure or timeout. It never reports
+ * success without the command having completed.
  */
 int xdna2_wait_command(int fd, xdna2_hwctx_t *ctx, uint32_t timeout_ms);
 

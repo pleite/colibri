@@ -3,6 +3,12 @@
 # strix-halo-podman-test.sh — build and run the Strix Halo building blocks
 # inside a headless Podman container.
 #
+# The container is built from Dockerfile.strix-halo-test, which layers the build
+# toolchain (ld, kernel UAPI headers, Vulkan headers) on top of the community
+# Strix Halo toolbox image. The toolbox image alone cannot compile this tree:
+# it has no linker and no kernel headers. Do not work around that with an
+# ad-hoc `ln -sf /usr/bin/ld.bfd /usr/bin/ld` in the test step — fix the image.
+#
 # Headless by design: the Vulkan backend requests zero instance extensions, so
 # no X11 socket, no Wayland socket, no DISPLAY and no Xvfb are needed. Passing a
 # display server into the container is not a fix for anything and is therefore
@@ -14,17 +20,20 @@
 #   /dev/accel/accel0 XDNA 2 NPU (amdxdna accel node)
 #
 # Environment overrides:
-#   CONTAINER_IMAGE   container image to run
+#   BASE_IMAGE        upstream toolbox image the harness image is built from
+#   CONTAINER_IMAGE   run this image as-is instead of building one
 #   CONTAINER_NAME    container name
 #   VNNI_VULKAN_ICD   path to the RADV ICD manifest inside the container
 #   SKIP_NPU=1        do not require/pass the NPU device
+#   REQUIRE_NPU=1     fail instead of warning when the NPU node is absent
 
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vnni_dir="$(cd "${script_dir}/.." && pwd)"
 repo_dir="$(cd "${vnni_dir}/.." && pwd)"
-container_image="${CONTAINER_IMAGE:-docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv}"
+base_image="${BASE_IMAGE:-docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv}"
+harness_image="${CONTAINER_IMAGE:-localhost/colibri-strix-halo-test:latest}"
 container_name="${CONTAINER_NAME:-colibri-vnni-strix-halo-test}"
 log_path="${vnni_dir}/test_output.log"
 container_vulkan_icd="${VNNI_VULKAN_ICD:-/usr/share/vulkan/icd.d/radeon_icd.x86_64.json}"
@@ -56,15 +65,28 @@ npu_args=()
 if [[ "${SKIP_NPU:-0}" != "1" ]]; then
     if [[ -e "${npu_device}" ]]; then
         npu_args+=(--device "${npu_device}")
+    elif [[ "${REQUIRE_NPU:-0}" == "1" ]]; then
+        echo "REQUIRE_NPU=1 but ${npu_device} does not exist" >&2
+        echo "load the amdxdna module (Linux >= 6.14) and retry" >&2
+        exit 1
     else
         echo "warning: ${npu_device} not found; NPU tests will report SKIP." >&2
         echo "         load the amdxdna module, or set SKIP_NPU=1 to silence this." >&2
     fi
 fi
 
-if ! podman image exists "${container_image}" 2>/dev/null; then
-    echo "Pulling Strix Halo container image: ${container_image}"
-    podman pull "${container_image}"
+if [[ -n "${CONTAINER_IMAGE:-}" ]]; then
+    if ! podman image exists "${harness_image}" 2>/dev/null; then
+        echo "Pulling ${harness_image}"
+        podman pull "${harness_image}"
+    fi
+else
+    echo "Building harness image ${harness_image} from ${base_image}"
+    podman build \
+        --build-arg "BASE_IMAGE=${base_image}" \
+        -f "${vnni_dir}/Dockerfile.strix-halo-test" \
+        -t "${harness_image}" \
+        "${vnni_dir}"
 fi
 
 podman_args=(
@@ -86,10 +108,21 @@ podman_args=(
     --workdir /work/vnni-int8-matmul
 )
 
-podman_args+=("${container_image}" bash -lc '
+podman_args+=("${harness_image}" bash -lc '
 set -euo pipefail
 echo "--- toolchain ---"
 gcc --version | head -1
+command -v ld >/dev/null || {
+    echo "no linker in the image; rebuild it from Dockerfile.strix-halo-test" >&2
+    exit 1
+}
+ld --version | head -1
+echo "--- kernel uapi ---"
+test -f /usr/include/drm/amdxdna_accel.h || {
+    echo "<drm/amdxdna_accel.h> missing; install kernel-headers >= 6.14 in the image" >&2
+    exit 1
+}
+echo "amdxdna UAPI present"
 echo "--- vulkan loader ---"
 ls -l /usr/lib64/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 2>/dev/null || true
 test -f "${VK_ICD_FILENAMES}" || { echo "ICD manifest ${VK_ICD_FILENAMES} not found" >&2; exit 1; }
@@ -104,7 +137,7 @@ make test
 ')
 
 : > "${log_path}"
-printf 'Running headless Strix Halo Podman harness with image %s\n' "${container_image}" | tee "${log_path}"
+printf 'Running headless Strix Halo Podman harness with image %s\n' "${harness_image}" | tee "${log_path}"
 {
     podman "${podman_args[@]}"
 } 2>&1 | tee -a "${log_path}"

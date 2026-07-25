@@ -187,11 +187,19 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
      * array; 16 cores with 32 KiB of tile memory each is the smallest
      * partition that keeps a 4096-wide reduction resident.
      */
+#ifdef AMDXDNA_QOS_HIGH_PRIORITY
+    const uint32_t qos_priority = AMDXDNA_QOS_HIGH_PRIORITY;
+#else
+    /* The AMDXDNA_QOS_* priority hints post-date Linux 6.18 and are absent
+     * from shipping kernel headers. Zero leaves the driver default in place;
+     * the value is deliberately not hard-coded here. */
+    const uint32_t qos_priority = 0;
+#endif
     if (xdna2_create_hwctx(runtime->device_fd, &runtime->hwctx,
                            /* num_tiles */ 16,
                            /* mem_size  */ 32768,
                            /* max_opc   */ 4,
-                           /* qos       */ AMDXDNA_QOS_HIGH_PRIORITY) < 0) {
+                           /* qos       */ qos_priority) < 0) {
         xdna2_close_device(runtime->device_fd);
         runtime->device_fd = -1;
         return -EIO;
@@ -275,6 +283,8 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
     int fd = runtime->device_fd;
     int ret;
 
+    /* AMDXDNA_BO_SHMEM is the canonical name in enum amdxdna_bo_type; the
+     * AMDXDNA_BO_SHARE alias (same value) only exists in newer headers. */
     if ((ret = alloc_and_map(fd, &bos.x, x_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
     if ((ret = alloc_and_map(fd, &bos.w, w_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;
     if ((ret = alloc_and_map(fd, &bos.y, y_bytes, AMDXDNA_BO_SHMEM)) < 0) goto out;

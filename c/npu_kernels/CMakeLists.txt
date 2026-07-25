@@ -20,6 +20,18 @@ if(NOT HAVE_AMDXDNA_UAPI)
 endif()
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
+# DRM_AMDXDNA_QUERY_RESOURCE_INFO was added to the amdxdna UAPI after Linux
+# 6.18. Probe for it rather than assuming; xdna2_driver.c reports the query as
+# unavailable when it is missing instead of re-declaring kernel types.
+include(CheckCSourceCompiles)
+check_c_source_compiles("
+#include <drm/amdxdna_accel.h>
+int main(void) { return (int)DRM_AMDXDNA_QUERY_RESOURCE_INFO; }
+" HAVE_AMDXDNA_QUERY_RESOURCE_INFO)
+if(HAVE_AMDXDNA_QUERY_RESOURCE_INFO)
+    add_definitions(-DCOLI_HAVE_XDNA2_RESOURCE_INFO)
+endif()
+
 # ── XRT paths (optional) ──
 
 if(DEFINED ENV{XILINX_XRT})
