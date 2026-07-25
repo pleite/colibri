@@ -73,6 +73,7 @@ typedef uint32_t VkCommandBufferUsageFlags;
 
 typedef void (*PFN_vkVoidFunction)(void);
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char *);
+typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char *);
 
 typedef VkResult (*PFN_vkCreateInstance)(const VkInstanceCreateInfo *, const void *, VkInstance *);
 typedef void (*PFN_vkDestroyInstance)(VkInstance, const void *);
