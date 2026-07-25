@@ -34,7 +34,12 @@ concurrency:
 jobs:
   test-vulkan:
     name: VNNI self-hosted GPU tests
-    runs-on: [self-hosted, strix-halo, vulkan]
+    # The one self-hosted machine is registered with the default labels only
+    # (`self-hosted, linux, x64`) — the same set `container-images.yml` targets.
+    # Requiring `strix-halo`/`vulkan` here left every run queued forever with no
+    # matching runner. The "Assert the runner is really Strix Halo" step below
+    # is what actually guarantees the silicon, so labelling adds nothing.
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
 
     env:

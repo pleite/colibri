@@ -1848,9 +1848,7 @@ static void check_and_evict_if_needed(qwen35_model *m) {
 static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int steps,
                       int *out_tokens, float temperature, float top_p, float min_p, int top_k, unsigned int seed,
                       int cache_slot) {
-#if COLI_HAS_BACKEND
-    double _run_start = get_time_ms();
-#endif
+    const double run_start_ms = get_time_ms();
     float *hidden = (float *)qwen_malloc((size_t)m->hidden_size * sizeof(float));
     for (int layer = 0; layer < m->num_layers; layer++) {
         QLayer *cur = &m->layers[layer];
@@ -2077,7 +2075,12 @@ static void run_model(qwen35_model *m, const int *tokens, int n_tokens, int step
         }
         out_tokens[step] = best;
         free(logits);
+        if (step == n_tokens - 1) {
+            g_prompt_time_ms = get_time_ms() - run_start_ms;
+        }
     }
+    g_generation_time_ms = get_time_ms() - run_start_ms;
+    g_total_tokens = steps;
     model_debug("run_model complete: total memory used=%zu/%zu, routed experts=%zu", get_mem_total_used(), g_ram_limit_bytes, get_mem_used(MEM_CAT_ROUTED_EXPERTS));
     free(hidden);
 }
@@ -2185,11 +2188,8 @@ static void run_server(qwen35_model *model, int max_tokens, float temperature, f
                 fprintf(stdout, "%d", out[i]);
             }
             printf("\x01\x01END\x01\x01\n");
-            printf("STAT %d 0.00 0.0 0.00\n", max_tokens_request);
-#if COLI_HAS_BACKEND
-    g_generation_time_ms = get_time_ms() - _run_start;
-    g_total_tokens = steps;
-#endif
+            printf("STAT %d %.2f 0.0 0.00\n", max_tokens_request,
+                   g_generation_time_ms > 0.0 ? (double)g_total_tokens / (g_generation_time_ms / 1000.0) : 0.0);
 
             fflush(stdout);
             free(tokens);
@@ -2240,6 +2240,8 @@ int main(int argc, char **argv) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--debug") || !strcmp(argv[i], "--verbose")) {
             debug_enabled = true;
+        } else if (!strcmp(argv[i], "--profile")) {
+            profile_enabled = true;
         } else if (!strcmp(argv[i], "--ram-limit-mb")) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "error: missing value for --ram-limit-mb\n");
@@ -2283,6 +2285,16 @@ int main(int argc, char **argv) {
     run_model(&model, tokens, n_tokens, steps, out, temperature, top_p, min_p, top_k, seed, 0);
     for (int i = 0; i < steps; i++) {
         printf("%d\n", out[i]);
+    }
+    if (profile_enabled) {
+        const double gen_ms = g_generation_time_ms - g_prompt_time_ms;
+        fprintf(stderr, "[profile] tokens=%d prompt=%.2fms generation=%.2fms total=%.2fms",
+                g_total_tokens, g_prompt_time_ms, gen_ms, g_generation_time_ms);
+        if (g_generation_time_ms > 0.0) {
+            fprintf(stderr, " throughput=%.2f tok/s",
+                    (double)g_total_tokens / (g_generation_time_ms / 1000.0));
+        }
+        fputc('\n', stderr);
     }
     free(tokens);
     free(out);
