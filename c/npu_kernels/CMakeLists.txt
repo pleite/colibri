@@ -6,7 +6,18 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # ── Compiler flags ──
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -march=native -Wall -Wextra")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -march=native -Wall -Wextra -D_GNU_SOURCE")
+
+# The XDNA 2 driver talks to the kernel through the amdxdna UAPI header. It
+# ships with Linux >= 6.14 kernel headers; there is no vendored copy and no
+# emulation path, because this code targets Strix Halo hardware only.
+include(CheckIncludeFile)
+check_include_file("drm/amdxdna_accel.h" HAVE_AMDXDNA_UAPI)
+if(NOT HAVE_AMDXDNA_UAPI)
+    message(FATAL_ERROR
+        "<drm/amdxdna_accel.h> not found. Install kernel headers >= 6.14 "
+        "(Fedora: kernel-headers; Debian/Ubuntu: linux-libc-dev).")
+endif()
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # ── XRT paths (optional) ──

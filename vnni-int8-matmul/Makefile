@@ -1,16 +1,63 @@
+# Strix Halo INT8 matmul building blocks.
+#
+# Target: AMD Ryzen AI Max+ 395 "Strix Halo" only — AVX-512 VNNI CPU, RADV
+# GFX1151 iGPU, XDNA 2 NPU. There are no portable or fallback build variants:
+# these are inference building blocks for one machine.
+#
+# Build requirements:
+#   * gcc with AVX-512 VNNI support
+#   * Vulkan headers            (vulkan-headers / libvulkan-dev)
+#   * Linux amdxdna UAPI header (<drm/amdxdna_accel.h>, kernel >= 6.14)
+#   * glslangValidator          (only to regenerate gpu/comp.spv)
+
 CC ?= gcc
 CFLAGS ?= -O3 -Wall -Wextra -std=c11
-CPPFLAGS += -I.
+CPPFLAGS += -I. -I.. -D_GNU_SOURCE
 LDFLAGS += -lm -ldl
 
-# Strix Halo targets require AVX-512 VNNI support. The default build uses the
-# required flags for that target; override CPU_FLAGS only if you need a custom
-# toolchain configuration.
+# Strix Halo targets require AVX-512 VNNI support.
 CPU_FLAGS ?= -mavx512f -mavx512vnni -mavx512bw -mavx512dq
 
-all: tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness
+GLSLANG ?= glslangValidator
 
-tests/test_backends: tests/test_backends.o cpu/vnni_cpu_backend.o gpu/vulkan_backend.o npu/xdna2_backend.o
+NPU_DIR := ../c/npu_kernels
+
+TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
+         tests/npu_device_test
+
+all: $(TESTS)
+
+# ── Shader ────────────────────────────────────────────────────────────────────
+# gpu/comp.spv is committed so the backend works without glslang installed.
+# Use `make shader` to regenerate it from gpu/comp.comp after editing the GLSL.
+shader:
+	$(GLSLANG) -V gpu/comp.comp -o gpu/comp.spv
+
+# ── Objects ───────────────────────────────────────────────────────────────────
+
+cpu/vnni_cpu_backend.o: cpu/vnni_cpu_backend.c cpu/vnni_cpu_backend.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(CPU_FLAGS) -c $< -o $@
+
+gpu/vulkan_backend.o: gpu/vulkan_backend.c gpu/vulkan_backend.h gpu/vulkan_dispatch.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(NPU_DIR)/xdna2_driver.o: $(NPU_DIR)/xdna2_driver.c $(NPU_DIR)/xdna2_driver.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o $(NPU_DIR)/xdna2_matmul.o
+
+tests/%.o: tests/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# ── Binaries ──────────────────────────────────────────────────────────────────
+
+tests/test_backends: tests/test_backends.o cpu/vnni_cpu_backend.o gpu/vulkan_backend.o $(NPU_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 tests/vulkan_runtime_test: tests/vulkan_runtime_test.o gpu/vulkan_backend.o cpu/vnni_cpu_backend.o
@@ -19,33 +66,21 @@ tests/vulkan_runtime_test: tests/vulkan_runtime_test.o gpu/vulkan_backend.o cpu/
 tests/vulkan_debug_harness: tests/vulkan_debug_harness.o gpu/vulkan_backend.o cpu/vnni_cpu_backend.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-cpu/vnni_cpu_backend.o: cpu/vnni_cpu_backend.c cpu/vnni_cpu_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(CPU_FLAGS) -c $< -o $@
+tests/npu_device_test: tests/npu_device_test.o $(NPU_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-gpu/vulkan_backend.o: gpu/vulkan_backend.c gpu/vulkan_backend.h cpu/vnni_cpu_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+# ── Test / clean ──────────────────────────────────────────────────────────────
 
-npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h cpu/vnni_cpu_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-tests/test_backends.o: tests/test_backends.c cpu/vnni_cpu_backend.h gpu/vulkan_backend.h npu/xdna2_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-tests/vulkan_runtime_test.o: tests/vulkan_runtime_test.c gpu/vulkan_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-tests/vulkan_debug_harness.o: tests/vulkan_debug_harness.c gpu/vulkan_backend.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-test: tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness
+test: $(TESTS)
 	./tests/test_backends
 	./tests/vulkan_runtime_test
 	./tests/vulkan_debug_harness
+	./tests/npu_device_test
 
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
 
 clean:
-	rm -f tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness tests/*.o cpu/*.o npu/*.o gpu/*.o test_output.log
+	rm -f $(TESTS) tests/*.o cpu/*.o npu/*.o gpu/*.o $(NPU_DIR)/*.o test_output.log
 
-.PHONY: all test podman-test clean
+.PHONY: all shader test podman-test clean

@@ -2,154 +2,163 @@
 #define XDNA2_MATMUL_H
 
 /**
- * xdna2_matmul.h — NPU matmul kernel interface for XDNA 2
+ * xdna2_matmul.h — fixed-shape INT8 matmul on the AMD XDNA 2 NPU (Strix Halo).
  *
- * Fixed-shape int8 matrix multiplication for XDNA 2 AIE-2.
- * Each kernel shape requires a separately compiled AIE kernel binary.
+ * Scope and non-goals
+ * -------------------
+ * This is a Strix Halo building block for inference. It is deliberately *not*
+ * portable and it has *no* CPU fallback: when the NPU cannot execute a request
+ * every entry point returns a negative error code so that the caller can decide
+ * what to do. Silently computing on the CPU would hide missing kernels and make
+ * NPU benchmarks meaningless.
  *
- * For shapes not covered by NPU kernels, falls back to CPU implementation.
+ * AIE-2 executes fixed-shape kernels only. A kernel binary is therefore bound
+ * to one (rows, inner_dim, out_cols, fmt) tuple and must be produced ahead of
+ * time by the AMD AIE toolchain. This runtime loads such an artifact, uploads
+ * it to the NPU, and drives the DMA / submit / wait cycle around it.
  */
 
 #include <stdint.h>
+#include <stdbool.h>
+
+#include "xdna2_driver.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── Weight formats ── */
+
+#define XDNA2_FMT_INT8 1
+#define XDNA2_FMT_INT4 2
 
 /* ── Kernel shape descriptor ── */
 
 typedef struct {
-    int32_t rows;        /* Batch size (typically 1 for inference) */
-    int32_t inner_dim;   /* Input dimension (hidden_dim) */
+    int32_t rows;        /* Batch size (1 for single-token decode) */
+    int32_t inner_dim;   /* Input dimension */
     int32_t out_cols;    /* Output dimension */
-    int32_t fmt;         /* Weight format: 0=F32, 1=INT8, 2=INT4 */
+    int32_t fmt;         /* XDNA2_FMT_INT8 or XDNA2_FMT_INT4 */
 } xdna2_matmul_shape_t;
 
-/* ── Kernel handle ── */
+/**
+ * On-disk kernel artifact ("*.npukernel").
+ *
+ * The AIE toolchain (aiecompiler / xclbinutil) is the only thing that can
+ * produce the DPU instruction stream for a given shape. Rather than guessing
+ * at an encoding in C, this runtime consumes a small self-describing container
+ * so the ERT opcode and CU mask travel with the instruction blob:
+ *
+ *   offset  size  field
+ *   0       4     magic      'X','D','N','2' (0x324E4458 little-endian)
+ *   4       4     version    format version, currently 1
+ *   8       4     ert_opcode ERT packet opcode for this kernel
+ *   12      4     cu_mask    compute-unit mask for the ERT packet
+ *   16      4     rows
+ *   20      4     inner_dim
+ *   24      4     out_cols
+ *   28      4     fmt
+ *   32      4     instr_size instruction stream length in bytes
+ *   36      4     instr_words number of 32-bit words the DPU should execute
+ *   40      instr_size  DPU instruction stream
+ *
+ * All fields are little-endian, matching the host.
+ */
+#define XDNA2_KERNEL_MAGIC   0x324E4458u
+#define XDNA2_KERNEL_VERSION 1u
+#define XDNA2_KERNEL_HEADER_BYTES 40u
 
 typedef struct {
     xdna2_matmul_shape_t shape;
-    uint32_t kernel_handle;  /* NPU kernel handle */
-    uint32_t num_args;       /* Number of kernel arguments */
-    uint32_t *arg_sizes;     /* Size of each argument in bytes */
-    int compiled;            /* Whether the kernel binary is loaded */
+    uint32_t   ert_opcode;
+    uint32_t   cu_mask;
+    uint32_t   instr_words;
+    xdna2_bo_t instr_bo;   /* Instruction stream resident on the NPU */
+    bool       loaded;
 } xdna2_kernel_t;
 
-/* ── NPU runtime state ── */
+/* ── Runtime state ── */
+
+#define XDNA2_MAX_KERNELS 16
 
 typedef struct {
-    int device_fd;                     /* /dev/dri/card1 */
-    int initialized;
-    void *cpu_backend;                 /* CPU fallback function pointer */
+    int             device_fd;
+    xdna2_hwctx_t   hwctx;
+    xdna2_kernel_t  kernels[XDNA2_MAX_KERNELS];
+    int             kernel_count;
+    uint32_t        timeout_ms;   /* Command wait timeout, default 5000 */
+    bool            initialized;
 } xdna2_runtime_t;
 
 /* ═══════════════════════════════════════════════════════════
- * Kernel Compilation & Loading
+ * Runtime management
  * ═══════════════════════════════════════════════════════════ */
 
 /**
- * xdna2_compile_kernel — Compile an AIE kernel for a specific shape
+ * xdna2_runtime_init — open the NPU, create a hardware context.
  *
- * Requires aiecompiler (not included in base XRT).
- * Returns kernel handle on success, 0 on failure.
- *
- * In the current implementation, this is a stub that returns 0
- * because aiecompiler is not available. The CPU fallback is used.
- *
- * Future: when aiecompiler is installed, this will:
- *   1. Generate AIE C source for the matmul kernel
- *   2. Compile with aiecompiler to .aie package
- *   3. Package as .xclbin for XRT loading
- *   4. Return kernel handle for runtime execution
- */
-uint32_t xdna2_compile_kernel(const xdna2_matmul_shape_t *shape,
-                               const char *output_path);
-
-/**
- * xdna2_load_kernel — Load a pre-compiled kernel binary
- *
- * Loads a .xclbin or .aie package file into the NPU.
- * Returns kernel handle on success, 0 on failure.
- */
-uint32_t xdna2_load_kernel(const char *kernel_path,
-                            const xdna2_matmul_shape_t *shape);
-
-/**
- * xdna2_free_kernel — Release a kernel handle
- */
-void xdna2_free_kernel(uint32_t kernel_handle);
-
-/* ═══════════════════════════════════════════════════════════
- * Runtime Management
- * ═══════════════════════════════════════════════════════════ */
-
-/**
- * xdna2_runtime_init — Initialize NPU runtime
- *
- * Opens device, creates hardware context, queries capabilities.
- * Returns 0 on success, negative on failure.
+ * Returns 0 on success, negative on failure. On failure the runtime owns no
+ * resources and must not be shut down.
  */
 int xdna2_runtime_init(xdna2_runtime_t *runtime);
 
 /**
- * xdna2_runtime_shutdown — Shutdown NPU runtime
+ * xdna2_runtime_shutdown — release kernels, hardware context and device fd.
+ * Safe to call on a zeroed or already-shut-down runtime.
  */
 void xdna2_runtime_shutdown(xdna2_runtime_t *runtime);
 
 /* ═══════════════════════════════════════════════════════════
- * Matmul Execution
+ * Kernel loading
  * ═══════════════════════════════════════════════════════════ */
 
 /**
- * xdna2_matmul_int8 — Execute int8 matrix multiplication on NPU
- *
- * y = X * W^T (where W is stored as [O x I] matrix)
- *
- * Args:
- *   x:      Input matrix [S x I] (float32)
- *   weights: Weight matrix [O x I] (int8, row-major)
- *   scales: Per-output-row scales [O] (float32)
- *   y:      Output matrix [S x O] (float32)
- *   S:      Batch size (sequence length)
- *   I:      Input dimension
- *   O:      Output dimension
+ * xdna2_load_kernel — load a *.npukernel artifact and upload its instruction
+ * stream to the NPU.
  *
  * Returns 0 on success, negative on failure.
- * Falls back to CPU if NPU kernel not available for this shape.
  */
-int xdna2_matmul_int8(const float *x, const int8_t *weights,
-                       const float *scales, float *y,
-                       int S, int I, int O,
-                       xdna2_runtime_t *runtime);
+int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path);
 
 /**
- * xdna2_matmul_int4 — Execute int4 matrix multiplication on NPU
- *
- * Dequantizes int4 to int8 on-the-fly, then uses int8 kernel.
- * Falls back to CPU for unsupported shapes.
+ * xdna2_find_kernel — look up a loaded kernel by exact shape.
+ * Returns NULL when no kernel matches; the caller must not fall back silently.
  */
-int xdna2_matmul_int4(const float *x, const uint8_t *weights_packed,
-                       const float *scales, float *y,
-                       int S, int I, int O,
-                       xdna2_runtime_t *runtime);
+const xdna2_kernel_t *xdna2_find_kernel(const xdna2_runtime_t *runtime,
+                                        int rows, int inner_dim, int out_cols,
+                                        int fmt);
 
 /* ═══════════════════════════════════════════════════════════
- * Shape Registration
+ * Execution
  * ═══════════════════════════════════════════════════════════ */
 
 /**
- * xdna2_register_shape — Register a kernel shape for automatic selection
+ * xdna2_matmul_int8 — y[S x O] = x[S x I] * weights^T[O x I], per-column scaled.
  *
- * When a matmul request comes in, the runtime checks if a compiled
- * kernel exists for that shape. If yes, uses NPU. If no, falls back
- * to CPU.
+ * x:       int8 activations, row-major [S][I]
+ * weights: int8 weights, row-major [O][I]
+ * scales:  per-output-column f32 scales, or NULL
+ * y:       f32 output, row-major [S][O]
+ *
+ * Returns 0 on success. Returns -ENOENT when no kernel is loaded for this exact
+ * shape; there is no CPU fallback.
  */
-int xdna2_register_shape(xdna2_runtime_t *runtime,
-                          const xdna2_matmul_shape_t *shape,
-                          uint32_t kernel_handle);
+int xdna2_matmul_int8(xdna2_runtime_t *runtime,
+                      const int8_t *x, const int8_t *weights,
+                      const float *scales, float *y,
+                      int S, int I, int O);
 
 /**
- * xdna2_find_kernel — Find a compiled kernel for a given shape
+ * xdna2_dequant_int4 — expand packed int4 weights to int8, two nibbles per
+ * byte, zero point 8. Output buffer must hold O*I bytes.
  *
- * Returns kernel handle if found, 0 if not (caller should use CPU).
+ * The AIE-2 MAC datapath has no int4 mode, so int4 weights must be widened
+ * before they can be fed to an int8 kernel.
  */
-uint32_t xdna2_find_kernel(xdna2_runtime_t *runtime,
-                            int rows, int inner_dim, int out_cols);
+void xdna2_dequant_int4(const uint8_t *packed, int8_t *out, int O, int I);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* XDNA2_MATMUL_H */
