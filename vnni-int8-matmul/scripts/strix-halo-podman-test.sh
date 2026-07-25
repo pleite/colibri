@@ -24,7 +24,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vnni_dir="$(cd "${script_dir}/.." && pwd)"
 repo_dir="$(cd "${vnni_dir}/.." && pwd)"
-container_image="${CONTAINER_IMAGE:-docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv}"
+container_image="${CONTAINER_IMAGE:-ghcr.io/pleite/colibri-vulkan:latest}"
 container_name="${CONTAINER_NAME:-colibri-vnni-strix-halo-test}"
 log_path="${vnni_dir}/test_output.log"
 container_vulkan_icd="${VNNI_VULKAN_ICD:-/usr/share/vulkan/icd.d/radeon_icd.x86_64.json}"
