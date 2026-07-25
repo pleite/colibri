@@ -92,6 +92,51 @@ jobs:
             vnni-int8-matmul/test_output.log
 ```
 
+## Forcing a run, and what to check when nothing runs
+
+The workflow is dispatchable:
+
+* Actions → **VNNI GPU Tests** → **Run workflow**, or
+* `gh workflow run vnni-test.yml --ref <branch>`
+
+Inputs:
+
+| Input | Default | Effect |
+|---|---|---|
+| `base_image` | `ghcr.io/pleite/colibri-vulkan:latest` | base the harness image is layered on |
+| `require_npu` | `true` | fail when `/dev/accel/accel0` is absent |
+| `skip_npu` | `false` | do not pass the NPU device through at all |
+
+Use `require_npu=false` to exercise the CPU and Vulkan paths while the NPU is
+unavailable; leave it `true` for normal runs so a missing accel node is a red
+run rather than a silent SKIP.
+
+### Runs stuck in "queued"
+
+A queued run that never starts is **always** a runner problem, never a workflow
+problem: GitHub has no runner online matching `[self-hosted, strix-halo,
+vulkan]`. Note that `container-images.yml` targets `[self-hosted, linux, x64]`,
+so if both workflows queue, the runner is offline rather than mislabelled.
+
+On the Strix Halo host:
+
+```bash
+sudo systemctl status actions-runner      # or: ./svc.sh status
+sudo systemctl start actions-runner
+sudo journalctl -u actions-runner -n 100 --no-pager
+```
+
+Then confirm on GitHub under Settings → Actions → Runners that the runner is
+**Idle** and carries all three labels. Cancel the backlog before re-running:
+
+```bash
+gh run list --workflow vnni-test.yml --status queued \
+  --json databaseId --jq '.[].databaseId' | xargs -rn1 gh run cancel
+```
+
+The workflow sets `concurrency: cancel-in-progress`, so future downtime
+supersedes stale runs instead of accumulating them.
+
 ## Step 3: Test Workflow
 
 ### 3.1 Push Test Commit

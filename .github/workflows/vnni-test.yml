@@ -6,26 +6,91 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base_image:
+        description: Base image the harness image is layered on
+        required: false
+        default: ghcr.io/pleite/colibri-vulkan:latest
+      require_npu:
+        description: Fail the run when /dev/accel/accel0 is absent
+        type: boolean
+        required: false
+        default: true
+      skip_npu:
+        description: Do not pass the NPU device into the container
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
+
+# Only one run per ref. The self-hosted runner is a single machine, so without
+# this a period of downtime leaves a queue of superseded runs behind.
+concurrency:
+  group: vnni-test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-vulkan:
     name: VNNI self-hosted GPU tests
     runs-on: [self-hosted, strix-halo, vulkan]
+    timeout-minutes: 45
+
+    env:
+      BASE_IMAGE: ${{ inputs.base_image || 'ghcr.io/pleite/colibri-vulkan:latest' }}
+      REQUIRE_NPU: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_npu == false) && '0' || '1' }}
+      SKIP_NPU: ${{ (github.event_name == 'workflow_dispatch' && inputs.skip_npu == true) && '1' || '0' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Printed before anything can fail, so a forced run is useful even when a
+      # backend is missing. Every command is tolerant: this step reports, it
+      # does not gate.
+      - name: Runner preflight
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "## Runner preflight" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```text'
+            echo "kernel:  $(uname -r)"
+            echo "cpu:     $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "podman:  $(podman --version 2>/dev/null || echo 'not installed')"
+            echo "amdxdna: $(lsmod 2>/dev/null | grep -c '^amdxdna') module(s) loaded"
+            echo "avx512_vnni: $(grep -c avx512_vnni /proc/cpuinfo) thread(s)"
+            echo "--- devices ---"
+            ls -l /dev/dri /dev/kfd 2>&1 || true
+            ls -l /dev/accel 2>&1 || echo "no /dev/accel node"
+            echo "--- npu firmware ---"
+            ls /lib/firmware/amdnpu/ 2>&1 || echo "no amdnpu firmware directory"
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # The AVX-512 VNNI CPU path, the RADV iGPU and the XDNA 2 NPU are all
+      # required for this job to mean anything. Fail loudly rather than let the
+      # suite degrade into three SKIPs on the one machine that has the silicon.
+      - name: Assert the runner is really Strix Halo
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q avx512_vnni /proc/cpuinfo || {
+            echo "runner CPU has no AVX-512 VNNI; this job is mislabelled" >&2
+            exit 1
+          }
+          test -e /dev/dri || { echo "/dev/dri missing" >&2; exit 1; }
+          test -e /dev/kfd || { echo "/dev/kfd missing" >&2; exit 1; }
+          if [ "${REQUIRE_NPU}" = "1" ] && [ "${SKIP_NPU}" != "1" ] && [ ! -e /dev/accel/accel0 ]; then
+            echo "/dev/accel/accel0 missing: load the amdxdna module (Linux >= 6.14)" >&2
+            echo "re-run with require_npu=false to test the CPU and Vulkan paths only" >&2
+            exit 1
+          fi
+
       - name: Run VNNI tests in Strix Halo podman harness
         working-directory: vnni-int8-matmul
         shell: bash
-        env:
-          # Fail the job if the amdxdna node is missing instead of letting the
-          # NPU tests degrade into silent SKIPs on a machine that has an NPU.
-          REQUIRE_NPU: "1"
         run: |
           set -euo pipefail
           make podman-test
@@ -44,6 +109,12 @@ jobs:
             echo "XDNA2 backend reported OK with no kernel artifact loaded" >&2
             exit 1
           fi
+          # A SKIP on the machine that has the silicon is a failure, not a pass.
+          if [ "${REQUIRE_NPU}" = "1" ] && [ "${SKIP_NPU}" != "1" ] && \
+             grep -q 'NPU probe SKIP' test_output.log; then
+            echo "NPU probe skipped on a runner that has an NPU" >&2
+            exit 1
+          fi
 
       - name: Publish test summary
         if: always()
@@ -57,7 +128,7 @@ jobs:
               echo "### Test output"
               echo ""
               echo '```text'
-              tail -n 40 vnni-int8-matmul/test_output.log
+              tail -n 60 vnni-int8-matmul/test_output.log
               echo '```'
             else
               echo "No test log was produced."
