@@ -21,6 +21,8 @@
 #include <math.h>
 #include <stdint.h>
 
+#include <errno.h>
+
 #include "xdna2_driver.h"
 #include "xdna2_matmul.h"
 #include <drm/amdxdna_accel.h>
@@ -182,95 +184,85 @@ static void test_runtime_lifecycle(void) {
 
 /* ── Test: Matmul CPU Fallback ── */
 
-static void test_matmul_fallback(void) {
-    TEST("Matmul CPU fallback (shape 1x64x64)");
+static void test_no_cpu_fallback(void) {
+    TEST("Unsupported shape is rejected (no CPU fallback)");
 
     const int S = 1, I = 64, O = 64;
-    float *x = (float *)calloc(S * I, sizeof(float));
-    int8_t *weights = (int8_t *)malloc(O * I * sizeof(int8_t));
+    int8_t *x = (int8_t *)calloc((size_t)S * I, sizeof(int8_t));
+    int8_t *weights = (int8_t *)malloc((size_t)O * I * sizeof(int8_t));
     float *scales = (float *)calloc(O, sizeof(float));
-    float *y = (float *)calloc(S * O, sizeof(float));
-    float *y_ref = (float *)calloc(S * O, sizeof(float));
+    float *y = (float *)calloc((size_t)S * O, sizeof(float));
 
-    /* Initialize test data */
-    for (int i = 0; i < S * I; i++) x[i] = (float)(i % 10) - 4.0f;
+    if (!x || !weights || !scales || !y) {
+        printf("SKIP (out of memory)\n");
+        free(x); free(weights); free(scales); free(y);
+        return;
+    }
+    for (int i = 0; i < S * I; i++) x[i] = (int8_t)((i % 10) - 4);
     for (int i = 0; i < O * I; i++) weights[i] = (int8_t)((i % 13) - 6);
     for (int o = 0; o < O; o++) scales[o] = 1.0f / 128.0f;
 
-    /* Reference: naive CPU matmul */
-    for (int o = 0; o < O; o++) {
-        for (int s = 0; s < S; s++) {
-            float acc = 0.0f;
-            for (int i = 0; i < I; i++) {
-                acc += x[s * I + i] * (float)weights[o * I + i];
-            }
-            y_ref[s * O + o] = acc * scales[o];
-        }
-    }
-
-    /* NPU matmul (will use CPU fallback) */
-    xdna2_runtime_t runtime = {0};
-    xdna2_runtime_init(&runtime);
-
-    int ret = xdna2_matmul_int8(x, weights, scales, y, S, I, O, &runtime);
-    xdna2_runtime_shutdown(&runtime);
-
-    if (ret == 0) {
-        /* Verify against reference */
-        float max_err = 0.0f;
-        for (int i = 0; i < S * O; i++) {
-            float err = fabsf(y[i] - y_ref[i]);
-            if (err > max_err) max_err = err;
-        }
-
-        if (max_err < 1.0f) {
-            printf("PASS (max_err=%e)\n", max_err);
-            g_tests_passed++;
-        } else {
-            printf("FAIL (max_err=%e)\n", max_err);
-            g_tests_failed++;
-        }
-    } else {
-        printf("FAIL (matmul returned %d)\n", ret);
-        g_tests_failed++;
-    }
-
-    free(x); free(weights); free(scales); free(y); free(y_ref);
-}
-
-/* ── Test: Shape Registration ── */
-
-static void test_shape_registration(void) {
-    TEST("Shape registration and lookup");
-
-    xdna2_runtime_t runtime = {0};
-    xdna2_matmul_shape_t shape = {.rows = 1, .inner_dim = 4096,
-                                   .out_cols = 4096, .fmt = 1};
-
-    /* Register a fake kernel handle */
-    int ret = xdna2_register_shape(&runtime, &shape, 42);
-    if (ret != 0) {
-        printf("FAIL (register returned %d)\n", ret);
-        g_tests_failed++;
+    xdna2_runtime_t runtime;
+    memset(&runtime, 0, sizeof(runtime));
+    if (xdna2_runtime_init(&runtime) < 0) {
+        printf("SKIP (no NPU on this host)\n");
+        free(x); free(weights); free(scales); free(y);
         return;
     }
 
-    /* Look up the shape */
-    uint32_t handle = xdna2_find_kernel(&runtime, 1, 4096, 4096);
-    if (handle == 42) {
-        printf("PASS (found kernel 42 for shape 1x4096x4096)\n");
+    /* No kernel artifact is loaded, so this must fail rather than quietly
+     * computing the result on the CPU. */
+    int ret = xdna2_matmul_int8(&runtime, x, weights, scales, y, S, I, O);
+    xdna2_runtime_shutdown(&runtime);
+
+    if (ret == -ENOENT) {
+        printf("PASS (rejected with -ENOENT)\n");
         g_tests_passed++;
     } else {
-        printf("FAIL (expected 42, got %u)\n", handle);
+        printf("FAIL (expected -ENOENT, got %d)\n", ret);
         g_tests_failed++;
     }
 
-    /* Look up non-existent shape */
-    handle = xdna2_find_kernel(&runtime, 1, 1024, 1024);
-    if (handle == 0) {
-        printf("  Correctly returns 0 for unregistered shape\n");
+    free(x); free(weights); free(scales); free(y);
+}
+
+/* ── Test: int4 -> int8 expansion (host arithmetic, always runs) ── */
+
+static void test_int4_expansion(void) {
+    TEST("int4 -> int8 weight expansion");
+
+    const uint8_t packed[4] = { 0x10, 0x32, 0xBA, 0xDC };
+    const int8_t expected[8] = { -8, -7, -6, -5, 2, 3, 4, 5 };
+    int8_t got[8];
+    memset(got, 0, sizeof(got));
+
+    xdna2_dequant_int4(packed, got, /* O */ 2, /* I */ 4);
+
+    if (memcmp(got, expected, sizeof(expected)) == 0) {
+        printf("PASS\n");
+        g_tests_passed++;
     } else {
-        printf("  WARNING: unexpected handle %u for unregistered shape\n", handle);
+        printf("FAIL (got");
+        for (int i = 0; i < 8; i++) printf(" %d", (int)got[i]);
+        printf(")\n");
+        g_tests_failed++;
+    }
+}
+
+/* ── Test: kernel lookup ── */
+
+static void test_kernel_lookup(void) {
+    TEST("Kernel lookup returns NULL when nothing is loaded");
+
+    xdna2_runtime_t runtime;
+    memset(&runtime, 0, sizeof(runtime));
+
+    if (xdna2_find_kernel(&runtime, 1, 4096, 4096, XDNA2_FMT_INT8) == NULL) {
+        printf("PASS\n");
+        g_tests_passed++;
+    } else {
+        printf("FAIL (unexpected kernel for an empty runtime)\n");
+        g_tests_failed++;
     }
 }
 
@@ -283,8 +275,9 @@ int main(void) {
     test_hwctx();
     test_buffer_objects();
     test_runtime_lifecycle();
-    test_matmul_fallback();
-    test_shape_registration();
+    test_no_cpu_fallback();
+    test_int4_expansion();
+    test_kernel_lookup();
 
     printf("\n=== Results: %d/%d passed", g_tests_passed, g_tests_run);
     if (g_tests_failed > 0) {

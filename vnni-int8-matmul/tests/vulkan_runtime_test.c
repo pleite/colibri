@@ -57,8 +57,8 @@ int main(void) {
     }
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
-    if (strcmp(strix_vulkan_backend_name(), "vulkan-unavailable") == 0) {
-        printf("Vulkan runtime test SKIP (requires Vulkan runtime on Strix Halo)\n");
+    if (!strix_vulkan_is_supported()) {
+        printf("Vulkan runtime test SKIP (%s)\n", strix_vulkan_failure_reason());
         return 0;
     }
     if (!strix_vulkan_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
@@ -81,5 +81,6 @@ int main(void) {
     }
 
     printf("Vulkan runtime test passed via %s\n", strix_vulkan_backend_name());
+    strix_vulkan_shutdown();
     return 0;
 }

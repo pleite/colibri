@@ -57,11 +57,13 @@ int main(void) {
     }
 
     scalar_reference(input, rows, inner_dim, weights, out_cols, expected, scales);
+    if (!strix_vulkan_is_supported()) {
+        printf("Vulkan debug harness: backend unavailable (%s)\n",
+               strix_vulkan_failure_reason());
+        return 0;
+    }
+    printf("Vulkan debug harness: device '%s'\n", strix_vulkan_device_name());
     if (!strix_vulkan_matmul(input, rows, inner_dim, weights, out_cols, got, scales)) {
-        if (strcmp(strix_vulkan_backend_name(), "vulkan-unavailable") == 0) {
-            printf("Vulkan debug harness: backend unavailable on this host; diagnostics above\n");
-            return 0;
-        }
         fprintf(stderr, "Vulkan debug harness: backend execution failed\n");
         return 1;
     }
@@ -71,5 +73,6 @@ int main(void) {
         printf("result[%d]=%.6f expected=%.6f\n", i, got[i], expected[i]);
     }
     printf("Vulkan debug harness: completed\n");
+    strix_vulkan_shutdown();
     return 0;
 }
