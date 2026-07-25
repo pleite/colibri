@@ -30,11 +30,12 @@ mkdir -p /home/leite/actions-runner && cd /home/leite/actions-runner
 curl -o actions-runner-linux-x64-2.316.1.tar.gz https://github.com/actions/runner/releases/download/v2.316.1/actions-runner-linux-x64-2.316.1.tar.gz
 tar xzf actions-runner-linux-x64-2.316.1.tar.gz
 
-# Configure runner
+# Configure runner. The workflows target the default labels
+# (self-hosted, linux, x64); extra labels are optional and are not
+# required by any workflow in this repository.
 ./config.sh \
   --url https://github.com/pleite/colibri \
   --token <YOUR_RUNNER_TOKEN> \
-  --labels strix-halo,vulkan,gpu \
   --unattended
 
 # Start runner as service
@@ -68,7 +69,7 @@ on:
 
 jobs:
   test-vulkan:
-    runs-on: [self-hosted, strix-halo, vulkan]
+    runs-on: [self-hosted, linux, x64]
 
     steps:
       - name: Checkout code
@@ -113,10 +114,12 @@ run rather than a silent SKIP.
 
 ### Runs stuck in "queued"
 
-A queued run that never starts is **always** a runner problem, never a workflow
-problem: GitHub has no runner online matching `[self-hosted, strix-halo,
-vulkan]`. Note that `container-images.yml` targets `[self-hosted, linux, x64]`,
-so if both workflows queue, the runner is offline rather than mislabelled.
+A queued run that never starts means no online runner matches the job labels.
+Both `vnni-test.yml` and `container-images.yml` target `[self-hosted, linux,
+x64]`, the labels every runner carries by default, so a queued run now means the
+runner is offline or busy rather than mislabelled. (Historically this workflow
+asked for `[self-hosted, strix-halo, vulkan]`, which no registered runner had,
+and every run queued forever.)
 
 On the Strix Halo host:
 
@@ -127,7 +130,7 @@ sudo journalctl -u actions-runner -n 100 --no-pager
 ```
 
 Then confirm on GitHub under Settings → Actions → Runners that the runner is
-**Idle** and carries all three labels. Cancel the backlog before re-running:
+**Idle**. Cancel the backlog before re-running:
 
 ```bash
 gh run list --workflow vnni-test.yml --status queued \
