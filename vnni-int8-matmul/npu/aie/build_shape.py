@@ -50,7 +50,7 @@ MATMUL_EXAMPLES = "programming_examples/basic/matrix_multiplication"
 # aiecc failure halfway through a 15-shape build.
 L1_TILE_BUDGET_BYTES = 32 * 1024
 
-TILE_CANDIDATES = (64, 32, 16, 8)
+TILE_CANDIDATES = (64, 32, 16, 8, 4)
 COLUMN_CANDIDATES = (8, 4, 2, 1)
 N_AIE_ROWS = 4  # rows of compute tiles used by the whole-array design
 TRANSFER_BLOCK_ROWS = 2  # whole_array's transfer-block granularity
@@ -61,6 +61,11 @@ SINGLE_CORE_ROW_BLOCK = 2  # single_core's C tile-group height (rows_per_block /
 # this in AIEX::verifyStridesWraps, "Stride 3 exceeds the [1:1048576] range").
 # C is int32, so one accumulator element is exactly one word.
 MAX_BD_STRIDE_WORDS = 1 << 20
+
+# The same descriptor holds the outermost ("iteration") wrap in a 6-bit field,
+# so no BD may repeat more than 64 times ("Size 3 exceeds the [1:64] range").
+# Both designs stream A once per column block of B, which is the repeat count.
+MAX_BD_ITERATIONS = 64
 
 
 def mac_dims(m: int, k: int, n: int) -> tuple[int, int, int]:
@@ -132,6 +137,12 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
                         > MAX_BD_STRIDE_WORDS
                     ):
                         continue
+                    # A is re-streamed once per column block of B.
+                    if out // n // cols > MAX_BD_ITERATIONS:
+                        continue
+                    # Every core must get the same number of output tiles.
+                    if (rows // m) * (out // n) % (N_AIE_ROWS * cols) != 0:
+                        continue
                     cand = {
                         "design": "whole_array",
                         "m": m,
@@ -148,6 +159,7 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
                     if (
                         c_drain_stride_words(m * SINGLE_CORE_ROW_BLOCK, out)
                         <= MAX_BD_STRIDE_WORDS
+                        and out // n <= MAX_BD_ITERATIONS
                     ):
                         cand = {
                             "design": "single_core",

@@ -67,6 +67,17 @@ order, everything the toolchain and the hardware impose:
   2^20. `256x4096x16384` is the shape this binds: `m = 32` needs a stride of
   2097152 words and is rejected by `mlir-aie`'s verifier, so the planner drops
   to `m = 16` (stride exactly 2^20).
+- **Shim ND-DMA iteration count.** The same descriptor holds the outermost wrap
+  in a 6 bit field, and A is re-streamed once per column block of B, so
+  `out / n` (`out / n / cols` for the whole array) may not exceed 64. This is
+  what rules the single-core design out for `out = 16384`: 256 repeats, rejected
+  as `Size 3 exceeds the [1:64] range`.
+- **Even core occupancy.** `(rows / m) * (out / n)` must divide by the number of
+  cores, so no core in the array is left without an output tile.
+
+The 32-row shapes therefore run on the whole array with `m = 4` rather than on a
+single core: `rows % (8 * m) == 0` admits nothing larger, and it is also the only
+tiling that keeps `out = 16384` inside the iteration field.
 
 ## What is not built, and why
 

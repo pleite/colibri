@@ -50,6 +50,9 @@ FMT_INT8 = 1
 # XRT's header by the probe below.
 ERT_OPCODE_NAME = "ERT_START_NPU"
 
+# IP_LAYOUT entry types that denote a compute unit the ERT CU mask can address.
+CU_IP_TYPES = frozenset({"IP_KERNEL", "IP_PS_KERNEL"})
+
 
 def probe_ert_opcode(probe: str, name: str = ERT_OPCODE_NAME) -> int:
     """Read an ERT opcode out of XRT's ert.h via the compiled probe."""
@@ -106,11 +109,20 @@ def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
         layout = json.loads(dump.read_text())
 
     entries = layout.get("ip_layout", {}).get("m_ip_data", [])
-    cus = [e for e in entries if str(e.get("m_type", "")).upper() == "IP_KERNEL"]
+    # aiecc registers the design through xclbinutil's --add-kernel with a
+    # "ps-kernels" JSON, which XRT records as IP_PS_KERNEL (m_subtype DPU), not
+    # IP_KERNEL. Both are compute units addressable by the ERT CU mask.
+    cus = [
+        e
+        for e in entries
+        if str(e.get("m_type", "")).upper() in CU_IP_TYPES
+    ]
     if not cus:
+        seen = sorted({str(e.get("m_type", "")) for e in entries})
         raise SystemExit(
-            f"{xclbin} declares no IP_KERNEL compute unit; there is nothing to "
-            "address with a CU mask"
+            f"{xclbin} declares no compute unit of type "
+            f"{'/'.join(sorted(CU_IP_TYPES))}; IP_LAYOUT holds "
+            f"{seen or 'no entries'}"
         )
     if len(cus) > 32:
         raise SystemExit(
