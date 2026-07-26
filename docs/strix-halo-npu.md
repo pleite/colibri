@@ -190,10 +190,8 @@ from a pinned IRON/`mlir-aie` + Peano toolchain packaged as a Podman image, and
 result as an artifact. AMD's proprietary `aiecompiler` has no public release
 for XDNA 2, so the open toolchain is the only route; see
 [`vnni-int8-matmul/npu/aie/README.md`](../vnni-int8-matmul/npu/aie/README.md)
-for how to run it and for the gaps that remain. Two of those gaps matter here:
-the decode row tile (`rows = 1`) has no valid tiling on the AIE int8 MAC and is
-not built, and the DRM path does not yet register the compiled xclbin's
-partition with the firmware.
+for how to run it and for the gaps that remain. The decode row tile (`rows = 1`)
+has no valid tiling on the AIE int8 MAC and is not built.
 
 **Which tensors can run on the NPU, and which cannot.** The AIE2P int8
 microkernel multiplies in units of `8x8x8` (`kernels.mm(...).mac_dims` with the

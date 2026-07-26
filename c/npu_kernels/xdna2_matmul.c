@@ -83,6 +83,21 @@ static uint32_t read_le32(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static char *sidecar_xclbin_path(const char *kernel_path) {
+    if (!kernel_path) return NULL;
+    size_t path_len = strlen(kernel_path);
+    const char *dot = strrchr(kernel_path, '.');
+    size_t stem_len = path_len;
+    if (dot && strcmp(dot, ".npukernel") == 0) {
+        stem_len = (size_t)(dot - kernel_path);
+    }
+    char *path = (char *)malloc(stem_len + sizeof(".xclbin"));
+    if (!path) return NULL;
+    memcpy(path, kernel_path, stem_len);
+    memcpy(path + stem_len, ".xclbin", sizeof(".xclbin"));
+    return path;
+}
+
 int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
     if (!runtime || !runtime->initialized || !kernel_path) return -EINVAL;
     if (runtime->kernel_count >= XDNA2_MAX_KERNELS) {
@@ -173,12 +188,86 @@ int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
     }
 
     if (!runtime->cu_configured) {
-        if (xdna2_config_hwctx_single_cu(runtime->device_fd, &runtime->hwctx,
-                                         entry.instr_bo.handle,
-                                         /* DPU CU function */ 0) < 0) {
+        char *xclbin_path = sidecar_xclbin_path(kernel_path);
+        if (!xclbin_path) {
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOMEM;
+        }
+        FILE *xclfp = fopen(xclbin_path, "rb");
+        if (!xclfp) {
+            fprintf(stderr, "xdna2: sidecar xclbin '%s' not found for '%s'\n",
+                    xclbin_path, kernel_path);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOENT;
+        }
+        if (fseek(xclfp, 0, SEEK_END) != 0) {
+            fclose(xclfp);
+            free(xclbin_path);
             xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
             return -EIO;
         }
+        long xcl_size_long = ftell(xclfp);
+        if (xcl_size_long <= 0) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EINVAL;
+        }
+        if (fseek(xclfp, 0, SEEK_SET) != 0) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        size_t xcl_size = (size_t)xcl_size_long;
+        uint8_t *xclbin = (uint8_t *)malloc(xcl_size);
+        if (!xclbin) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOMEM;
+        }
+        if (fread(xclbin, 1, xcl_size, xclfp) != xcl_size) {
+            fclose(xclfp);
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EINVAL;
+        }
+        fclose(xclfp);
+
+        if (xdna2_create_bo(runtime->device_fd, &entry.pdi_bo, xcl_size, AMDXDNA_BO_DEV) < 0) {
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        if (xdna2_map_bo(runtime->device_fd, &entry.pdi_bo) < 0) {
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        memcpy(entry.pdi_bo.mapped, xclbin, xcl_size);
+        free(xclbin);
+        if (xdna2_sync_bo(runtime->device_fd, &entry.pdi_bo,
+                          SYNC_DIRECT_TO_DEVICE, 0, xcl_size) < 0) {
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        if (xdna2_config_hwctx_single_cu(runtime->device_fd, &runtime->hwctx,
+                                         entry.pdi_bo.handle,
+                                         /* DPU CU function */ 0) < 0) {
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            free(xclbin_path);
+            return -EIO;
+        }
+        free(xclbin_path);
         runtime->cu_configured = true;
     }
 
@@ -219,8 +308,8 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
     /*
      * Pick the control plane before touching the device. This decides how the
      * NPU is validated (DRM ioctls only, or the official XRT + XDNA shim
-     * stack); the fixed-shape dispatch below is DRM in both cases, because the
-     * `.npukernel` artifacts are not xclbins. It never selects a CPU path.
+     * stack); fixed-shape dispatch below is DRM in both cases. It never
+     * selects a CPU path.
      */
     xdna2_control_plane_t requested = XDNA2_CONTROL_PLANE_AUTO;
     if (xdna2_control_plane_from_env(&requested) < 0) {
@@ -274,6 +363,7 @@ void xdna2_runtime_shutdown(xdna2_runtime_t *runtime) {
 
     for (int i = 0; i < runtime->kernel_count; ++i) {
         if (runtime->kernels[i].loaded) {
+            xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].pdi_bo);
             xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].instr_bo);
             runtime->kernels[i].loaded = false;
         }

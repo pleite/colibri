@@ -115,20 +115,8 @@ the NPU. That is the documented "no silent fallback" behaviour.
 
 ## Known gaps
 
-These are real, and they are why a successful build is not yet a working
-inference path:
-
-- **Partition configuration.** The DRM dispatch path in
-  `c/npu_kernels/xdna2_driver.c` creates a hardware context but never registers
-  the compiled xclbin's PDI with the firmware. The xclbin is copied next to each
-  artifact so that step has something to consume once it is implemented.
-- **ERT payload layout.** The command payload the runtime writes
-  (`xdna2_matmul.c`) was written against the documented field order, not against
-  XRT's `ert.h` structures, and truncates buffer addresses to 32 bits. It needs
-  to be rebuilt on the real header before a dispatch can be trusted.
 - **rows = 1.** See above.
 
-Until the first two are closed, the artifacts this directory produces are
-verified for *shape and container correctness* only — `pack_npukernel.py
---verify` and the CI step that runs it check exactly that, and claim nothing
-more.
+The artifacts this directory produces are still verified in CI for *shape and
+container correctness* (`pack_npukernel.py --verify`), and runtime execution
+must still be validated on Strix Halo hardware.

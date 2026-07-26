@@ -75,6 +75,7 @@ typedef struct {
     uint32_t   cu_mask;
     uint32_t   instr_words;
     xdna2_bo_t instr_bo;   /* Instruction stream resident on the NPU */
+    xdna2_bo_t pdi_bo;     /* Sidecar xclbin/PDI BO used for CU registration */
     bool       loaded;
 } xdna2_kernel_t;
 

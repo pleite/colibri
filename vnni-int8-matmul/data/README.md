@@ -23,10 +23,9 @@ There is deliberately no checked-in default file. With no table present the
 placement policy falls back to the documented structural order and says so, and
 an operator who wants to forbid that can set `COLI_PLACEMENT_REQUIRE_PROFILE=1`.
 
-Note also that the NPU columns of any table produced today are not trustworthy:
-the DRM dispatch path has not yet registered a PDI with firmware and its ERT
-payload truncates buffer addresses to 32 bits (`npu/aie/README.md`, "Known
-gaps"). CPU and GPU-f32 rows are the honest baseline until those close.
+NPU rows are now expected to execute through the DRM path with xclbin/PDI
+registration and 64-bit ERT payload addresses; remaining NPU caveats are the
+documented shape limits (notably `rows=1`) in `npu/aie/README.md`.
 
 ## Producing it
 
