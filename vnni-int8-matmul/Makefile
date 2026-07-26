@@ -33,7 +33,7 @@ endif
 TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
          tests/npu_device_test tests/test_placement tests/test_moe_schedule
 
-TOOLS := bench/backend_bench
+TOOLS := bench/backend_bench tools/npu_shapes_list
 
 all: $(TESTS) $(TOOLS)
 
@@ -79,6 +79,9 @@ SCHED_OBJS := sched/shape_profile.o sched/npu_shapes.o sched/backend_placement.o
 bench/backend_bench.o: bench/backend_bench.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+tools/%.o: tools/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 tests/%.o: tests/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -109,6 +112,11 @@ bench/backend_bench: bench/backend_bench.o cpu/vnni_cpu_backend.o \
                      gpu/vulkan_backend.o $(NPU_OBJS) $(SCHED_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Prints the enumerated NPU shape set so the kernel build reads it from
+# sched/npu_shapes.c instead of carrying a second copy of the enumeration.
+tools/npu_shapes_list: tools/npu_shapes_list.o sched/npu_shapes.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 # ── Test / clean ──────────────────────────────────────────────────────────────
 
 test: $(TESTS)
@@ -122,6 +130,23 @@ test: $(TESTS)
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
 
+# ── NPU kernel artifacts ──────────────────────────────────────────────────────
+# The AIE toolchain (IRON + Peano) is pinned in npu/aie/toolchain.lock and lives
+# in its own build-only container image; it is not part of the test image and
+# needs no NPU device. See npu/aie/README.md.
+
+npu-toolchain-image:
+	./scripts/build-npu-kernels.sh --image-only
+
+npu-kernels: tools/npu_shapes_list
+	./scripts/build-npu-kernels.sh
+
+# Host-side checks that need no toolchain and no NPU: the container packer
+# round-trips, and the enumerated shape set is printable.
+npu-kernels-check: tools/npu_shapes_list
+	python3 npu/aie/pack_npukernel.py --self-test
+	./tools/npu_shapes_list
+
 # test_output.log is deliberately NOT removed here. It is written on the host by
 # scripts/strix-halo-podman-test.sh with `tee`, while the container runs
 # `make clean` in the same bind-mounted directory: removing it unlinks the file
@@ -129,6 +154,8 @@ podman-test: scripts/strix-halo-podman-test.sh
 # disk and CI reports "no test log produced".
 clean:
 	rm -f $(TESTS) $(TOOLS) tests/*.o cpu/*.o npu/*.o gpu/*.o sched/*.o bench/*.o \
-	      $(NPU_DIR)/*.o
+	      tools/*.o $(NPU_DIR)/*.o
+	rm -rf npu/aie/build npu/aie/__pycache__
 
-.PHONY: all shader test podman-test clean
+.PHONY: all shader test podman-test clean \
+        npu-toolchain-image npu-kernels npu-kernels-check

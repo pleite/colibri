@@ -1,0 +1,32 @@
+# Pinned AIE toolchain for the Strix Halo NPU kernels.
+#
+# Every version here is consumed by Containerfile.aie-toolchain. Nothing in the
+# kernel build resolves "latest": a kernel artifact is only meaningful together
+# with the compiler that produced it, and a rolling nightly would make a red CI
+# run impossible to attribute.
+#
+# Bumping a pin is a reviewed change: rebuild the image, rebuild all shapes, and
+# re-run the NPU tests on the Strix Halo runner.
+
+# Xilinx/mlir-aie release. Supplies the IRON Python API (`aie.iron`), aiecc and
+# the prebuilt AIE microkernels (`aie.iron.kernels.mm`). The wheel and the git
+# checkout must be the same release: env_install.sh refuses a mismatch, and the
+# programming_examples designs are taken from the checkout.
+MLIR_AIE_VERSION=1.3.4
+MLIR_AIE_WHEEL_INDEX=https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.4
+MLIR_AIE_GIT=https://github.com/Xilinx/mlir-aie.git
+MLIR_AIE_REF=v1.3.4
+
+# Peano (llvm-aie) is the open-source AIE2/AIE2P code generator. It is *not*
+# pinned here: the mlir-aie checkout carries utils/peano-requirements.txt, which
+# names the nightly that release was tested against, and the image installs that
+# file. Pinning it twice is how the two drift apart.
+PEANO_REQUIREMENTS=utils/peano-requirements.txt
+
+# Python for the IRON environment. mlir_aie publishes cp311..cp314 manylinux
+# wheels; 3.12 is the version mlir-aie's own env_install.sh requires.
+PYTHON_VERSION=3.12
+
+# Base image. Ubuntu 24.04 is what AMD packages XRT and the amdxdna userspace
+# for (ppa:amd-team/xrt), and the manylinux_2_35 wheels resolve against it.
+BASE_IMAGE=docker.io/library/ubuntu:24.04

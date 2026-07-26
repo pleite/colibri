@@ -27,6 +27,13 @@ vnni-int8-matmul/tests/test_backends
 vnni-int8-matmul/tests/vulkan_runtime_test
 vnni-int8-matmul/tests/vulkan_debug_harness
 vnni-int8-matmul/tests/npu_device_test
+vnni-int8-matmul/tools/npu_shapes_list
+
+# NPU kernel artifacts: built from npu/aie by `make npu-kernels`, published as
+# a CI artifact rather than committed (they are megabytes of instruction stream
+# and are reproducible from the pinned toolchain).
+vnni-int8-matmul/npu/kernels/
+vnni-int8-matmul/npu/aie/build/
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
