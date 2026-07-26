@@ -421,3 +421,255 @@ Given the aiecompiler availability situation, the Copilot prompt should:
 3. Keep the NPU backend as a validated SKIP path in CI
 4. Focus engineering effort on Vulkan (SPIR-V) and ROCm (HIP) backends which
    have working open toolchains
+
+---
+
+## Design Correction: Full AIE Array Utilization (Not Fixed 16-Core Partition)
+
+### Current bug in xdna2_matmul.c (line ~210)
+
+The runtime hardcodes a 16-core partition:
+
+
+
+This wastes 64 of the 80 AIE-2 cores (10 cols x 8 rows). The 16-core choice
+is arbitrary — it is the smallest partition that keeps a 4096-wide reduction
+resident in tile memory, but it says nothing about the actual matrix shape
+being computed.
+
+### What the AIE array actually is
+
+Strix Halo XDNA 2:
+- 10 columns x 8 rows = 80 total tiles
+- Core tiles: 4 rows (rows 0-3), each with locks and event registers
+- Mem tiles: 2 rows (rows 4-5), each with DMA channels
+- Shim tiles: 2 rows (rows 6-7), each with DMA channels for host I/O
+- Column size: 4096 bytes (per the AIE metadata query)
+- Tile memory: 32 KiB per tile (configurable via mem_size)
+
+The AIE-2 array is a 2D mesh of processing elements. Each core tile can
+execute one DPU instruction stream. For a matmul, the optimal partition
+maps:
+- Columns to the inner dimension (I) — more columns = more parallel MACs
+- Rows to the output dimension (O) — more rows = more output channels computed
+  simultaneously
+- Mem tiles handle DMA for input/output data movement
+- Shim tiles handle host-to-device and device-to-host transfers
+
+### Correct partition sizing algorithm
+
+Given a matmul shape (S rows, I inner, O out):
+
+1. **Columns needed for I:** ceil(I / tile_width) where tile_width is the
+   number of inner-dim elements one core tile can hold in its 32 KiB of
+   tile memory. For INT8, that is 32768 bytes / 1 byte = 32768 elements per
+   tile. But the reduction dimension must be partitioned across columns, so
+   column_count = ceil(I / elements_per_column_tile).
+
+2. **Rows needed for O:** ceil(O / elements_per_row_tile). Each row tile
+   computes one output channel. elements_per_row_tile depends on how many
+   inner-dim elements fit in the output tile's memory.
+
+3. **Constraints:**
+   - column_count <= 10 (physical column limit)
+   - row_count <= 8 (physical row limit)
+   - column_count * row_count <= 80 (total tiles)
+   - column_count must be a multiple of core.row_count for the driver
+   - The partition must leave enough mem/shim tiles for DMA
+
+4. **Maximize utilization:** Choose the partition that uses the most cores
+   while fitting the shape. For large matrices (q_proj: 4096x16384), this
+   should use all 80 cores. For small matrices (decode: 1x4096x512), fewer
+   cores are needed but the partition should still be optimal.
+
+### Updated kernel artifact format
+
+The .npukernel container must also carry the partition geometry:
+
+
+
+The runtime reads the partition geometry and passes it to the hardware
+context creation, replacing the hardcoded 16-tile partition.
+
+### Updated runtime flow
+
+
+
+### What this means for the AIE compiler
+
+The AIE compiler must produce kernels that:
+1. Accept the partition geometry as a compile-time parameter
+2. Map the (S, I, O) shape to the AIE array columns/rows
+3. Generate DPU instruction streams that use exactly the allocated tiles
+4. Produce an ERT opcode and CU mask that match the partition
+
+This is fundamentally different from the current approach where each kernel
+is hardcoded to a fixed shape and fixed partition. The new approach makes
+the kernel shape-aware and partition-aware.
+
+### Impact on the 15-artifact enumeration
+
+The current npu_shapes.c enumerates 15 (rows, inner, out) tuples. With full
+array utilization, each tuple may need multiple partition variants:
+- A large prefill (256x4096x16384) might use all 80 cores
+- A small prefill (32x4096x16384) might use 40 cores
+- A decode (1x4096x512) might use 8 cores
+
+The kernel artifact must encode which partition it was compiled for, and the
+runtime must select the best-fit partition for each dispatch.
+
+### Immediate action items
+
+1. **Bump .npukernel format version to 2** — add partition geometry fields
+2. **Replace hardcoded 16-tile partition** with shape-derived partition
+3. **Query AIE metadata at runtime** — get actual column/row counts from the
+   driver, not hardcoded 10x8
+4. **Update aiecompiler prompt** — the AIE C source must accept partition
+   geometry as a parameter, not be hardcoded to a fixed tile count
+5. **Re-enumerate kernel artifacts** — the 15 shapes may need multiple
+   partition variants each
+
+
+
+---
+
+## Design Correction: Full AIE Array Utilization (Not Fixed 16-Core Partition)
+
+### Current bug in xdna2_matmul.c (line ~210)
+
+The runtime hardcodes a 16-core partition:
+
+    xdna2_create_hwctx(runtime->device_fd, &runtime->hwctx,
+                       /* num_tiles */ 16,
+                       /* mem_size  */ 32768,
+                       /* max_opc   */ 4,
+                       /* qos       */ qos_priority)
+
+This wastes 64 of the 80 AIE-2 cores (10 cols x 8 rows). The 16-core choice
+is arbitrary — it is the smallest partition that keeps a 4096-wide reduction
+resident in tile memory, but it says nothing about the actual matrix shape
+being computed.
+
+### What the AIE array actually is
+
+Strix Halo XDNA 2:
+- 10 columns x 8 rows = 80 total tiles
+- Core tiles: 4 rows (rows 0-3), each with locks and event registers
+- Mem tiles: 2 rows (rows 4-5), each with DMA channels
+- Shim tiles: 2 rows (rows 6-7), each with DMA channels for host I/O
+- Column size: 4096 bytes (per the AIE metadata query)
+- Tile memory: 32 KiB per tile (configurable via mem_size)
+
+The AIE-2 array is a 2D mesh of processing elements. Each core tile can
+execute one DPU instruction stream. For a matmul, the optimal partition
+maps:
+- Columns to the inner dimension (I) — more columns = more parallel MACs
+- Rows to the output dimension (O) — more rows = more output channels computed
+  simultaneously
+- Mem tiles handle DMA for input/output data movement
+- Shim tiles handle host-to-device and device-to-host transfers
+
+### Correct partition sizing algorithm
+
+Given a matmul shape (S rows, I inner, O out):
+
+1. Columns needed for I: ceil(I / tile_width) where tile_width is the
+   number of inner-dim elements one core tile can hold in its 32 KiB of
+   tile memory. For INT8, that is 32768 bytes / 1 byte = 32768 elements per
+   tile. But the reduction dimension must be partitioned across columns, so
+   column_count = ceil(I / elements_per_column_tile).
+
+2. Rows needed for O: ceil(O / elements_per_row_tile). Each row tile
+   computes one output channel. elements_per_row_tile depends on how many
+   inner-dim elements fit in the output tile memory.
+
+3. Constraints:
+   - column_count <= 10 (physical column limit)
+   - row_count <= 8 (physical row limit)
+   - column_count * row_count <= 80 (total tiles)
+   - column_count must be a multiple of core.row_count for the driver
+   - The partition must leave enough mem/shim tiles for DMA
+
+4. Maximize utilization: Choose the partition that uses the most cores
+   while fitting the shape. For large matrices (q_proj: 4096x16384), this
+   should use all 80 cores. For small matrices (decode: 1x4096x512), fewer
+   cores are needed but the partition should still be optimal.
+
+### Updated kernel artifact format
+
+The .npukernel container must also carry the partition geometry:
+
+    offset  size  field
+    0       4     magic       XDN2
+    4       4     version     2  (bumped from 1 - adds partition info)
+    8       4     ert_opcode
+    12      4     cu_mask
+    16      4     rows        (batch rows, S)
+    20      4     inner_dim   (I)
+    24      4     out_cols    (O)
+    28      4     fmt         1=INT8
+    32      4     instr_size
+    36      4     instr_words
+    40      4     col_count   (AIE columns allocated)
+    44      4     row_count   (AIE rows allocated)
+    48      4     mem_tiles   (mem tile rows used for DMA)
+    52      4     shim_tiles  (shim tile rows used for host IO)
+    56      ... instruction stream
+
+The runtime reads the partition geometry and passes it to the hardware
+context creation, replacing the hardcoded 16-tile partition.
+
+### Updated runtime flow
+
+    xdna2_runtime_init()
+      - xdna2_query_aie_metadata()  -> meta.cols, meta.rows, meta.core.row_count,
+                                         meta.mem.row_count, meta.shim.row_count
+      - xdna2_create_hwctx(fd, ctx,
+           num_tiles = col_count * row_count,   <- computed from shape
+           mem_size = 32768,
+           max_opc = 4,
+           qos = priority)
+
+    xdna2_matmul_int8(S, I, O, x, weights, y)
+      - xdna2_find_kernel(runtime, S, I, O, INT8)
+           - kernel.col_count, kernel.row_count  <- from .npukernel v2 header
+      - For each (S, I, O) dispatch:
+           + Allocate BOs sized for the actual shape
+           + Upload x, weights to device
+           + Build ERT packet with kernel partition geometry
+           + Submit and wait
+           + Download y
+
+### What this means for the AIE compiler
+
+The AIE compiler must produce kernels that:
+1. Accept the partition geometry as a compile-time parameter
+2. Map the (S, I, O) shape to the AIE array columns/rows
+3. Generate DPU instruction streams that use exactly the allocated tiles
+4. Produce an ERT opcode and CU mask that match the partition
+
+This is fundamentally different from the current approach where each kernel
+is hardcoded to a fixed shape and fixed partition. The new approach makes
+the kernel shape-aware and partition-aware.
+
+### Impact on the 15-artifact enumeration
+
+The current npu_shapes.c enumerates 15 (rows, inner, out) tuples. With full
+array utilization, each tuple may need multiple partition variants:
+- A large prefill (256x4096x16384) might use all 80 cores
+- A small prefill (32x4096x16384) might use 40 cores
+- A decode (1x4096x512) might use 8 cores
+
+The kernel artifact must encode which partition it was compiled for, and the
+runtime must select the best-fit partition for each dispatch.
+
+### Immediate action items
+
+1. Bump .npukernel format version to 2 — add partition geometry fields
+2. Replace hardcoded 16-tile partition with shape-derived partition
+3. Query AIE metadata at runtime — get actual column/row counts from the
+   driver, not hardcoded 10x8
+4. Update aiecompiler prompt — the AIE C source must accept partition
+   geometry as a parameter, not be hardcoded to a fixed tile count
+5. Re-enumerate kernel artifacts — the 15 shapes may need multiple
+   partition variants each
