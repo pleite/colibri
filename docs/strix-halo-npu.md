@@ -39,7 +39,7 @@ vnni-int8-matmul/npu/
   xdna2_backend.{c,h}  strix_xdna2_* backend used by the VNNI building blocks
 
 vnni-int8-matmul/tests/
-  npu_device_test.c    NPU probe, AIE-version check, no-fallback assertion
+  npu_device_test.c    NPU probe, generation check, no-fallback assertion
 ```
 
 ---
@@ -242,6 +242,7 @@ hand-copied kernel structures and magic constants instead of the UAPI.
 | Device heap mapped at a page-aligned but not 64 MiB-aligned address | the firmware refuses `MSG_OP_MAP_HOST_BUFFER`, `aie2_hwctx_init()` logs "Map host buffer failed" and `CREATE_HWCTX` fails with `-EINVAL` in some processes and not others | `xdna2_map_bo_ex()` reserves `size + align - 1` bytes and `MAP_FIXED`s the heap into the 64 MiB-aligned interior |
 | `GET_BO_INFO`'s `AMDXDNA_INVALID_ADDR` (`~0`) stored as a real address | `xdna2_map_bo()` returned `(void *)-1` as the host pointer for an unmapped BO | Normalise the sentinel to 0 and refuse to map a BO with no offset |
 | `DRM_AMDXDNA_QUERY_RESOURCE_INFO` and `AMDXDNA_QOS_*` used unconditionally | build failure on every shipping kernel-headers package — both post-date Linux 6.18 | Build-system probe defines `COLI_HAVE_XDNA2_RESOURCE_INFO`; the QoS hint falls back to the driver default |
+| XDNA 2 detected from the AIE metadata `version` field (`>= 2`) | Strix Halo firmware reports tile info version **1.1**, so the probe rejected the very silicon it targets | `xdna2_is_xdna2_hardware()` reads the accel node's PCI vendor/device/revision from sysfs (`0x1002:0x17f0`, rev `0x10`/`0x11`/`0x20`) |
 | `xdna2_runtime_init()` created the hwctx in a stack local | hwctx and device fd leaked on every init | Runtime owns the hwctx; `shutdown` releases it |
 | Every matmul path ended in `strix_cpu_matmul()` | NPU benchmarks silently measured the CPU | Removed; unsupported shapes return `-ENOENT` |
 | Local re-declarations of every ioctl struct | fragile against UAPI evolution | Use `struct amdxdna_drm_*` throughout |

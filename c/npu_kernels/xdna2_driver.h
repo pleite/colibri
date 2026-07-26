@@ -93,6 +93,29 @@ typedef struct {
     xdna2_tile_metadata_t shim;
 } xdna2_aie_metadata_t;
 
+/* ── PCI identity ──
+ *
+ * The firmware's AIE metadata carries a `version` field, but it is the AIE
+ * tile-info protocol version, not the NPU generation: Strix Halo (an XDNA 2
+ * part) reports 1.1 there. The generation is only unambiguous in the PCI
+ * identity of the accel node, which the amdxdna driver matches on:
+ *
+ *   XDNA 1  0x1002:0x1502 rev 0x00 (Phoenix), 0x1002:0x1050 rev 0x01 (Hawk Point)
+ *   XDNA 2  0x1002:0x17f0 rev 0x10 (Strix Point), rev 0x11 (Strix Halo),
+ *                         rev 0x20 (Krackan)
+ */
+#define XDNA2_PCI_VENDOR_AMD    0x1002u
+#define XDNA2_PCI_DEVICE_NPU4   0x17f0u  /* Strix family, XDNA 2 */
+#define XDNA2_PCI_REV_STRIX     0x10u
+#define XDNA2_PCI_REV_STRIX_HALO 0x11u
+#define XDNA2_PCI_REV_KRACKAN   0x20u
+
+typedef struct {
+    uint32_t vendor;
+    uint32_t device;
+    uint32_t revision;
+} xdna2_pci_ids_t;
+
 /* ── Resource info ── */
 
 typedef struct {
@@ -222,6 +245,25 @@ int xdna2_query_resource_info(int fd, xdna2_resource_info_t *info);
 int xdna2_query_firmware_version(int fd, uint32_t *major,
                                  uint32_t *minor, uint32_t *patch,
                                  uint32_t *build);
+
+/**
+ * xdna2_query_pci_ids — Read the PCI vendor/device/revision of the accel node
+ *
+ * Read from sysfs for the character device behind `fd`; the DRM UAPI exposes
+ * no query for it. Returns 0 on success, -1 when sysfs is unreadable (a
+ * container without /sys, for instance).
+ */
+int xdna2_query_pci_ids(int fd, xdna2_pci_ids_t *ids);
+
+/**
+ * xdna2_is_xdna2_hardware — Is the device behind `fd` an XDNA 2 (AIE-2) NPU?
+ *
+ * Returns 1 for XDNA 2, 0 for a device the amdxdna driver binds that is not
+ * XDNA 2, and -1 when the PCI identity cannot be read and the generation is
+ * therefore unknown. The AIE metadata `version` field must not be used for
+ * this: Strix Halo reports 1.1 there.
+ */
+int xdna2_is_xdna2_hardware(int fd);
 
 /**
  * xdna2_print_device_info — Print NPU device summary

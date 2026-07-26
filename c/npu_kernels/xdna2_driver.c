@@ -26,6 +26,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -667,6 +669,69 @@ int xdna2_query_aie_metadata(int fd, xdna2_aie_metadata_t *meta) {
 }
 
 /*
+ * The NPU generation is a property of the part, not of the firmware protocol.
+ * `struct amdxdna_drm_query_aie_metadata.version` is the AIE tile-info version
+ * the firmware answers with — Strix Halo, an XDNA 2 part, reports 1.1 there —
+ * so it cannot be used to tell AIE-2 silicon from AIE-1 silicon. The PCI
+ * identity can: it is exactly what amdxdna's own device table matches on.
+ * There is no DRM query for it, so it is read from sysfs for the character
+ * device behind the fd; a host without /sys leaves the generation unknown
+ * rather than assumed.
+ */
+static int xdna2_read_sysfs_u32(const char *path, uint32_t *out) {
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    unsigned long value = 0;
+    int fields = fscanf(f, "%lx", &value); /* sysfs prints "0x1002" */
+    fclose(f);
+    if (fields != 1) return -1;
+    *out = (uint32_t)value;
+    return 0;
+}
+
+int xdna2_query_pci_ids(int fd, xdna2_pci_ids_t *ids) {
+    if (!ids || fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
+        return -1;
+    }
+
+    char base[128];
+    int n = snprintf(base, sizeof(base), "/sys/dev/char/%u:%u/device",
+                     (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev));
+    if (n <= 0 || (size_t)n >= sizeof(base)) return -1;
+
+    xdna2_pci_ids_t out;
+    memset(&out, 0, sizeof(out));
+
+    static const char *const attrs[3] = {"vendor", "device", "revision"};
+    uint32_t *slots[3] = {&out.vendor, &out.device, &out.revision};
+    for (int i = 0; i < 3; ++i) {
+        char path[192];
+        n = snprintf(path, sizeof(path), "%s/%s", base, attrs[i]);
+        if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+        if (xdna2_read_sysfs_u32(path, slots[i]) != 0) return -1;
+    }
+
+    *ids = out;
+    return 0;
+}
+
+int xdna2_is_xdna2_hardware(int fd) {
+    xdna2_pci_ids_t ids;
+    if (xdna2_query_pci_ids(fd, &ids) != 0) {
+        return -1;
+    }
+    if (ids.vendor != XDNA2_PCI_VENDOR_AMD) {
+        return 0;
+    }
+    /* Every XDNA 2 part shipped so far shares one device id and differs only
+     * in the revision; the XDNA 1 parts use different device ids entirely. */
+    return ids.device == XDNA2_PCI_DEVICE_NPU4 ? 1 : 0;
+}
+
+/*
  * DRM_AMDXDNA_QUERY_RESOURCE_INFO and struct amdxdna_drm_get_resource_info
  * were added to the amdxdna UAPI after Linux 6.18, so they are absent from
  * every currently shipping kernel-headers package. The build system probes for
@@ -734,6 +799,13 @@ void xdna2_print_device_info(int fd) {
     memset(&info, 0, sizeof(info));
 
     printf("=== XDNA 2 NPU Device Info ===\n");
+
+    xdna2_pci_ids_t ids;
+    if (xdna2_query_pci_ids(fd, &ids) == 0) {
+        printf("PCI: %04x:%04x rev %02x (%s)\n", ids.vendor, ids.device,
+               ids.revision,
+               xdna2_is_xdna2_hardware(fd) == 1 ? "XDNA 2" : "not XDNA 2");
+    }
 
     if (xdna2_query_firmware_version(fd, &fw_major, &fw_minor, &fw_patch, &fw_build) == 0) {
         printf("Firmware: %u.%u.%u (build %u)\n",

@@ -7,7 +7,7 @@
  * compare against. It checks, in order:
  *
  *   1. the accel node opens and a hardware context can be created,
- *   2. the AIE array reported by the driver looks like XDNA 2 on Strix Halo,
+ *   2. the accel node's PCI identity is an XDNA 2 part,
  *   3. requesting a matmul with no kernel loaded fails instead of silently
  *      falling back to the CPU,
  *   4. int4 -> int8 weight expansion is correct (pure host arithmetic),
@@ -61,15 +61,26 @@ static int test_device_probe(void) {
         xdna2_aie_metadata_t meta;
         memset(&meta, 0, sizeof(meta));
         if (xdna2_query_aie_metadata(fd, &meta) == 0) {
-            printf("AIE array: %u columns x %u rows, version %u.%u\n",
+            printf("AIE array: %u columns x %u rows, tile info version %u.%u\n",
                    meta.cols, meta.rows, meta.version_major, meta.version_minor);
-            if (meta.version_major < 2) {
-                fprintf(stderr,
-                        "this backend targets XDNA 2 (AIE-2); reported AIE version is %u.%u\n",
-                        meta.version_major, meta.version_minor);
-                xdna2_close_device(fd);
-                return 0;
-            }
+        }
+        /* The generation comes from the PCI identity of the accel node, never
+         * from the tile info version above: Strix Halo is an XDNA 2 part and
+         * its firmware reports tile info version 1.1. */
+        int gen = xdna2_is_xdna2_hardware(fd);
+        if (gen == 0) {
+            xdna2_pci_ids_t ids;
+            memset(&ids, 0, sizeof(ids));
+            (void)xdna2_query_pci_ids(fd, &ids);
+            fprintf(stderr,
+                    "this backend targets XDNA 2 (AIE-2); the accel node is "
+                    "PCI %04x:%04x rev %02x\n",
+                    ids.vendor, ids.device, ids.revision);
+            xdna2_close_device(fd);
+            return 0;
+        }
+        if (gen < 0) {
+            printf("NPU generation unknown (PCI identity unreadable from sysfs)\n");
         }
         xdna2_close_device(fd);
     }
