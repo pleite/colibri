@@ -13,6 +13,7 @@
 #include <drm/amdxdna_accel.h>
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,36 @@ typedef struct {
     uint32_t data[1]; /* variable length */
 } ert_packet_t;
 
+/* Compatible with XRT's ert.h layout for ERT_START_NPU (struct ert_npu_data). */
+typedef struct {
+    uint64_t instruction_buffer;
+    uint32_t instruction_buffer_size;
+    uint32_t instruction_prop_count;
+} xdna2_ert_npu_data_t;
+
+/* Kernel argument register payload after ert_npu_data, matching firmware ABI:
+ * x, w, y device pointers as 64-bit values, then I and O. */
+typedef struct {
+    uint64_t x;
+    uint64_t w;
+    uint64_t y;
+    uint32_t I;
+    uint32_t O;
+} xdna2_ert_kernel_args_t;
+
+/* Full payload area written into ert_start_kernel_cmd::data[] for START_NPU. */
+typedef struct {
+    xdna2_ert_npu_data_t npu;
+    xdna2_ert_kernel_args_t args;
+} xdna2_ert_start_npu_payload_t;
+
+_Static_assert(sizeof(xdna2_ert_npu_data_t) == 16, "ert_npu_data size mismatch");
+_Static_assert(sizeof(xdna2_ert_kernel_args_t) == 32, "kernel arg payload size mismatch");
+_Static_assert(offsetof(xdna2_ert_start_npu_payload_t, args) == 16,
+               "START_NPU payload order mismatch");
+_Static_assert((sizeof(xdna2_ert_start_npu_payload_t) % sizeof(uint32_t)) == 0,
+               "START_NPU payload must be 32-bit word aligned");
+
 static uint32_t ert_make_header(uint32_t opcode, uint32_t count) {
     return (ERT_STATE_NEW & 0xFu) |
            ((count & 0x7FFu) << 12) |
@@ -50,6 +81,21 @@ static uint32_t ert_make_header(uint32_t opcode, uint32_t count) {
 static uint32_t read_le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static char *sidecar_xclbin_path(const char *kernel_path) {
+    if (!kernel_path) return NULL;
+    size_t path_len = strlen(kernel_path);
+    const char *dot = strrchr(kernel_path, '.');
+    size_t stem_len = path_len;
+    if (dot && strcmp(dot, ".npukernel") == 0) {
+        stem_len = (size_t)(dot - kernel_path);
+    }
+    char *path = (char *)malloc(stem_len + sizeof(".xclbin"));
+    if (!path) return NULL;
+    memcpy(path, kernel_path, stem_len);
+    memcpy(path + stem_len, ".xclbin", sizeof(".xclbin"));
+    return path;
 }
 
 int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
@@ -141,6 +187,90 @@ int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
         return -EIO;
     }
 
+    if (!runtime->cu_configured) {
+        char *xclbin_path = sidecar_xclbin_path(kernel_path);
+        if (!xclbin_path) {
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOMEM;
+        }
+        FILE *xclfp = fopen(xclbin_path, "rb");
+        if (!xclfp) {
+            fprintf(stderr, "xdna2: sidecar xclbin '%s' not found for '%s'\n",
+                    xclbin_path, kernel_path);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOENT;
+        }
+        if (fseek(xclfp, 0, SEEK_END) != 0) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        long xcl_size_long = ftell(xclfp);
+        if (xcl_size_long <= 0) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EINVAL;
+        }
+        if (fseek(xclfp, 0, SEEK_SET) != 0) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        size_t xcl_size = (size_t)xcl_size_long;
+        uint8_t *xclbin = (uint8_t *)malloc(xcl_size);
+        if (!xclbin) {
+            fclose(xclfp);
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOMEM;
+        }
+        if (fread(xclbin, 1, xcl_size, xclfp) != xcl_size) {
+            fclose(xclfp);
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EINVAL;
+        }
+        fclose(xclfp);
+
+        if (xdna2_create_bo(runtime->device_fd, &entry.pdi_bo, xcl_size, AMDXDNA_BO_DEV) < 0) {
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        if (xdna2_map_bo(runtime->device_fd, &entry.pdi_bo) < 0) {
+            free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        memcpy(entry.pdi_bo.mapped, xclbin, xcl_size);
+        free(xclbin);
+        if (xdna2_sync_bo(runtime->device_fd, &entry.pdi_bo,
+                          SYNC_DIRECT_TO_DEVICE, 0, xcl_size) < 0) {
+            free(xclbin_path);
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        if (xdna2_config_hwctx_single_cu(runtime->device_fd, &runtime->hwctx,
+                                         entry.pdi_bo.handle,
+                                         /* DPU CU function */ 0) < 0) {
+            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            free(xclbin_path);
+            return -EIO;
+        }
+        free(xclbin_path);
+        runtime->cu_configured = true;
+    }
+
     entry.loaded = true;
     runtime->kernels[runtime->kernel_count++] = entry;
 
@@ -178,8 +308,8 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
     /*
      * Pick the control plane before touching the device. This decides how the
      * NPU is validated (DRM ioctls only, or the official XRT + XDNA shim
-     * stack); the fixed-shape dispatch below is DRM in both cases, because the
-     * `.npukernel` artifacts are not xclbins. It never selects a CPU path.
+     * stack); fixed-shape dispatch below is DRM in both cases. It never
+     * selects a CPU path.
      */
     xdna2_control_plane_t requested = XDNA2_CONTROL_PLANE_AUTO;
     if (xdna2_control_plane_from_env(&requested) < 0) {
@@ -233,6 +363,7 @@ void xdna2_runtime_shutdown(xdna2_runtime_t *runtime) {
 
     for (int i = 0; i < runtime->kernel_count; ++i) {
         if (runtime->kernels[i].loaded) {
+            xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].pdi_bo);
             xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].instr_bo);
             runtime->kernels[i].loaded = false;
         }
@@ -346,12 +477,8 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     }
     if (timing) { uint64_t t = now_ns(); timing->upload_ns = t - t_mark; t_mark = t; }
 
-    /*
-     * ERT payload: instruction stream address and word count, then the
-     * device addresses of the three data buffers, in the order the AIE kernel
-     * declares its arguments.
-     */
-    const uint32_t payload_words = 8;
+    const uint32_t payload_words =
+        (uint32_t)(sizeof(xdna2_ert_start_npu_payload_t) / sizeof(uint32_t));
     const size_t cmd_bytes = sizeof(uint32_t) * (2u + payload_words);
     if ((ret = alloc_and_map(fd, &bos.cmd, cmd_bytes, AMDXDNA_BO_CMD)) < 0) goto out;
 
@@ -360,15 +487,15 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     pkt->header = ert_make_header(kernel->ert_opcode, payload_words + 1u /* cu_mask */);
     pkt->cu_mask = kernel->cu_mask;
 
-    uint32_t *d = pkt->data;
-    d[0] = (uint32_t)(kernel->instr_bo.xdna_addr & 0xFFFFFFFFu);
-    d[1] = (uint32_t)(kernel->instr_bo.xdna_addr >> 32);
-    d[2] = kernel->instr_words;
-    d[3] = (uint32_t)(bos.x.xdna_addr & 0xFFFFFFFFu);
-    d[4] = (uint32_t)(bos.w.xdna_addr & 0xFFFFFFFFu);
-    d[5] = (uint32_t)(bos.y.xdna_addr & 0xFFFFFFFFu);
-    d[6] = (uint32_t)I;
-    d[7] = (uint32_t)O;
+    xdna2_ert_start_npu_payload_t *payload = (xdna2_ert_start_npu_payload_t *)pkt->data;
+    payload->npu.instruction_buffer = kernel->instr_bo.xdna_addr;
+    payload->npu.instruction_buffer_size = (uint32_t)kernel->instr_bo.size;
+    payload->npu.instruction_prop_count = 0;
+    payload->args.x = bos.x.xdna_addr;
+    payload->args.w = bos.w.xdna_addr;
+    payload->args.y = bos.y.xdna_addr;
+    payload->args.I = (uint32_t)I;
+    payload->args.O = (uint32_t)O;
 
     uint32_t arg_handles[3] = { bos.x.handle, bos.w.handle, bos.y.handle };
     if (xdna2_submit_command(fd, &runtime->hwctx, bos.cmd.handle, arg_handles, 3) < 0) {

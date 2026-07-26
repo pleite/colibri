@@ -158,6 +158,15 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                        uint32_t max_opc, uint32_t qos);
 
 /**
+ * xdna2_config_hwctx_single_cu — register one CU/PDI BO on a hardware context
+ *
+ * The BO must stay alive while the context uses it.
+ * Returns 0 on success, negative on failure.
+ */
+int xdna2_config_hwctx_single_cu(int fd, xdna2_hwctx_t *ctx,
+                                 uint32_t cu_bo_handle, uint8_t cu_func);
+
+/**
  * xdna2_destroy_hwctx — Destroy hardware context
  */
 int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx);
