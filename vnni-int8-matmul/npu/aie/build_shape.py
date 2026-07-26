@@ -44,6 +44,14 @@ from pathlib import Path
 # The upstream designs live in the mlir-aie checkout the toolchain image pins.
 MATMUL_EXAMPLES = "programming_examples/basic/matrix_multiplication"
 
+# The IRON device name for Strix Halo's NPU. One constant, used both to read the
+# microkernel's MAC geometry and as the design's `--dev`: the MMUL geometry is
+# per-architecture (AIE2 int8 is 4x8x8, AIE2P is 8x8x8), and IRON resolves it
+# from the *current device*, silently falling back to AIE2 when none is set. A
+# planner that reads one architecture's geometry while the design compiles for
+# another produces tilings the design rejects with `assert m % r == 0`.
+DEVICE = "npu2"
+
 # AIE-2 compute tile local memory is 64 KiB. The three live tiles (A, B and the
 # int32 accumulator) have to fit alongside the ObjectFifo double buffering, so
 # the search keeps them well inside it rather than discovering the limit as an
@@ -51,6 +59,12 @@ MATMUL_EXAMPLES = "programming_examples/basic/matrix_multiplication"
 L1_TILE_BUDGET_BYTES = 32 * 1024
 
 TILE_CANDIDATES = (64, 32, 16, 8, 4)
+# A shape that no candidate above can express is retried with wider output
+# tiles. `out / n` is the number of times A is re-streamed, and the 6-bit
+# iteration field caps it at 64, so an out of 16384 needs n >= 256 on the
+# single-core design. Only shapes that would otherwise be reported unsupported
+# see these, so a tiling that already works cannot change under this list.
+WIDE_N_CANDIDATES = (256, 128)
 COLUMN_CANDIDATES = (8, 4, 2, 1)
 N_AIE_ROWS = 4  # rows of compute tiles used by the whole-array design
 TRANSFER_BLOCK_ROWS = 2  # whole_array's transfer-block granularity
@@ -69,10 +83,18 @@ MAX_BD_ITERATIONS = 64
 
 
 def mac_dims(m: int, k: int, n: int) -> tuple[int, int, int]:
-    """MAC dimensions (r, s, t) of the int8 microkernel, from the toolchain."""
-    import numpy as np
-    from aie.iron import kernels
+    """MAC dimensions (r, s, t) of the int8 microkernel, from the toolchain.
 
+    The current device is set first, exactly as the design's own CLI does
+    (`aie.utils.hostruntime.cli.run_design_cli`), because `kernels.mm()` reads
+    the geometry from it. Without it IRON logs a warning and answers for AIE2,
+    which is a different microkernel from the one the design will link.
+    """
+    import numpy as np
+    from aie.iron import kernels, set_current_device
+    from aie.iron.device import from_name
+
+    set_current_device(from_name(DEVICE))
     kernel = kernels.mm(
         dim_m=m,
         dim_k=k,
@@ -105,8 +127,21 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
 
     Preference order is the whole-array design (32 compute tiles) over the
     single-core design, then the largest tile that satisfies every constraint:
-    both maximise the work done per DMA transfer.
+    both maximise the work done per DMA transfer. The ordinary candidate set is
+    searched first; only when it yields nothing are the wide output tiles tried,
+    so adding them can rescue a shape but never re-plan one that already works.
     """
+    plan = _search_tiling(rows, inner, out, TILE_CANDIDATES)
+    if plan is not None:
+        return plan
+    return _search_tiling(
+        rows, inner, out, tuple(WIDE_N_CANDIDATES) + TILE_CANDIDATES
+    )
+
+
+def _search_tiling(
+    rows: int, inner: int, out: int, n_candidates: tuple[int, ...]
+) -> dict | None:
     r, s, t = mac_dims(64, 64, 64)
 
     def tile_ok(m: int, k: int, n: int) -> bool:
@@ -120,7 +155,7 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
     best: dict | None = None
     for m in TILE_CANDIDATES:
         for k in TILE_CANDIDATES:
-            for n in TILE_CANDIDATES:
+            for n in n_candidates:
                 if not tile_ok(m, k, n):
                     continue
                 if inner % k != 0:
@@ -194,7 +229,7 @@ def design_command(
         sys.executable,
         str(script),
         "--dev",
-        "npu2",
+        DEVICE,
         "-M",
         str(rows),
         "-K",

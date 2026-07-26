@@ -41,6 +41,17 @@ These are not preferences and are not ranked against anything:
 A refusal is recorded per engine in `decision.rejected[]`, so the caller can
 print *which* constraint removed an engine rather than "it did not get picked".
 
+In practice the artifact constraint is what decides NPU eligibility today, and
+it is a *row count* constraint: the AIE2P int8 MAC works in blocks of 8 rows, so
+only the 256- and 32-row prefill tiles have compiled kernels, and the 1-row
+decode tile has none and cannot have one with the upstream designs (see
+[`strix-halo-npu.md`](strix-halo-npu.md)). Decode therefore never reaches the
+NPU regardless of what the measured table says, and a prefill row count that is
+not a multiple of 32 leaves a remainder that must be placed elsewhere. Which
+weights are eligible at those row tiles is a separate, coarser question: any
+matmul whose `(inner, out)` is one of the five enumerated projections, and
+nothing else.
+
 ## 2. Measured ranking
 
 With a table loaded (`data/strix_halo_profile.csv`, see

@@ -54,7 +54,12 @@ scheduler is all it takes for the build to pick it up.
 order, everything the toolchain and the hardware impose:
 
 - **MAC dimensions.** `m % r`, `k % s`, `n % t` — read from
-  `aie.iron.kernels.mm(...).mac_dims`, which is `4x8x8` for int8 in / int32 out.
+  `aie.iron.kernels.mm(...).mac_dims`, which for int8 in / int32 out is `8x8x8`
+  on AIE2P (Strix Halo) and `4x8x8` on AIE2 (Phoenix). IRON resolves that
+  geometry from the *current device* and quietly falls back to AIE2 when none is
+  set, so `build_shape.py` sets the device (`npu2`) before asking — the same
+  constant it passes to the design as `--dev`. Reading the AIE2 geometry while
+  compiling for AIE2P is what produced `assert m % r == 0` inside the design.
 - **L1 budget.** `A + B + C` for one core kept inside 32 KiB of the 64 KiB
   compute-tile memory, leaving room for ObjectFifo double buffering.
 - **Design row blocking.** `whole_array` drains C in transfer blocks of two
@@ -70,24 +75,38 @@ order, everything the toolchain and the hardware impose:
 - **Shim ND-DMA iteration count.** The same descriptor holds the outermost wrap
   in a 6 bit field, and A is re-streamed once per column block of B, so
   `out / n` (`out / n / cols` for the whole array) may not exceed 64. This is
-  what rules the single-core design out for `out = 16384`: 256 repeats, rejected
-  as `Size 3 exceeds the [1:64] range`.
+  what rules the single-core design out for `out = 16384` at `n = 64`: 256
+  repeats, rejected as `Size 3 exceeds the [1:64] range`. A shape that no
+  ordinary tile satisfies is retried with wider output tiles (`n` up to 256),
+  which is the only way `32x4096x16384` fits; the retry runs only after the
+  ordinary search found nothing, so it can never re-plan a shape that already
+  builds.
 - **Even core occupancy.** `(rows / m) * (out / n)` must divide by the number of
   cores, so no core in the array is left without an output tile.
 
-The 32-row shapes therefore run on the whole array with `m = 4` rather than on a
-single core: `rows % (8 * m) == 0` admits nothing larger, and it is also the only
-tiling that keeps `out = 16384` inside the iteration field.
+With `r = 8` the row constraint decides which design each row tile lands on:
+
+| row tile | design | why |
+| --- | --- | --- |
+| 256 | `whole_array`, 8 columns, 32 cores | `256 % (8 * m) == 0` for `m = 32` (`m = 16` for `out = 16384`, where the C-drain stride binds) |
+| 32 | `single_core` | the whole array needs `rows % (8 * m) == 0` with `m` a multiple of 8, i.e. at least 64 rows; the single-core design needs only `rows % (2 * m) == 0`, i.e. 16 |
+| 1 | none | see below |
 
 ## What is not built, and why
 
-The AIE int8 MAC has a row granularity of 4, and on top of it each design needs
-whole row blocks: 8 tile rows for the whole-array design, 2 for the single-core
-one. The smallest row count either design can express is therefore 8. The decode
-row tile (`rows = 1`) has no valid tiling, and `build_shape.py` reports it as
+The AIE2P int8 MAC has a row granularity of 8 (`r = 8`), and on top of it each
+design needs whole row blocks: 8 tile rows for the whole-array design, 2 for the
+single-core one. The smallest row count either design can express is therefore
+16, and the smallest the whole array can express is 64. The decode row tile
+(`rows = 1`) has no valid tiling, and `build_shape.py` reports it as
 `unsupported` rather than padding: padding would feed the array uninitialised
 activation rows, and the accumulator for the real row would be correct only by
 luck of what the buffer happened to contain.
+
+That is a property of the microkernel, not of this planner: no choice of `m`,
+`k`, `n`, design or column count makes a 1-row int8 matmul expressible. Only a
+kernel that accepts a row count below the MAC granularity — which the upstream
+designs do not have — would change it.
 
 So a full-set build is partial by construction, and CI passes `--allow-partial`.
 The consequence is visible and safe: no artifact exists for those shapes, the
