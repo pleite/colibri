@@ -7,9 +7,15 @@ piece of silicon in that SoC. None of them falls back to another.
 
 Row-major int8 matmul; each output element is the dot product of an input row
 and a weight row, accumulated with `_mm512_dpbusd_epi32`. Because that
-instruction takes an *unsigned* first operand, the kernel uses the sign-flip
-trick: bias the activations into unsigned range and subtract the corresponding
-correction term from the accumulator.
+instruction takes an *unsigned* first operand, the kernel makes the weights
+unsigned with `_mm512_abs_epi8` and negates the corresponding activation lanes
+with a mask taken from the weight sign bits — two extra operations per vector.
+
+It is a correctness reference, not a tuned kernel: one horizontal reduction per
+*output element*, no register blocking, no weight packing and no threading. The
+alternative sign handling (bias the activations into unsigned range and subtract
+a per-weight-row `128·Σb` precomputed at pack time) removes those two ops, and
+is one of the things Plan A3 exists to measure.
 
 There is no scalar path. On a host without AVX-512 VNNI the backend reports
 `avx512-vnni-unavailable` and the tests skip.
@@ -19,6 +25,14 @@ There is no scalar path. On a host without AVX-512 VNNI the backend reports
 A real compute pipeline, not a wrapper: `gpu/comp.comp` is compiled to
 `gpu/comp.spv` and dispatched over three std430 storage buffers (A, B
 transposed, C) with `{rows, cols, inner}` push constants and a 16×16 local size.
+
+**It is not an int8 engine, and its dataflow is not zero-copy.** The shader is
+f32, so `run_matmul()` widens both int8 operands to f32 on the host, transposes
+B on the host on *every* call even though the weights are constant across
+tokens, and `memcpy`s C back out of the mapped output buffer. All three buffers
+are created and freed per call. The *allocation* is on the unified-memory fast
+path; the *dataflow* is not, and any GPU int8 throughput number taken from this
+path is measuring host-side format conversion as much as the shader.
 
 Load-bearing properties:
 
@@ -36,7 +50,9 @@ Load-bearing properties:
 * Memory is allocated from a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` heap
   where available — the Strix Halo unified-memory fast path, with no staging
   copy. A `SHADER_WRITE → HOST_READ` pipeline barrier still precedes host
-  readback, as the specification requires.
+  readback, as the specification requires. Note that "no staging copy" is a
+  property of the allocation only: the host widening, transpose and readback
+  `memcpy` above are copies all the same.
 * The `VkInstance` / `VkDevice` pair is created once and cached for the process.
 
 ## NPU backend — XDNA 2

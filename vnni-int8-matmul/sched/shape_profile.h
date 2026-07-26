@@ -127,16 +127,42 @@ typedef enum {
     COLI_PROFILE_ESTIMATE = 2, /* scaled from the nearest measured shape */
 } coli_profile_match_t;
 
+/* ── Row-tile classes ──
+ *
+ * A record may only be the basis for an estimate of another shape in the same
+ * row-tile class. The classes exist because `fixed_ns` dominance flips across
+ * them: at rows=1 a dispatch is almost entirely fixed cost, at rows>=256 it is
+ * almost entirely array time. Scaling one from the other by the MAC ratio —
+ * which is what `coli_profile_estimate_ns()` does — is exactly wrong at the
+ * boundary, and wrong in the direction that makes an accelerator look cheap for
+ * decode.
+ */
+typedef enum {
+    COLI_ROW_CLASS_DECODE  = 0, /* rows == 1 */
+    COLI_ROW_CLASS_PREFILL = 1, /* rows > 1 */
+} coli_row_class_t;
+
+/** Row-tile class of `rows`. Non-positive row counts report DECODE. */
+coli_row_class_t coli_row_class(int rows);
+
+/** "decode" / "prefill". */
+const char *coli_row_class_name(coli_row_class_t klass);
+
 /**
  * Estimated per-call cost of `(rows, inner, out, fmt)` on `engine`.
  *
  * An exact record is used as-is. Otherwise the nearest measured record for the
- * same engine and format is scaled: fixed cost is taken unchanged (it does not
- * depend on the shape in any way this harness can see) and array time is scaled
- * by the MAC ratio rows*inner*out. "Nearest" is the record with the smallest
- * log-space distance in that MAC count, which keeps a 1x4096x1024 decode shape
- * from being estimated off a 256x4096x16384 prefill record when a closer one
- * exists.
+ * same engine, format *and row-tile class* is scaled: fixed cost is taken
+ * unchanged (it does not depend on the shape in any way this harness can see)
+ * and array time is scaled by the MAC ratio rows*inner*out. "Nearest" is the
+ * record with the smallest log-space distance in that MAC count, which keeps a
+ * 1x4096x1024 decode shape from being estimated off a 256x4096x16384 prefill
+ * record when a closer one exists.
+ *
+ * The row-tile class is a hard filter, not a preference: with no record in the
+ * request's class the answer is COLI_PROFILE_MISS, so the caller falls back to
+ * the structural rule instead of acting on an extrapolation across the one
+ * boundary where fixed-cost dominance flips.
  *
  * Returns the match kind and, when it is not MISS, stores the estimate in
  * `*ns_out`. An estimate is deliberately distinguishable from a measurement so
@@ -146,6 +172,27 @@ coli_profile_match_t coli_profile_estimate_ns(const coli_shape_profile_t *profil
                                               coli_engine_t engine,
                                               int rows, int inner, int out, int fmt,
                                               double *ns_out);
+
+/**
+ * Cost of uploading the weights of `(rows, inner, out, fmt)` to `engine`, in
+ * nanoseconds, as carried by the record the estimate above would use.
+ *
+ * Every bench record is *cold*: it uploads its operands on every iteration, so
+ * `total_ns` includes an upload the caller may not have to pay. This function
+ * reports the weight-attributable share of that upload — `upload_ns` scaled by
+ * the weight fraction of the record's operand bytes, then rescaled to the
+ * requested weight size — so placement can subtract it for an engine that
+ * already holds the weights.
+ *
+ * Returns the match kind of the record used and stores the cost in `*ns_out`.
+ * Records that did not attribute an upload stage (`upload_ns` is
+ * COLI_PROFILE_UNMEASURED) report 0.0: an unmeasured stage is not a licence to
+ * invent a saving.
+ */
+coli_profile_match_t coli_profile_upload_ns(const coli_shape_profile_t *profile,
+                                            coli_engine_t engine,
+                                            int rows, int inner, int out, int fmt,
+                                            double *ns_out);
 
 #ifdef __cplusplus
 }

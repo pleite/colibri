@@ -6,6 +6,7 @@ This directory contains the active roadmap and the archive of superseded plannin
 
 - `2026-07-17_consolidated-roadmap.md` — the current, consolidated plan for runtime parity, engine fidelity, server features and multimodal follow-up work.
 - `2026-07-17_self-hosted-runner-setup.md` — the current setup note for the Strix Halo self-hosted runner workstream.
+- `2026-07-26_npu-execution-path.md` — Plan A: the remaining work between "the NPU kernels compile" and "the NPU computes" (partition registration, ERT payload, real backend dispatch, one placement policy). Recorded, not scheduled.
 
 ## Archived notes
 

@@ -1,0 +1,196 @@
+name: NPU kernels
+
+# Builds the XDNA 2 kernel artifacts the NPU backend consumes.
+#
+# The AIE toolchain (IRON + Peano, pinned in
+# vnni-int8-matmul/npu/aie/toolchain.lock) is a container image, so the kernels
+# are built the same way in CI and on a developer machine: `make npu-kernels`.
+#
+# No NPU device is needed to *build* kernels — this job compiles them. Running
+# them on the silicon is what the "VNNI GPU Tests" workflow does; it downloads
+# nothing, so a kernel set only reaches a test run once it is committed or the
+# artifact is unpacked into vnni-int8-matmul/npu/kernels.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vnni-int8-matmul/npu/aie/**'
+      - 'vnni-int8-matmul/sched/npu_shapes.*'
+      - 'vnni-int8-matmul/scripts/build-npu-kernels.sh'
+      - 'vnni-int8-matmul/tools/npu_shapes_list.c'
+      - '.github/workflows/npu-kernels.yml'
+  pull_request:
+    paths:
+      - 'vnni-int8-matmul/npu/aie/**'
+      - 'vnni-int8-matmul/sched/npu_shapes.*'
+      - 'vnni-int8-matmul/scripts/build-npu-kernels.sh'
+      - 'vnni-int8-matmul/tools/npu_shapes_list.c'
+      - '.github/workflows/npu-kernels.yml'
+  workflow_dispatch:
+    inputs:
+      shapes:
+        description: Build only these shapes (e.g. "256x4096x1024 32x4096x512")
+        required: false
+        default: ''
+      require_all_shapes:
+        description: Fail when a shape the toolchain cannot express is skipped
+        type: boolean
+        required: false
+        default: false
+      push_image:
+        description: Push the toolchain image to GHCR
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# The self-hosted runner is a single machine and an AIE toolchain image build
+# pulls ~2 GB of wheels; superseded runs must not queue behind each other.
+concurrency:
+  group: npu-kernels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-kernels:
+    name: Build XDNA 2 kernel artifacts
+    # Same default labels as the other workflows: the one self-hosted machine is
+    # registered with `self-hosted, linux, x64` only.
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 120
+
+    env:
+      TOOLCHAIN_IMAGE: ghcr.io/${{ github.repository_owner }}/colibri-aie-toolchain:latest
+      # The decode row tile (rows=1) has no expressible tiling on the AIE int8
+      # MAC, so the default build accepts a partial set and records the reason
+      # per shape in the manifest. Set require_all_shapes to make that fatal.
+      ALLOW_PARTIAL: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_all_shapes == true) && '0' || '1' }}
+
+    steps:
+      # Reports, then gates: the toolchain image cannot be built without
+      # podman, and there is no fallback path worth having for that.
+      - name: Runner preflight
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## NPU kernel build preflight"
+            echo '```text'
+            echo "podman:  $(podman --version 2>/dev/null || echo 'not installed')"
+            echo "python:  $(python3 --version 2>/dev/null || echo 'not installed')"
+            echo "cc:      $(cc --version 2>/dev/null | head -1 || echo 'not installed')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          command -v podman >/dev/null || { echo "podman is required" >&2; exit 1; }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Cheap checks first: they need neither podman nor the toolchain, and they
+      # are the ones that catch a shape-set or container-format mistake.
+      - name: Check the shape set and the container packer
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          make npu-kernels-check
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | podman login \
+            --username "${{ github.actor }}" --password-stdin ghcr.io
+
+      - name: Build the AIE toolchain image
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/build-npu-kernels.sh --image-only
+
+      - name: Build the kernel artifacts
+        working-directory: vnni-int8-matmul
+        shell: bash
+        # The shape filter reaches the shell through the environment, never
+        # through expression interpolation, and each entry is checked against
+        # the rowsXinnerXout form before it is used as an argument.
+        env:
+          SHAPES: ${{ inputs.shapes }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${ALLOW_PARTIAL}" = "1" ]; then
+            args+=(--allow-partial)
+          fi
+          read -ra shapes <<< "${SHAPES:-}"
+          for shape in "${shapes[@]+"${shapes[@]}"}"; do
+            if ! [[ "${shape}" =~ ^[0-9]+x[0-9]+x[0-9]+$ ]]; then
+              echo "not a shape: ${shape}" >&2
+              exit 2
+            fi
+          done
+          ./scripts/build-npu-kernels.sh "${args[@]}" "${shapes[@]+"${shapes[@]}"}"
+
+      # An artifact that the C loader would reject is worse than no artifact:
+      # it turns a clean -ENOENT into a load failure at inference time.
+      - name: Verify every artifact parses as the loader reads it
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(npu/kernels/*.npukernel)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "the build produced no kernel artifacts at all" >&2
+            exit 1
+          fi
+          python3 npu/aie/pack_npukernel.py --verify "${artifacts[@]}"
+
+      - name: Publish the kernel manifest
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          {
+            echo "## NPU kernel build"
+            echo ""
+            if [ -f npu/kernels/manifest.json ]; then
+              echo '```json'
+              cat npu/kernels/manifest.json
+              echo '```'
+            else
+              echo "No manifest was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-kernels
+          if-no-files-found: warn
+          path: |
+            vnni-int8-matmul/npu/kernels/*.npukernel
+            vnni-int8-matmul/npu/kernels/*.xclbin
+            vnni-int8-matmul/npu/kernels/manifest.json
+
+      # The image is the expensive part of the build; publishing it means a
+      # developer machine can run `CONTAINER_IMAGE=ghcr.io/... make npu-kernels`
+      # without rebuilding the toolchain.
+      - name: Push the toolchain image
+        if: >-
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.push_image)
+        shell: bash
+        run: |
+          set -euo pipefail
+          podman push "${TOOLCHAIN_IMAGE}"

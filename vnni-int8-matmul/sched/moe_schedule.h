@@ -155,8 +155,82 @@ int coli_moe_plan_build(const coli_moe_grouping_t *grouping,
                         int inner, int out, int fmt,
                         coli_moe_plan_t *plan);
 
+/**
+ * Place every group, asking `resident` whether each engine already holds the
+ * expert's weights.
+ *
+ * This is the seam that makes a warm expert cheaper than a cold one: the
+ * measured table is cold by construction (the bench re-uploads on every
+ * iteration), so without this input placement charges every group for an upload
+ * it may not owe. `resident` may be NULL, which reproduces the cold table
+ * exactly. It is called once per (group, engine) and must not dispatch.
+ *
+ * Same return values as coli_moe_plan_build().
+ */
+typedef bool (*coli_moe_weights_resident_fn)(int expert, coli_engine_t engine,
+                                             void *user);
+
+int coli_moe_plan_build_resident(const coli_moe_grouping_t *grouping,
+                                 const coli_placement_policy_t *policy,
+                                 const coli_placement_caps_t *caps,
+                                 const coli_moe_lane_limits_t *limits,
+                                 int inner, int out, int fmt,
+                                 coli_moe_weights_resident_fn resident,
+                                 void *resident_user,
+                                 coli_moe_plan_t *plan);
+
 /** Number of planned items assigned to `engine`. */
 int coli_moe_plan_engine_items(const coli_moe_plan_t *plan, coli_engine_t engine);
+
+/* ── Execution ──
+ *
+ * The plan is data; this runs it. It still dispatches nothing itself — the
+ * caller supplies the function that computes one group — but it owns the two
+ * things a caller would otherwise have to reinvent per call site: the order
+ * items are issued in, and the concurrency each engine is allowed.
+ *
+ * Ordering is by waves. Each wave issues at most `lane_limit(engine)` items per
+ * engine, in group order, so an engine is never oversubscribed and the sequence
+ * is deterministic and replayable. The NPU's cap is 1 (COLI_MOE_NPU_LANES), so
+ * its items serialise through the single hardware context, which is what the
+ * one-partition-one-hwctx constraint requires.
+ *
+ * There is no fallback. A group whose dispatch fails stops the run and the
+ * error is returned; it is never re-placed onto another engine, because a
+ * backend computing on another backend's behalf is what makes a measurement a
+ * lie.
+ */
+
+/**
+ * Compute one group. Returns 0 on success or a negative errno; anything
+ * non-zero aborts the run.
+ */
+typedef int (*coli_moe_dispatch_fn)(const coli_moe_plan_item_t *item, void *user);
+
+typedef struct {
+    int waves;                            /* issue rounds performed */
+    int dispatched;                       /* items dispatched successfully */
+    int per_engine[COLI_ENGINE_COUNT_];   /* dispatched, per engine */
+    int max_in_flight[COLI_ENGINE_COUNT_];/* largest wave width per engine */
+    int failed_item;                      /* index of the failing item, else -1 */
+    int failed_rc;                        /* its return value, else 0 */
+} coli_moe_exec_stats_t;
+
+/**
+ * Run `plan`.
+ *
+ * Refuses (-EINVAL) a plan with unplaced groups: a plan that could not place
+ * everything is not runnable, and running the placeable part silently would
+ * drop tokens. `stats` may be NULL.
+ *
+ * Returns 0 when every item ran, the dispatcher's negative return value when
+ * one failed, or -EINVAL for a NULL plan, limits or dispatcher.
+ */
+int coli_moe_plan_execute(const coli_moe_plan_t *plan,
+                          const coli_moe_lane_limits_t *limits,
+                          coli_moe_dispatch_fn dispatch,
+                          void *user,
+                          coli_moe_exec_stats_t *stats);
 
 /* ── Expert weight residency ──
  *

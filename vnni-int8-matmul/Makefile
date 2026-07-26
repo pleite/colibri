@@ -33,7 +33,7 @@ endif
 TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
          tests/npu_device_test tests/test_placement tests/test_moe_schedule
 
-TOOLS := bench/backend_bench
+TOOLS := bench/backend_bench tools/npu_shapes_list tools/placement_report
 
 all: $(TESTS) $(TOOLS)
 
@@ -70,16 +70,35 @@ NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o \
 
 # The scheduler plans work; it dispatches none, so it needs neither the Vulkan
 # nor the amdxdna headers and its tests run on any host.
-sched/%.o: sched/%.c
+sched/%.o: sched/%.c sched/shape_profile.h sched/npu_shapes.h \
+           sched/backend_placement.h sched/moe_schedule.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 SCHED_OBJS := sched/shape_profile.o sched/npu_shapes.o sched/backend_placement.o \
               sched/moe_schedule.o
 
-bench/backend_bench.o: bench/backend_bench.c
+# Deliberately not in SCHED_OBJS: this is the one scheduler object that links
+# the backends, so the scheduler's own tests keep building on a host with none
+# of the silicon.
+sched/engine_caps.o: sched/engine_caps.c sched/engine_caps.h \
+                     sched/backend_placement.h cpu/vnni_cpu_backend.h \
+                     gpu/vulkan_backend.h npu/xdna2_backend.h
+
+# Every consumer sees the scheduler and backend headers. Listing them is not
+# cosmetic: these objects embed struct layouts, so a stale object linked against
+# a changed header corrupts the stack rather than failing to build.
+PUBLIC_HEADERS := sched/shape_profile.h sched/npu_shapes.h \
+                  sched/backend_placement.h sched/moe_schedule.h \
+                  sched/engine_caps.h cpu/vnni_cpu_backend.h \
+                  gpu/vulkan_backend.h npu/xdna2_backend.h
+
+bench/backend_bench.o: bench/backend_bench.c $(PUBLIC_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-tests/%.o: tests/%.c
+tools/%.o: tools/%.c $(PUBLIC_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+tests/%.o: tests/%.c $(PUBLIC_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 # ── Binaries ──────────────────────────────────────────────────────────────────
@@ -109,6 +128,18 @@ bench/backend_bench: bench/backend_bench.o cpu/vnni_cpu_backend.o \
                      gpu/vulkan_backend.o $(NPU_OBJS) $(SCHED_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Prints the enumerated NPU shape set so the kernel build reads it from
+# sched/npu_shapes.c instead of carrying a second copy of the enumeration.
+tools/npu_shapes_list: tools/npu_shapes_list.o sched/npu_shapes.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Prints, for this host, which engine each enumerated shape would run on and
+# why the others were refused. Probes the devices, so it links the backends.
+tools/placement_report: tools/placement_report.o sched/engine_caps.o \
+                        $(SCHED_OBJS) cpu/vnni_cpu_backend.o \
+                        gpu/vulkan_backend.o $(NPU_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 # ── Test / clean ──────────────────────────────────────────────────────────────
 
 test: $(TESTS)
@@ -122,6 +153,23 @@ test: $(TESTS)
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
 
+# ── NPU kernel artifacts ──────────────────────────────────────────────────────
+# The AIE toolchain (IRON + Peano) is pinned in npu/aie/toolchain.lock and lives
+# in its own build-only container image; it is not part of the test image and
+# needs no NPU device. See npu/aie/README.md.
+
+npu-toolchain-image:
+	./scripts/build-npu-kernels.sh --image-only
+
+npu-kernels: tools/npu_shapes_list
+	./scripts/build-npu-kernels.sh
+
+# Host-side checks that need no toolchain and no NPU: the container packer
+# round-trips, and the enumerated shape set is printable.
+npu-kernels-check: tools/npu_shapes_list
+	python3 npu/aie/pack_npukernel.py --self-test
+	./tools/npu_shapes_list
+
 # test_output.log is deliberately NOT removed here. It is written on the host by
 # scripts/strix-halo-podman-test.sh with `tee`, while the container runs
 # `make clean` in the same bind-mounted directory: removing it unlinks the file
@@ -129,6 +177,8 @@ podman-test: scripts/strix-halo-podman-test.sh
 # disk and CI reports "no test log produced".
 clean:
 	rm -f $(TESTS) $(TOOLS) tests/*.o cpu/*.o npu/*.o gpu/*.o sched/*.o bench/*.o \
-	      $(NPU_DIR)/*.o
+	      tools/*.o $(NPU_DIR)/*.o
+	rm -rf npu/aie/build npu/aie/__pycache__
 
-.PHONY: all shader test podman-test clean
+.PHONY: all shader test podman-test clean \
+        npu-toolchain-image npu-kernels npu-kernels-check

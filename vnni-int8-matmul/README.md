@@ -20,10 +20,14 @@ cannot.
 | `gpu/vulkan_dispatch.h` | Dispatch tables built only from `<vulkan/vulkan_core.h>` |
 | `gpu/comp.comp`, `gpu/comp.spv` | GEMM compute shader source and compiled SPIR-V |
 | `npu/xdna2_backend.[ch]` | XDNA 2 NPU backend, driving `c/npu_kernels/` |
+| `npu/aie/` | Containerised AIE toolchain that compiles the `.npukernel` artifacts |
+| `tools/npu_shapes_list.c` | Prints the enumerated shape set, so the kernel build has one source of truth |
+| `tools/placement_report.c` | Prints, per shape, which engine this host would use and why the others were refused |
 | `sched/shape_profile.[ch]` | The measured per-shape, per-engine cost table |
 | `sched/npu_shapes.[ch]` | Qwen 3.6 MoE shape enumeration and host-side row tiling |
 | `sched/backend_placement.[ch]` | `coli_choose_backend()`, the one placement decision |
-| `sched/moe_schedule.[ch]` | Router grouping, lane caps, expert weight residency |
+| `sched/moe_schedule.[ch]` | Router grouping, lane caps, plan execution, expert weight residency |
+| `sched/engine_caps.[ch]` | Fills the placement capability snapshot by probing the real devices |
 | `bench/backend_bench.c` | Sweeps the shapes and writes the measured table |
 | `data/` | Where the measured table lives; see `data/README.md` |
 | `kernel/vnni_matmul_test.c` | Small CPU-backend demo |
@@ -34,6 +38,7 @@ cannot.
 | `tests/test_placement.c` | Profile table, shape set and placement policy, host-only |
 | `tests/test_moe_schedule.c` | Expert grouping, lane caps and residency, host-only |
 | `scripts/strix-halo-podman-test.sh` | Headless Podman harness for the Strix Halo host |
+| `scripts/build-npu-kernels.sh` | Builds every enumerated NPU kernel in the toolchain container |
 
 ## Build requirements
 
@@ -60,6 +65,19 @@ make bench/backend_bench
 With no table present, `coli_choose_backend()` still decides, but labels the
 decision `structural` so it cannot be mistaken for a measurement. See
 [docs/placement-policy.md](../docs/placement-policy.md).
+
+## NPU kernels
+
+The `.npukernel` artifacts are compiled, not committed:
+
+```bash
+make npu-kernels          # toolchain image + every buildable shape
+make npu-kernels-check    # host-only checks: shape set and container format
+```
+
+CI builds them too (`.github/workflows/npu-kernels.yml`) and uploads them as the
+`npu-kernels` artifact. See [npu/aie/README.md](npu/aie/README.md) for the
+toolchain, and for what is deliberately not built.
 
 On the Strix Halo host, headless, in a container:
 

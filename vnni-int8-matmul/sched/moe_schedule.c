@@ -156,11 +156,23 @@ int coli_moe_plan_build(const coli_moe_grouping_t *grouping,
                         const coli_moe_lane_limits_t *limits,
                         int inner, int out, int fmt,
                         coli_moe_plan_t *plan) {
+    return coli_moe_plan_build_resident(grouping, policy, caps, limits,
+                                        inner, out, fmt, NULL, NULL, plan);
+}
+
+int coli_moe_plan_build_resident(const coli_moe_grouping_t *grouping,
+                                 const coli_placement_policy_t *policy,
+                                 const coli_placement_caps_t *caps,
+                                 const coli_moe_lane_limits_t *limits,
+                                 int inner, int out, int fmt,
+                                 coli_moe_weights_resident_fn resident,
+                                 void *resident_user,
+                                 coli_moe_plan_t *plan) {
     if (!grouping || !policy || !caps || !limits || !plan) return -EINVAL;
     if (inner <= 0 || out <= 0) return -EINVAL;
 
     coli_moe_plan_free(plan);
-    if (grouping->group_count == 0) return 0;
+    if (grouping->group_count <= 0) return 0;
 
     coli_moe_plan_item_t *items = (coli_moe_plan_item_t *)calloc(
         (size_t)grouping->group_count, sizeof(*items));
@@ -172,8 +184,19 @@ int coli_moe_plan_build(const coli_moe_grouping_t *grouping,
     int unplaced = 0;
     for (int g = 0; g < grouping->group_count; ++g) {
         const coli_moe_group_t *group = &grouping->groups[g];
+
+        /* Per-group residency: the same expert can be warm on one engine and
+         * cold on another, and that is the whole point of asking. */
+        coli_placement_caps_t group_caps = *caps;
+        if (resident) {
+            for (int e = COLI_ENGINE_CPU; e < COLI_ENGINE_COUNT_; ++e) {
+                group_caps.weights_resident[e] =
+                    resident(group->expert, (coli_engine_t)e, resident_user);
+            }
+        }
+
         coli_placement_decision_t decision;
-        coli_engine_t engine = coli_choose_backend(policy, caps, group->rows,
+        coli_engine_t engine = coli_choose_backend(policy, &group_caps, group->rows,
                                                    inner, out, fmt, &decision);
 
         items[g].group_index = g;
@@ -208,6 +231,84 @@ int coli_moe_plan_engine_items(const coli_moe_plan_t *plan, coli_engine_t engine
         if (plan->items[i].engine == engine) n++;
     }
     return n;
+}
+
+/* ── Execution ── */
+
+int coli_moe_plan_execute(const coli_moe_plan_t *plan,
+                          const coli_moe_lane_limits_t *limits,
+                          coli_moe_dispatch_fn dispatch,
+                          void *user,
+                          coli_moe_exec_stats_t *stats) {
+    coli_moe_exec_stats_t local;
+    if (!stats) stats = &local;
+    memset(stats, 0, sizeof(*stats));
+    stats->failed_item = -1;
+
+    if (!plan || !limits || !dispatch) return -EINVAL;
+    if (plan->count > 0 && !plan->items) return -EINVAL;
+    if (plan->unplaced > 0) {
+        /* Running the placeable part would drop the rest of the tokens on the
+         * floor. An unplaceable plan is a scheduling failure, not a partial
+         * success. */
+        return -EINVAL;
+    }
+    if (plan->count <= 0) return 0;
+
+    bool *done = (bool *)calloc((size_t)plan->count, sizeof(*done));
+    if (!done) return -ENOMEM;
+
+    int remaining = plan->count;
+    while (remaining > 0) {
+        int issued_this_wave[COLI_ENGINE_COUNT_];
+        memset(issued_this_wave, 0, sizeof(issued_this_wave));
+        int issued = 0;
+
+        for (int i = 0; i < plan->count; ++i) {
+            if (done[i]) continue;
+            const coli_moe_plan_item_t *item = &plan->items[i];
+            const coli_engine_t engine = item->engine;
+            if (engine <= COLI_ENGINE_NONE || engine >= COLI_ENGINE_COUNT_) {
+                free(done);
+                return -EINVAL;
+            }
+            const int lanes = coli_moe_lane_limit(limits, engine);
+            if (lanes <= 0) {
+                free(done);
+                return -EINVAL;
+            }
+            if (issued_this_wave[engine] >= lanes) continue;
+
+            const int rc = dispatch(item, user);
+            if (rc != 0) {
+                stats->failed_item = i;
+                stats->failed_rc = rc;
+                free(done);
+                return rc;
+            }
+
+            done[i] = true;
+            remaining--;
+            issued++;
+            issued_this_wave[engine]++;
+            stats->dispatched++;
+            stats->per_engine[engine]++;
+            if (issued_this_wave[engine] > stats->max_in_flight[engine]) {
+                stats->max_in_flight[engine] = issued_this_wave[engine];
+            }
+        }
+
+        stats->waves++;
+        if (issued == 0) {
+            /* No engine could take anything: the lane limits contradict the
+             * plan. Spinning here would hang the caller. */
+            free(done);
+            return -EINVAL;
+        }
+    }
+
+    free(done);
+    return 0;
 }
 
 /* ── Expert weight residency ── */

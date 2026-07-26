@@ -184,6 +184,54 @@ tiles (256 for bulk prefill, 32 for small prefill, 1 for decode). That is 15
 artifacts, which is what `XDNA2_MAX_KERNELS` is sized from; the number follows
 from the enumeration rather than the other way round.
 
+**How they are compiled.** `vnni-int8-matmul/npu/aie/` builds the artifacts
+from a pinned IRON/`mlir-aie` + Peano toolchain packaged as a Podman image, and
+`.github/workflows/npu-kernels.yml` runs that build in CI and publishes the
+result as an artifact. AMD's proprietary `aiecompiler` has no public release
+for XDNA 2, so the open toolchain is the only route; see
+[`vnni-int8-matmul/npu/aie/README.md`](../vnni-int8-matmul/npu/aie/README.md)
+for how to run it and for the gaps that remain. Two of those gaps matter here:
+the decode row tile (`rows = 1`) has no valid tiling on the AIE int8 MAC and is
+not built, and the DRM path does not yet register the compiled xclbin's
+partition with the firmware.
+
+**Which tensors can run on the NPU, and which cannot.** The AIE2P int8
+microkernel multiplies in units of `8x8x8` (`kernels.mm(...).mac_dims` with the
+device set to `npu2`; the AIE2 value of `4x8x8` is what IRON answers when no
+device is set, and planning against it produces tilings the design rejects).
+Everything below follows from that row granularity of 8 plus the row blocking
+each design imposes:
+
+| row tile | what it is | on the NPU? |
+| --- | --- | --- |
+| 256 | bulk prefill | yes — all five projections, whole-array design |
+| 32 | small prefill | yes — all five projections, single-core design (the whole array needs at least 64 rows) |
+| 1 | decode | **no** — a 1-row int8 matmul is not expressible on an 8-row MAC |
+
+So the NPU is a *prefill* engine for this model. Every decode step, and every
+prefill remainder that is not a whole multiple of 32 rows, has no artifact and
+is refused with `-ENOENT`; `coli_choose_backend()` sees that through
+`caps.npu_kernel_exists` and places the work on the CPU or the iGPU. Row counts
+that are not multiples of 32 are decomposed by `coli_npu_plan_tiles()` into
+`256`/`32`/`1` tiles, and the `1`-row tiles are exactly the part that does not
+run — the remainder must be placed on another engine, not padded onto the NPU,
+because a fixed-shape kernel reads exactly the rows it was compiled for and
+padding would feed it uninitialised activations.
+
+Tensor eligibility is otherwise per *projection*, not per weight: the five
+`(inner, out)` pairs above cover q/k/v/o, the router gate and the expert
+gate/up/down matrices, so any weight matching one of those pairs is eligible at
+the supported row tiles. A projection outside the set is refused rather than
+matched to the nearest compiled shape. Everything that is not an int8 matmul of
+one of those pairs — attention itself, the softmax/top-k router arithmetic,
+RMSNorm, RoPE, the SiLU/mul in the expert MLP and all dequantisation — has no
+NPU kernel at all and is not a candidate for placement.
+
+The compiled kernels accumulate in **int32** with no on-chip dequantisation, so
+the readback path scales accumulators through `xdna2_dequant_i32()` instead of
+reinterpreting the output buffer as floats — `fmt = 1` means "int8 operands,
+int32 accumulators", not "int8 in, float out".
+
 Any row count is then covered host-side by `coli_npu_plan_tiles()`, which
 splits it greedily into those exact tiles, so every dispatch hits a compiled
 kernel and the loader never has to widen a match.

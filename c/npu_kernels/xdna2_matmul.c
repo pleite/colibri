@@ -387,15 +387,14 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
         ret = -EIO;
         goto out;
     }
-    memcpy(y, bos.y.mapped, y_bytes);
-
-    if (scales) {
-        for (int s = 0; s < S; ++s) {
-            for (int o = 0; o < O; ++o) {
-                y[(size_t)s * (size_t)O + (size_t)o] *= scales[o];
-            }
-        }
-    }
+    /* The AIE int8 datapath accumulates into int32 — every artifact is compiled
+     * with dtype_in=i8, dtype_out=i32; see
+     * vnni-int8-matmul/npu/aie/build_shape.py — so the output BO holds
+     * accumulators, not floats. Reinterpreting those bytes as f32 would be
+     * silently wrong in exactly the way the NPU guardrails exist to prevent. The
+     * per-column scale that turns them back into activations is applied here, on
+     * the host, because the kernels carry no dequantisation epilogue. */
+    xdna2_dequant_i32((const int32_t *)bos.y.mapped, y, S, O, scales);
     if (timing) { uint64_t t = now_ns(); timing->readback_ns = t - t_mark; t_mark = t; }
     ret = 0;
 
@@ -407,6 +406,20 @@ out:
         timing->total_ns = t - t_start;
     }
     return ret;
+}
+
+void xdna2_dequant_i32(const int32_t *acc, float *out, int S, int O,
+                       const float *scales) {
+    if (!acc || !out || S <= 0 || O <= 0) return;
+
+    for (int s = 0; s < S; ++s) {
+        const int32_t *row = acc + (size_t)s * (size_t)O;
+        float *dst = out + (size_t)s * (size_t)O;
+        for (int o = 0; o < O; ++o) {
+            const float scale = scales ? scales[o] : 1.0f;
+            dst[o] = (float)row[o] * scale;
+        }
+    }
 }
 
 void xdna2_dequant_int4(const uint8_t *packed, int8_t *out, int O, int I) {

@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1.7
+#
+# AIE toolchain image for the Strix Halo NPU kernels.
+#
+# This image compiles the fixed-shape INT8 matmul kernels that
+# c/npu_kernels/xdna2_matmul.c consumes as `.npukernel` artifacts. It is a
+# *build* image: it never touches /dev/accel/accel0 and is not the image the
+# tests run in (that one is ../../Dockerfile.strix-halo-test).
+#
+# Why this toolchain
+# ------------------
+# AMD's proprietary `aiecompiler` (Vitis AIE Essentials) is not publicly
+# distributable, which is why no kernels existed. The open-source route is
+# Xilinx/mlir-aie — the IRON Python API plus `aiecc` — with Peano (`llvm-aie`)
+# as the AIE2/AIE2P code generator. That is the same route the community
+# xdna-engine project takes; see README.md next to this file. Both are ordinary
+# pip wheels, so the toolchain fits in a container and therefore in CI.
+#
+# Every version is pinned in toolchain.lock; scripts/build-npu-kernels.sh reads
+# that file and passes the values as build args.
+#
+# Build:
+#   podman build -f npu/aie/Containerfile.aie-toolchain -t colibri-aie-toolchain npu/aie
+#
+# The kernel build scripts and the shape set are bind-mounted at run time by
+# scripts/build-npu-kernels.sh, so a build always reflects the checkout.
+
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+FROM ${BASE_IMAGE}
+
+ARG MLIR_AIE_VERSION=1.3.4
+ARG MLIR_AIE_WHEEL_INDEX=https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.3.4
+ARG MLIR_AIE_GIT=https://github.com/Xilinx/mlir-aie.git
+ARG MLIR_AIE_REF=v1.3.4
+ARG PEANO_REQUIREMENTS=utils/peano-requirements.txt
+ARG PYTHON_VERSION=3.12
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    IRON_VENV=/opt/ironenv \
+    MLIR_AIE_SRC=/opt/mlir-aie
+
+# build-essential  -> the ERT opcode probe is a C program compiled against XRT
+# python3-venv     -> the IRON wheels go into a venv, not the system Python
+# git/curl/ca-*    -> fetch the mlir-aie checkout the wheel was released from
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git make \
+        python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
+        software-properties-common gnupg; \
+    rm -rf /var/lib/apt/lists/*
+
+# XRT supplies two things this build must not guess: <xrt/detail/ert.h>, which
+# defines the ERT command opcodes, and xclbinutil, which reports the compute
+# units of a compiled kernel. pack_npukernel.py reads both. A failure to install
+# them is fatal here rather than later, when it would mean artifacts carrying an
+# invented opcode — guardrail 4 in docs/strix-halo-npu.md.
+RUN set -eux; \
+    add-apt-repository -y ppa:amd-team/xrt; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libxrt2 libxrt-dev libxrt-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+# IRON. The mlir_aie wheel and the git checkout are the same release: the wheel
+# supplies `aie.iron` and aiecc, the checkout supplies the matmul designs under
+# programming_examples/ and the Peano pin that release was tested against.
+# PYTHONPATH is deliberately *not* pointed at the checkout — its python/ tree is
+# the unbuilt source of the very package the wheel installs.
+RUN set -eux; \
+    python${PYTHON_VERSION} -m venv "${IRON_VENV}"; \
+    "${IRON_VENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel; \
+    "${IRON_VENV}/bin/pip" install --no-cache-dir \
+        "mlir_aie==${MLIR_AIE_VERSION}" -f "${MLIR_AIE_WHEEL_INDEX}"; \
+    git clone --depth 1 --branch "${MLIR_AIE_REF}" "${MLIR_AIE_GIT}" "${MLIR_AIE_SRC}"; \
+    "${IRON_VENV}/bin/pip" install --no-cache-dir -r "${MLIR_AIE_SRC}/python/requirements.txt"; \
+    "${IRON_VENV}/bin/pip" install --no-cache-dir -r "${MLIR_AIE_SRC}/${PEANO_REQUIREMENTS}"
+
+# Peano ships inside the venv as a directory whose name is not a valid module
+# name ("llvm-aie"), so it is located, not imported — the same way mlir-aie's own
+# utils/env_setup.sh does it.
+RUN set -eux; \
+    peano="$(ls -d "${IRON_VENV}"/lib/python*/site-packages/llvm-aie | head -1)"; \
+    test -x "${peano}/bin/clang"; \
+    ert_header="$(find /usr/include /opt/xilinx -name ert.h -path '*xrt*' -print -quit)"; \
+    test -n "${ert_header}"; \
+    { \
+      printf 'export PEANO_INSTALL_DIR=%s\n' "${peano}"; \
+      printf 'export MLIR_AIE_SRC=%s\n' "${MLIR_AIE_SRC}"; \
+      printf 'export COLI_AIE_ERT_HEADER=%s\n' "${ert_header}"; \
+      printf 'export PATH=%s/bin:$PATH\n' "${IRON_VENV}"; \
+    } > /etc/profile.d/aie-toolchain.sh
+
+ENV PATH="/opt/ironenv/bin:${PATH}"
+
+# The ERT opcode is read out of XRT's own header at image build time, so a
+# kernel artifact can never carry a value that was typed in by hand.
+COPY ert_opcode_probe.c /opt/ert_opcode_probe.c
+RUN set -eux; \
+    . /etc/profile.d/aie-toolchain.sh; \
+    gcc -I/usr/include -I/opt/xilinx/xrt/include /opt/ert_opcode_probe.c \
+        -o /usr/local/bin/ert-opcode-probe; \
+    /usr/local/bin/ert-opcode-probe
+
+# Fail at image build time rather than halfway through a 15-shape kernel build.
+RUN set -eux; \
+    . /etc/profile.d/aie-toolchain.sh; \
+    "${PEANO_INSTALL_DIR}/bin/clang" --version | head -1; \
+    python -c "import aie.iron; from aie.iron import kernels; print('iron ok')"; \
+    command -v aiecc.py; \
+    command -v xclbinutil; \
+    test -f "${MLIR_AIE_SRC}/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py"; \
+    test -f "${MLIR_AIE_SRC}/programming_examples/basic/matrix_multiplication/single_core/single_core.py"
+
+WORKDIR /work/vnni-int8-matmul
+CMD ["bash", "-l"]

@@ -204,6 +204,18 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
                             xdna2_matmul_timing_t *timing);
 
 /**
+ * xdna2_dequant_i32 — turn the NPU's int32 accumulators into f32 activations.
+ *
+ * The compiled kernels are int8 x int8 -> int32 (dtype_in=i8, dtype_out=i32 in
+ * vnni-int8-matmul/npu/aie/build_shape.py) and carry no dequantisation
+ * epilogue, so the output buffer object holds accumulators. `scales` is the
+ * per-output-column scale; NULL means unity. `acc` and `out` both hold S*O
+ * elements and may not overlap.
+ */
+void xdna2_dequant_i32(const int32_t *acc, float *out, int S, int O,
+                       const float *scales);
+
+/**
  * xdna2_dequant_int4 — expand packed int4 weights to int8, two nibbles per
  * byte, zero point 8. Output buffer must hold O*I bytes.
  *

@@ -193,8 +193,7 @@ static void test_profile_parse(void) {
     coli_profile_free(profile);
 }
 
-static void test_profile_rejects_garbage(void) {
-    const char *bad[] = {
+static void test_profile_rejects_garbage(void) {    const char *bad[] = {
         "cpu,1,4096,1024,1,5,1000.0\n",                          /* short row */
         "tpu,1,4096,1024,1,5,1,0,-1,-1,-1,-1,-1,-1\n",           /* unknown engine */
         "cpu,0,4096,1024,1,5,1,0,-1,-1,-1,-1,-1,-1\n",           /* zero rows */
@@ -308,6 +307,135 @@ static void test_placement_constraints(void) {
               == COLI_ENGINE_NONE, "zero rows must be refused");
     CHECK(coli_choose_backend(NULL, &caps, 1, 1, 1, 1, &decision)
               == COLI_ENGINE_NONE, "a NULL policy must be refused");
+}
+
+/* ── Row-tile class guard (A4.4) ── */
+
+static void test_row_class_guard(void) {
+    /* Only a decode record for the cpu, only a prefill record for the gpu. */
+    const char *table =
+        "cpu,1,4096,1024,1,5,1000.0,0.0,-1,-1,-1,-1,-1,-1\n"
+        "gpu,256,4096,1024,1,5,15000.0,2000.0,-1,-1,-1,-1,-1,-1\n";
+    coli_shape_profile_t *profile = load_table(table);
+    CHECK(profile != NULL, "table did not load");
+    if (!profile) return;
+
+    CHECK(coli_row_class(1) == COLI_ROW_CLASS_DECODE, "rows=1 is decode");
+    CHECK(coli_row_class(32) == COLI_ROW_CLASS_PREFILL, "rows=32 is prefill");
+    CHECK(strcmp(coli_row_class_name(COLI_ROW_CLASS_PREFILL), "prefill") == 0,
+          "prefill class name");
+
+    double ns = 0.0;
+    /* A prefill request must not be estimated from the decode-only cpu record:
+     * that is the extrapolation where fixed cost dominance flips. */
+    CHECK(coli_profile_estimate_ns(profile, COLI_ENGINE_CPU, 256, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_MISS,
+          "a prefill shape was estimated from a decode record");
+    /* And the mirror: decode must not be estimated from the prefill gpu record. */
+    CHECK(coli_profile_estimate_ns(profile, COLI_ENGINE_GPU, 1, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_MISS,
+          "a decode shape was estimated from a prefill record");
+    /* Within a class it still estimates. */
+    CHECK(coli_profile_estimate_ns(profile, COLI_ENGINE_GPU, 128, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_ESTIMATE, "a same-class estimate must still work");
+    /* An exact record is an exact record regardless of class filtering. */
+    CHECK(coli_profile_estimate_ns(profile, COLI_ENGINE_CPU, 1, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_EXACT, "the exact record was lost");
+
+    coli_profile_free(profile);
+}
+
+/* ── Data-movement term (A4.3) ── */
+
+static void test_upload_cost(void) {
+    /* One npu record whose upload stage is attributed, one gpu record whose is
+     * not. 256x4096x1024 moves 256*4096 + 4096*1024 + 256*1024*4 = 6291456
+     * bytes, of which 4194304 are weights: two thirds of the 3000 ns upload. */
+    const char *table =
+        "npu,256,4096,1024,1,5,20000.0,8000.0,1000,3000,500,12000,1500,1000\n"
+        "gpu,256,4096,1024,1,5,15000.0,-1,-1,-1,-1,-1,-1,-1\n";
+    coli_shape_profile_t *profile = load_table(table);
+    CHECK(profile != NULL, "table did not load");
+    if (!profile) return;
+
+    double ns = -1.0;
+    CHECK(coli_profile_upload_ns(profile, COLI_ENGINE_NPU, 256, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_EXACT, "upload lookup failed");
+    CHECK(fabs(ns - 2000.0) < 1.0, "weight-upload share was %f, expected 2000", ns);
+
+    /* A record that did not attribute an upload stage yields no saving: an
+     * unmeasured stage must never become a discount. */
+    ns = -1.0;
+    CHECK(coli_profile_upload_ns(profile, COLI_ENGINE_GPU, 256, 4096, 1024, 1, &ns)
+              == COLI_PROFILE_EXACT, "gpu upload lookup failed");
+    CHECK(ns == 0.0, "an unmeasured upload stage reported %f", ns);
+
+    /* Placement must charge the cold engine and credit the warm one. */
+    coli_placement_caps_t caps;
+    all_available(&caps);
+    coli_placement_policy_t policy;
+    memset(&policy, 0, sizeof(policy));
+    policy.profile = profile;
+
+    coli_placement_decision_t cold, warm;
+    coli_choose_backend(&policy, &caps, 256, 4096, 1024, 1, &cold);
+    CHECK(cold.engine == COLI_ENGINE_GPU,
+          "cold: the 15000 ns gpu record should beat the 20000 ns npu one, got %s",
+          coli_engine_name(cold.engine));
+    CHECK(fabs(cold.upload_ns[COLI_ENGINE_NPU] - 2000.0) < 1.0,
+          "the decision must report the measured upload share");
+
+    caps.weights_resident[COLI_ENGINE_NPU] = true;
+    coli_choose_backend(&policy, &caps, 256, 4096, 1024, 1, &warm);
+    CHECK(fabs(warm.estimate_ns[COLI_ENGINE_NPU] - 18000.0) < 1.0,
+          "a warm npu must be charged 20000-2000 ns, got %f",
+          warm.estimate_ns[COLI_ENGINE_NPU]);
+    CHECK(fabs(warm.estimate_ns[COLI_ENGINE_GPU]
+               - cold.estimate_ns[COLI_ENGINE_GPU]) < 1e-9,
+          "an engine that is not resident must be unaffected");
+    /* Warm still does not beat the gpu here (18000 > 15000) — the point is that
+     * the number moved by exactly the measured amount and no more. */
+
+    coli_profile_free(profile);
+}
+
+/* ── Permanent refusals (A1.4) and the iGPU budget (A4.2) ── */
+
+static void test_permanent_refusal_and_gpu_budget(void) {
+    coli_placement_caps_t caps;
+    all_available(&caps);
+
+    coli_placement_policy_t policy;
+    memset(&policy, 0, sizeof(policy));
+    coli_placement_decision_t decision;
+
+    /* rows=1 is a property of the AIE2P MAC, not of this build: it must be
+     * refused even with a kernel callback that claims an artifact exists, and
+     * it must be marked permanent so a report does not tell the operator to
+     * wait for a kernel that can never be built. */
+    coli_choose_backend(&policy, &caps, 1, 4096, 1024, 1, &decision);
+    CHECK(decision.engine != COLI_ENGINE_NPU, "rows=1 must never reach the NPU");
+    CHECK(decision.rejected_permanent[COLI_ENGINE_NPU],
+          "the rows=1 refusal must be marked permanent");
+
+    /* A missing artifact is a different, non-permanent refusal. */
+    all_available(&caps);
+    caps.npu_kernel_exists = kernel_never;
+    coli_choose_backend(&policy, &caps, 256, 4096, 1024, 1, &decision);
+    CHECK(decision.rejected[COLI_ENGINE_NPU] != NULL, "a refusal needs a reason");
+    CHECK(!decision.rejected_permanent[COLI_ENGINE_NPU],
+          "a missing artifact is not a permanent refusal");
+
+    /* The iGPU budget is honoured when known and ignored when zero. */
+    all_available(&caps);
+    caps.gpu_resident_bytes = 1024;
+    coli_choose_backend(&policy, &caps, 256, 4096, 1024, 1, &decision);
+    CHECK(decision.rejected[COLI_ENGINE_GPU] != NULL,
+          "an operand set over the gpu budget must be refused");
+    caps.gpu_resident_bytes = 0;
+    coli_choose_backend(&policy, &caps, 256, 4096, 1024, 1, &decision);
+    CHECK(decision.rejected[COLI_ENGINE_GPU] == NULL,
+          "an unknown gpu budget must not act as a constraint");
 }
 
 static void test_placement_forced(void) {
@@ -478,6 +606,9 @@ int main(void) {
     test_profile_rejects_garbage();
     test_profile_roundtrip();
     test_placement_constraints();
+    test_row_class_guard();
+    test_upload_cost();
+    test_permanent_refusal_and_gpu_budget();
     test_placement_forced();
     test_placement_measured();
     test_placement_requires_profile();

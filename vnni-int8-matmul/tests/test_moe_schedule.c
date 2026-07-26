@@ -319,6 +319,240 @@ static void test_plan_reports_unplaced(void) {
     coli_moe_grouping_free(&grouping);
 }
 
+
+/* ── Execution ── */
+
+typedef struct {
+    int  calls;
+    int  order[64];              /* group indices, in dispatch order */
+    int  concurrent_npu;         /* largest npu width the executor issued */
+    int  fail_on_group;          /* -1 to never fail */
+    coli_engine_t seen[64];
+} exec_probe_t;
+
+static int exec_probe_dispatch(const coli_moe_plan_item_t *item, void *user) {
+    exec_probe_t *probe = (exec_probe_t *)user;
+    if (item->group_index == probe->fail_on_group) return -EIO;
+    if (probe->calls < 64) {
+        probe->order[probe->calls] = item->group_index;
+        probe->seen[probe->calls] = item->engine;
+    }
+    probe->calls++;
+    return 0;
+}
+
+/* Build a plan over `experts` single-token groups, all placed on `engine`. */
+static int build_uniform_plan(coli_engine_t engine, int experts,
+                              coli_moe_grouping_t *grouping,
+                              coli_moe_plan_t *plan,
+                              coli_moe_lane_limits_t *limits) {
+    coli_moe_assignment_t *assignments =
+        (coli_moe_assignment_t *)calloc((size_t)experts, sizeof(*assignments));
+    if (!assignments) return -1;
+    for (int i = 0; i < experts; ++i) {
+        assignments[i] = (coli_moe_assignment_t){ i, i, 1.0f };
+    }
+    coli_moe_grouping_init(grouping);
+    int ret = coli_moe_group_by_expert(assignments, experts, grouping);
+    free(assignments);
+    if (ret != 0) return -1;
+
+    coli_placement_caps_t caps;
+    coli_placement_caps_init(&caps);
+    caps.cpu_available = (engine == COLI_ENGINE_CPU);
+    caps.gpu_available = (engine == COLI_ENGINE_GPU);
+
+    coli_placement_policy_t policy;
+    memset(&policy, 0, sizeof(policy));
+
+    coli_moe_plan_init(plan);
+    return coli_moe_plan_build(grouping, &policy, &caps, limits,
+                               4096, 1024, 1, plan);
+}
+
+static void test_plan_execute(void) {
+    coli_moe_lane_limits_t limits;
+    coli_moe_lane_limits_from_env(&limits);
+    limits.gpu_lanes = 2;
+
+    coli_moe_grouping_t grouping;
+    coli_moe_plan_t plan;
+    CHECK(build_uniform_plan(COLI_ENGINE_GPU, 5, &grouping, &plan, &limits) == 0,
+          "plan build failed");
+    CHECK(plan.unplaced == 0, "every group should have been placed");
+
+    exec_probe_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.fail_on_group = -1;
+
+    coli_moe_exec_stats_t stats;
+    CHECK(coli_moe_plan_execute(&plan, &limits, exec_probe_dispatch, &probe, &stats)
+              == 0, "execution failed");
+    CHECK(probe.calls == 5, "every item must be dispatched exactly once, got %d",
+          probe.calls);
+    CHECK(stats.dispatched == 5, "stats disagree with the dispatcher");
+    CHECK(stats.per_engine[COLI_ENGINE_GPU] == 5, "all five were gpu items");
+    /* Two gpu lanes, five items: three waves of 2, 2, 1. */
+    CHECK(stats.waves == 3, "expected 3 waves at 2 lanes, got %d", stats.waves);
+    CHECK(stats.max_in_flight[COLI_ENGINE_GPU] == 2,
+          "an engine must never be issued more than its lane count");
+    /* Order is group order, which makes a run replayable. */
+    for (int i = 0; i < 5; ++i) {
+        CHECK(probe.order[i] == i, "item %d dispatched out of order (%d)",
+              i, probe.order[i]);
+    }
+
+    coli_moe_plan_free(&plan);
+    coli_moe_grouping_free(&grouping);
+}
+
+static void test_plan_execute_npu_is_serialised(void) {
+    coli_moe_lane_limits_t limits;
+    coli_moe_lane_limits_from_env(&limits);
+
+    /* Hand-build a plan of npu items: one AIE partition means one hardware
+     * context, so the executor must never issue two at once. */
+    coli_moe_plan_item_t items[4];
+    memset(items, 0, sizeof(items));
+    for (int i = 0; i < 4; ++i) {
+        items[i].group_index = i;
+        items[i].expert = i;
+        items[i].rows = 32;
+        items[i].engine = COLI_ENGINE_NPU;
+        items[i].lane = 0;
+    }
+    coli_moe_plan_t plan;
+    coli_moe_plan_init(&plan);
+    plan.items = items;
+    plan.count = 4;
+    plan.capacity = 4;
+
+    exec_probe_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.fail_on_group = -1;
+
+    coli_moe_exec_stats_t stats;
+    CHECK(coli_moe_plan_execute(&plan, &limits, exec_probe_dispatch, &probe, &stats)
+              == 0, "npu execution failed");
+    CHECK(stats.max_in_flight[COLI_ENGINE_NPU] == 1,
+          "the npu must be issued one at a time, got %d",
+          stats.max_in_flight[COLI_ENGINE_NPU]);
+    CHECK(stats.waves == 4, "four serialised items need four waves, got %d",
+          stats.waves);
+    /* plan.items is stack memory here; do not free it through the plan. */
+}
+
+static void test_plan_execute_refusals(void) {
+    coli_moe_lane_limits_t limits;
+    coli_moe_lane_limits_from_env(&limits);
+
+    coli_moe_grouping_t grouping;
+    coli_moe_plan_t plan;
+    CHECK(build_uniform_plan(COLI_ENGINE_CPU, 3, &grouping, &plan, &limits) == 0,
+          "plan build failed");
+
+    exec_probe_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.fail_on_group = 1;
+
+    coli_moe_exec_stats_t stats;
+    /* A failing dispatch stops the run and is reported; it is never re-placed
+     * onto another engine. */
+    CHECK(coli_moe_plan_execute(&plan, &limits, exec_probe_dispatch, &probe, &stats)
+              == -EIO, "a failing dispatch must surface its error");
+    CHECK(stats.failed_item == 1, "the failing item must be identified, got %d",
+          stats.failed_item);
+    CHECK(stats.failed_rc == -EIO, "the dispatcher's return value must survive");
+    CHECK(probe.calls == 1, "nothing may be dispatched after a failure");
+
+    /* A plan that could not place everything is not runnable. */
+    plan.unplaced = 1;
+    memset(&probe, 0, sizeof(probe));
+    probe.fail_on_group = -1;
+    CHECK(coli_moe_plan_execute(&plan, &limits, exec_probe_dispatch, &probe, NULL)
+              == -EINVAL, "an unplaceable plan must be refused");
+    CHECK(probe.calls == 0, "a refused plan must dispatch nothing");
+    plan.unplaced = 0;
+
+    CHECK(coli_moe_plan_execute(NULL, &limits, exec_probe_dispatch, &probe, NULL)
+              == -EINVAL, "a NULL plan must be refused");
+    CHECK(coli_moe_plan_execute(&plan, &limits, NULL, &probe, NULL) == -EINVAL,
+          "a NULL dispatcher must be refused");
+
+    coli_moe_plan_free(&plan);
+    coli_moe_grouping_free(&grouping);
+}
+
+/* ── Residency as a placement input (A4.3) ── */
+
+static bool resident_on_gpu_only(int expert, coli_engine_t engine, void *user) {
+    (void)user;
+    return engine == COLI_ENGINE_GPU && expert == 7;
+}
+
+static void test_plan_build_residency_input(void) {
+    coli_moe_assignment_t assignments[4] = {
+        { 0, 7, 1.0f }, { 1, 7, 1.0f }, { 2, 9, 1.0f }, { 3, 9, 1.0f },
+    };
+    coli_moe_grouping_t grouping;
+    coli_moe_grouping_init(&grouping);
+    CHECK(coli_moe_group_by_expert(assignments, 4, &grouping) == 0, "grouping failed");
+
+    /* The gpu is measurably slower cold and faster warm; only the residency
+     * input can tell the two groups apart, since their shapes are identical. */
+    const char *table =
+        "cpu,2,4096,1024,1,5,9000.0,0.0,-1,-1,-1,-1,-1,-1\n"
+        "gpu,2,4096,1024,1,5,12000.0,2000.0,500,6000,500,500,500,0\n";
+    coli_shape_profile_t *profile = coli_profile_create();
+    CHECK(profile != NULL, "profile allocation failed");
+    if (!profile) { coli_moe_grouping_free(&grouping); return; }
+    FILE *fp = tmpfile();
+    CHECK(fp != NULL, "tmpfile failed");
+    if (!fp) { coli_profile_free(profile); coli_moe_grouping_free(&grouping); return; }
+    fputs(table, fp);
+    rewind(fp);
+    CHECK(coli_profile_parse(profile, fp, NULL) == 0, "table did not parse");
+    fclose(fp);
+
+    coli_placement_caps_t caps;
+    coli_placement_caps_init(&caps);
+    caps.cpu_available = true;
+    caps.gpu_available = true;
+
+    coli_placement_policy_t policy;
+    memset(&policy, 0, sizeof(policy));
+    policy.profile = profile;
+
+    coli_moe_lane_limits_t limits;
+    coli_moe_lane_limits_from_env(&limits);
+
+    coli_moe_plan_t cold;
+    coli_moe_plan_init(&cold);
+    CHECK(coli_moe_plan_build(&grouping, &policy, &caps, &limits,
+                              4096, 1024, 1, &cold) == 0, "cold plan failed");
+    CHECK(cold.items[0].engine == COLI_ENGINE_CPU,
+          "cold: the cpu record is cheaper, got %s",
+          coli_engine_name(cold.items[0].engine));
+    coli_moe_plan_free(&cold);
+
+    coli_moe_plan_t warm;
+    coli_moe_plan_init(&warm);
+    CHECK(coli_moe_plan_build_resident(&grouping, &policy, &caps, &limits,
+                                       4096, 1024, 1, resident_on_gpu_only, NULL,
+                                       &warm) == 0, "warm plan failed");
+    CHECK(warm.count == 2, "two experts, two groups");
+    CHECK(warm.items[0].expert == 7 && warm.items[0].engine == COLI_ENGINE_GPU,
+          "a warm expert must beat a cold cpu, got %s",
+          coli_engine_name(warm.items[0].engine));
+    CHECK(warm.items[1].expert == 9 && warm.items[1].engine == COLI_ENGINE_CPU,
+          "a cold expert of the same shape must still go to the cpu, got %s",
+          coli_engine_name(warm.items[1].engine));
+    coli_moe_plan_free(&warm);
+
+    coli_profile_free(profile);
+    coli_moe_grouping_free(&grouping);
+}
+
 /* ── Residency ── */
 
 static void test_residency(void) {
@@ -416,6 +650,10 @@ int main(void) {
     test_plan_splits_by_group_size();
     test_plan_lane_assignment();
     test_plan_reports_unplaced();
+    test_plan_execute();
+    test_plan_execute_npu_is_serialised();
+    test_plan_execute_refusals();
+    test_plan_build_residency_input();
     test_residency();
     test_residency_slot_pressure();
 

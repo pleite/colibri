@@ -34,12 +34,35 @@ These are not preferences and are not ranked against anything:
   fmt)` says a `.npukernel` for *exactly* that shape is loaded. There is no
   widening to a larger compiled shape: that would dispatch a kernel whose tiling
   does not describe the operands, and the hardware will not tell you.
-* **Residency.** When `caps.npu_resident_bytes` is known, an operand set larger
-  than the NPU can hold removes the NPU from the candidates, leaving the iGPU —
-  the engine with the memory to spare, on a machine where all three share DRAM.
+* **Residency.** When `caps.npu_resident_bytes` / `caps.gpu_resident_bytes` are
+  known, an operand set larger than that engine can hold removes it from the
+  candidates. Both are probed from the device by `coli_engine_caps_probe()`
+  (`sched/engine_caps.h`): the NPU's from the mapped amdxdna device heap, the
+  iGPU's from its largest `DEVICE_LOCAL` Vulkan heap. A zero means "unknown" and
+  is never treated as "no room".
+* **`rows = 1` on the NPU is permanent.** It is refused before availability is
+  even consulted, and flagged in `decision.rejected_permanent[]`. The AIE2P int8
+  MAC has an 8-row granularity and the smallest tiling the array can express is
+  64 rows, so no artifact, driver or heap size will ever make it dispatchable.
+  That is a different statement from "no kernel has been built yet", and a
+  report that conflates the two tells the operator to wait for something that is
+  never coming.
 
 A refusal is recorded per engine in `decision.rejected[]`, so the caller can
 print *which* constraint removed an engine rather than "it did not get picked".
+`tools/placement_report` prints exactly that for every enumerated shape on the
+current host.
+
+In practice the artifact constraint is what decides NPU eligibility today, and
+it is a *row count* constraint: the AIE2P int8 MAC works in blocks of 8 rows, so
+only the 256- and 32-row prefill tiles have compiled kernels, and the 1-row
+decode tile has none and cannot have one with the upstream designs (see
+[`strix-halo-npu.md`](strix-halo-npu.md)). Decode therefore never reaches the
+NPU regardless of what the measured table says, and a prefill row count that is
+not a multiple of 32 leaves a remainder that must be placed elsewhere. Which
+weights are eligible at those row tiles is a separate, coarser question: any
+matmul whose `(inner, out)` is one of the five enumerated projections, and
+nothing else.
 
 ## 2. Measured ranking
 
@@ -60,6 +83,27 @@ If *any* surviving engine has an exact record, only exact records compete. An
 extrapolation never outranks a measurement — extrapolating downwards from a
 large-batch record makes an engine look arbitrarily cheap, precisely because
 what it drops is the fixed cost.
+
+Estimation additionally refuses to cross a **row-tile class boundary**. A decode
+record (`rows = 1`) never estimates a prefill shape and vice versa: the boundary
+is exactly where `fixed_ns` dominance flips, so the MAC-ratio scaling that works
+within a class is wrong across it, and wrong in the direction that flatters the
+accelerator. With no record in the request's own class the answer is a miss and
+the structural rule applies.
+
+### Residency: warm weights are cheaper than cold ones
+
+Every bench record is *cold* — it re-uploads its operands on each iteration — so
+`total_ns` charges the call for an upload it may not owe. `caps.weights_resident[]`
+says, per engine, whether this call's weights are already there; when they are,
+ranking subtracts `coli_profile_upload_ns()`, the weight share of the record's
+measured `upload_ns`, and nothing more. A record that left `upload_ns`
+unattributed yields no discount at all — an unmeasured stage is not a saving.
+
+This is the term that decides expert placement on a UMA part: a warm expert on
+the iGPU can beat a cold one on the CPU purely on transfer, at identical shape.
+`coli_moe_plan_build_resident()` supplies it per group, so two groups of the same
+shape can legitimately be placed differently.
 
 ## 3. Structural default, when there is no table
 
@@ -93,7 +137,10 @@ after asking for the NPU produces a correct number and a false measurement, and
 these backends exist to be measured.
 
 The same rule applies one level up: `coli_moe_plan_build()` reports groups it
-could not place in `plan.unplaced` rather than parking them somewhere.
+could not place in `plan.unplaced` rather than parking them somewhere, and
+`coli_moe_plan_execute()` refuses to run such a plan at all rather than
+executing the placeable part and dropping the rest. A dispatch that fails stops
+the run and surfaces its error; it is never re-issued on another engine.
 
 ## Environment variables
 
@@ -124,6 +171,11 @@ count — which is the entire point:
 * groups whose row count reaches a prefill tile go to the NPU,
 * the long tail of 1–2 token groups stays on the VNNI CPU,
 * large concurrent expert sets go to the iGPU, where dispatch is cheap.
+
+Execution follows the plan through `coli_moe_plan_execute()`, which issues items
+in waves of at most `lane_limit(engine)` per engine, in group order. The order is
+deterministic so a run is replayable, and the NPU's cap of 1 means its items
+serialise through the single hardware context by construction.
 
 Expert weights are re-used across tokens and steps while activations are not, so
 `coli_moe_residency_*` keeps hot experts' weight buffers alive under an LRU

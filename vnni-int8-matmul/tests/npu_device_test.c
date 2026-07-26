@@ -11,10 +11,11 @@
  *   3. requesting a matmul with no kernel loaded fails instead of silently
  *      falling back to the CPU,
  *   4. int4 -> int8 weight expansion is correct (pure host arithmetic),
- *   5. the command wait refuses to report success without actually waiting.
+ *   5. int32 accumulators are dequantised, not reinterpreted, on readback,
+ *   6. the command wait refuses to report success without actually waiting.
  *
  * Steps 1-3 are skipped, not failed, when no NPU is present, so the harness is
- * usable in CI. Steps 4 and 5 always run.
+ * usable in CI. Steps 4 to 6 always run.
  */
 
 #include <stdint.h>
@@ -46,6 +47,42 @@ static int test_int4_expansion(void) {
         }
     }
     printf("int4 -> int8 expansion OK\n");
+    return 1;
+}
+
+static int test_i32_dequant(void) {
+    /* The compiled artifacts are int8 x int8 -> int32 with no on-chip
+     * dequantisation epilogue, so the readback path must scale accumulators
+     * rather than reinterpret them as floats. Pure host arithmetic: this runs
+     * everywhere. */
+    const int32_t acc[6] = {1, -2, 3, 1000, -2000, 3000};
+    const float scales[3] = {0.5f, 2.0f, 0.25f};
+    const float expected[6] = {0.5f, -4.0f, 0.75f, 500.0f, -4000.0f, 750.0f};
+    float got[6];
+
+    memset(got, 0, sizeof(got));
+    xdna2_dequant_i32(acc, got, /* S */ 2, /* O */ 3, scales);
+    for (int i = 0; i < 6; ++i) {
+        if (got[i] != expected[i]) {
+            fprintf(stderr, "int32 dequant mismatch at %d: got=%f expected=%f\n",
+                    i, (double)got[i], (double)expected[i]);
+            return 0;
+        }
+    }
+
+    /* No scales means unity, not "skip the conversion". */
+    memset(got, 0, sizeof(got));
+    xdna2_dequant_i32(acc, got, 2, 3, NULL);
+    for (int i = 0; i < 6; ++i) {
+        if (got[i] != (float)acc[i]) {
+            fprintf(stderr,
+                    "int32 dequant without scales mismatch at %d: got=%f expected=%f\n",
+                    i, (double)got[i], (double)acc[i]);
+            return 0;
+        }
+    }
+
+    printf("int32 -> f32 accumulator dequant OK\n");
     return 1;
 }
 
@@ -151,6 +188,7 @@ int main(void) {
     int failed = 0;
 
     if (!test_int4_expansion()) failed = 1;
+    if (!test_i32_dequant()) failed = 1;
     if (!test_wait_never_fakes_success()) failed = 1;
     if (!test_device_probe()) failed = 1;
     if (!test_no_cpu_fallback()) failed = 1;

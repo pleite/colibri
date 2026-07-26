@@ -107,13 +107,38 @@ static const char *cpu_constraint(const coli_placement_caps_t *caps) {
     return NULL;
 }
 
-static const char *gpu_constraint(const coli_placement_caps_t *caps) {
+static const char *gpu_constraint(const coli_placement_caps_t *caps,
+                                  int rows, int inner, int out) {
     if (!caps->gpu_available) return "no Vulkan compute context on the iGPU";
+
+    if (caps->gpu_resident_bytes > 0) {
+        const size_t needed = coli_npu_operand_bytes(rows, inner, out);
+        if (needed == 0) return "operand size overflow";
+        if (needed > caps->gpu_resident_bytes) {
+            return "operand set exceeds iGPU resident memory budget";
+        }
+    }
     return NULL;
 }
 
 static const char *npu_constraint(const coli_placement_caps_t *caps,
-                                  int rows, int inner, int out, int fmt) {
+                                  int rows, int inner, int out, int fmt,
+                                  bool *permanent) {
+    if (permanent) *permanent = false;
+
+    /*
+     * Checked before availability, because it is true of the silicon whether or
+     * not this host has any. The AIE2P int8 MAC is 8 rows wide and the smallest
+     * tiling the array can express is 64 rows; no artifact, driver version or
+     * device heap makes a 1-row matmul dispatchable (npu/aie/README.md). This
+     * is a permanent refusal, and the caller is told so rather than being left
+     * to assume the kernel has simply not been built yet.
+     */
+    if (rows == COLI_NPU_ROW_TILE_DECODE) {
+        if (permanent) *permanent = true;
+        return "rows=1 is inexpressible on the AIE2P int8 MAC granularity";
+    }
+
     if (!caps->npu_available) return "NPU device or hardware context unavailable";
 
     if (!caps->npu_kernel_exists ||
@@ -144,9 +169,11 @@ static double arithmetic_reuse(int rows, int inner, int out) {
 
 static void note_estimate(coli_placement_decision_t *decision,
                           const coli_placement_policy_t *policy,
+                          const coli_placement_caps_t *caps,
                           coli_engine_t engine,
                           int rows, int inner, int out, int fmt) {
     decision->estimate_ns[engine] = -1.0;
+    decision->upload_ns[engine] = 0.0;
     decision->match[engine] = COLI_PROFILE_MISS;
     if (!policy->profile) return;
 
@@ -154,7 +181,24 @@ static void note_estimate(coli_placement_decision_t *decision,
     coli_profile_match_t match = coli_profile_estimate_ns(
         policy->profile, engine, rows, inner, out, fmt, &ns);
     decision->match[engine] = match;
-    if (match != COLI_PROFILE_MISS) decision->estimate_ns[engine] = ns;
+    if (match == COLI_PROFILE_MISS) return;
+
+    /*
+     * Data-movement term. Every record is cold: it uploads the weights on each
+     * iteration, so `ns` charges this call for an upload it may not owe. When
+     * the caller says the weights are already on this engine, remove exactly
+     * the measured weight-upload share — never more, and never anything at all
+     * when the bench did not attribute an upload stage.
+     */
+    double upload_ns = 0.0;
+    coli_profile_upload_ns(policy->profile, engine, rows, inner, out, fmt,
+                           &upload_ns);
+    decision->upload_ns[engine] = upload_ns;
+    if (caps->weights_resident[engine] && upload_ns > 0.0) {
+        ns -= upload_ns;
+        if (ns < 0.0) ns = 0.0;
+    }
+    decision->estimate_ns[engine] = ns;
 }
 
 coli_engine_t coli_choose_backend(const coli_placement_policy_t *policy,
@@ -178,12 +222,16 @@ coli_engine_t coli_choose_backend(const coli_placement_policy_t *policy,
     }
 
     decision->rejected[COLI_ENGINE_CPU] = cpu_constraint(caps);
-    decision->rejected[COLI_ENGINE_GPU] = gpu_constraint(caps);
-    decision->rejected[COLI_ENGINE_NPU] = npu_constraint(caps, rows, inner, out, fmt);
+    decision->rejected[COLI_ENGINE_GPU] = gpu_constraint(caps, rows, inner, out);
+    bool npu_permanent = false;
+    decision->rejected[COLI_ENGINE_NPU] =
+        npu_constraint(caps, rows, inner, out, fmt, &npu_permanent);
+    decision->rejected_permanent[COLI_ENGINE_NPU] = npu_permanent;
 
     for (int e = COLI_ENGINE_CPU; e < COLI_ENGINE_COUNT_; ++e) {
         if (!decision->rejected[e]) {
-            note_estimate(decision, policy, (coli_engine_t)e, rows, inner, out, fmt);
+            note_estimate(decision, policy, caps, (coli_engine_t)e,
+                          rows, inner, out, fmt);
         }
     }
 
