@@ -98,13 +98,15 @@ typedef struct {
  * The firmware's AIE metadata carries a `version` field, but it is the AIE
  * tile-info protocol version, not the NPU generation: Strix Halo (an XDNA 2
  * part) reports 1.1 there. The generation is only unambiguous in the PCI
- * identity of the accel node, which the amdxdna driver matches on:
+ * identity of the accel node, which the amdxdna driver matches on. The accel
+ * function sits on the CPU's own PCI vendor id, PCI_VENDOR_ID_AMD (0x1022) —
+ * not the 0x1002 the Radeon iGPU uses:
  *
- *   XDNA 1  0x1002:0x1502 rev 0x00 (Phoenix), 0x1002:0x1050 rev 0x01 (Hawk Point)
- *   XDNA 2  0x1002:0x17f0 rev 0x10 (Strix Point), rev 0x11 (Strix Halo),
+ *   XDNA 1  0x1022:0x1502 rev 0x00 (Phoenix), 0x1022:0x1502 rev 0x01 (Hawk Point)
+ *   XDNA 2  0x1022:0x17f0 rev 0x10 (Strix Point), rev 0x11 (Strix Halo),
  *                         rev 0x20 (Krackan)
  */
-#define XDNA2_PCI_VENDOR_AMD    0x1002u
+#define XDNA2_PCI_VENDOR_AMD    0x1022u
 #define XDNA2_PCI_DEVICE_NPU4   0x17f0u  /* Strix family, XDNA 2 */
 #define XDNA2_PCI_REV_STRIX     0x10u
 #define XDNA2_PCI_REV_STRIX_HALO 0x11u

@@ -682,7 +682,7 @@ static int xdna2_read_sysfs_u32(const char *path, uint32_t *out) {
     FILE *f = fopen(path, "re");
     if (!f) return -1;
     unsigned long value = 0;
-    int fields = fscanf(f, "%lx", &value); /* sysfs prints "0x1002" */
+    int fields = fscanf(f, "%lx", &value); /* sysfs prints "0x1022" */
     fclose(f);
     if (fields != 1) return -1;
     *out = (uint32_t)value;
