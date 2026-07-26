@@ -50,7 +50,7 @@ Useful overrides:
 | `CONTAINER_IMAGE` | run a prebuilt image as-is instead of building one |
 | `SKIP_NPU=1` | do not pass the NPU device through |
 | `REQUIRE_NPU=1` | fail instead of warning when `/dev/accel/accel0` is absent |
-| `XDNA2_HEAP_BYTES` | size of the NPU device heap (32 KiB … 64 MiB) |
+| `XDNA2_HEAP_BYTES` | size of the NPU device heap (a multiple of 64 MiB, at most 64 MiB) |
 
 Use `REQUIRE_NPU=1` on the Strix Halo runner so an unloaded `amdxdna` module is
 reported as a red run rather than hidden behind three SKIPs.

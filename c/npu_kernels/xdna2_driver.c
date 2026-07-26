@@ -95,8 +95,11 @@ void xdna2_close_device(int fd) {
 /* ── Hardware Context ── */
 
 /* Defined with the other BO helpers below. `force_mmap` ignores any user
- * address the driver already reports and insists on a real mmap(). */
-static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap);
+ * address the driver already reports and insists on a real mmap(); `align`
+ * constrains the address that mmap() hands back (0 or 1 for "page alignment is
+ * enough"). */
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap,
+                           uint64_t align);
 
 /*
  * The amdxdna client owns exactly one device heap. `aie2_hwctx_init()` fails
@@ -108,19 +111,27 @@ static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap);
  * The kernel caps the heap at dev_info->dev_mem_size, which is 64 MiB
  * (AIE2_DEVM_SIZE) on every AIE2 part including Strix Halo, and rounds device
  * allocations to dev_mem_buf_shift = 32 KiB.
+ *
+ * The size itself must be a whole number of dev_mem_size chunks: that is what
+ * the driver checks when it creates the heap BO and what `aie2_map_host_buf()`
+ * hands to the firmware one chunk at a time. A smaller heap is refused rather
+ * than silently rounded, because a rounded-down size would fail later, inside
+ * CREATE_HWCTX, as a bare -EINVAL.
  */
 static uint64_t xdna2_dev_heap_bytes(void) {
     const char *env = getenv("XDNA2_HEAP_BYTES");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long value = strtoull(env, &end, 0);
-        if (end && *end == '\0' && value >= XDNA2_DEV_HEAP_ALIGN &&
-            value <= XDNA2_DEV_HEAP_MAX_BYTES) {
-            return (uint64_t)(value & ~(uint64_t)(XDNA2_DEV_HEAP_ALIGN - 1));
+        if (end && *end == '\0' && value >= XDNA2_DEV_HEAP_CHUNK_BYTES &&
+            value <= XDNA2_DEV_HEAP_MAX_BYTES &&
+            (value % XDNA2_DEV_HEAP_CHUNK_BYTES) == 0) {
+            return (uint64_t)value;
         }
         fprintf(stderr,
-                "xdna2: ignoring XDNA2_HEAP_BYTES='%s' (expected %u..%llu bytes)\n",
-                env, XDNA2_DEV_HEAP_ALIGN,
+                "xdna2: ignoring XDNA2_HEAP_BYTES='%s' (expected a multiple of "
+                "%llu bytes, at most %llu)\n",
+                env, (unsigned long long)XDNA2_DEV_HEAP_CHUNK_BYTES,
                 (unsigned long long)XDNA2_DEV_HEAP_MAX_BYTES);
     }
     return XDNA2_DEV_HEAP_MAX_BYTES;
@@ -156,8 +167,20 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
      * The mapping is forced: a heap's user address exists *because* this
      * process mapped it, so an address reported before that has to be treated
      * as stale rather than as permission to skip the mmap.
+     *
+     * It is also aligned to the firmware's chunk size. `aie2_map_host_buf()`
+     * hands the heap's user address to the firmware in `dev_mem_size`-sized
+     * chunks (MSG_OP_MAP_HOST_BUFFER), and the firmware rejects a base that is
+     * not a multiple of that chunk: the mgmt message fails, `aie2_hwctx_init()`
+     * logs "Map host buffer failed" and CREATE_HWCTX returns -EINVAL. The
+     * kernel applies the same alignment when it allocates the heap itself
+     * (`align = dev_info->dev_mem_size` for AMDXDNA_BO_DEV_HEAP), and both XRT
+     * and ROCr align their heap mapping the same way. A plain mmap() is only
+     * page aligned, so it satisfies this by luck: that is why the context came
+     * up in some processes and not in others on the same machine.
      */
-    if (xdna2_map_bo_ex(fd, &heap_bo, /* force_mmap */ true) < 0) {
+    if (xdna2_map_bo_ex(fd, &heap_bo, /* force_mmap */ true,
+                        /* align */ XDNA2_DEV_HEAP_CHUNK_BYTES) < 0) {
         xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr,
                 "xdna2: failed to map the device heap; the driver needs the "
@@ -277,7 +300,11 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                     "xdna2: the driver logs the exact rejection; check "
                     "`dmesg | grep -i amdxdna` on the host. "
                     "\"Invalid dev heap userptr\" there means the device heap "
-                    "was not mapped before the context was created\n");
+                    "was not mapped before the context was created; "
+                    "\"Map host buffer failed\" means the firmware refused the "
+                    "heap's user address, which must be a multiple of %llu "
+                    "bytes\n",
+                    (unsigned long long)XDNA2_DEV_HEAP_CHUNK_BYTES);
         }
         return -1;
     }
@@ -386,7 +413,51 @@ int xdna2_destroy_bo(int fd, xdna2_bo_t *bo) {
     return ret < 0 ? -1 : 0;
 }
 
-static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap) {
+/*
+ * mmap() a BO at an address that is a multiple of `align`.
+ *
+ * mmap() only guarantees page alignment, and there is no portable way to ask
+ * for more, so a slack region of `size + align - 1` bytes is reserved first and
+ * the real mapping is placed over its aligned interior with MAP_FIXED. The
+ * unused head and tail are released afterwards, which keeps munmap(mapped,
+ * size) correct at teardown. MAP_FIXED lands inside a reservation this call
+ * owns, so it can never replace an unrelated mapping.
+ */
+static void *xdna2_mmap_aligned(int fd, uint64_t size, uint64_t align,
+                                uint64_t offset) {
+    if (align <= 1) {
+        return mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fd, (off_t)offset);
+    }
+
+    size_t reserve = (size_t)size + (size_t)align - 1;
+    char *base = mmap(NULL, reserve, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    char *aligned = (char *)(((uintptr_t)base + (uintptr_t)align - 1) &
+                             ~((uintptr_t)align - 1));
+    void *addr = mmap(aligned, (size_t)size, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_FIXED, fd, (off_t)offset);
+    if (addr == MAP_FAILED) {
+        munmap(base, reserve);
+        return MAP_FAILED;
+    }
+
+    if (aligned > base) {
+        munmap(base, (size_t)(aligned - base));
+    }
+    char *tail = aligned + size;
+    if (tail < base + reserve) {
+        munmap(tail, (size_t)((base + reserve) - tail));
+    }
+    return addr;
+}
+
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap,
+                           uint64_t align) {
     if (!bo) return -1;
     if (bo->mapped) return 0;
 
@@ -406,9 +477,7 @@ static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap) {
         return -1;
     }
 
-    void *addr = mmap(NULL, (size_t)bo->size,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED, fd, (off_t)bo->map_offset);
+    void *addr = xdna2_mmap_aligned(fd, bo->size, align, bo->map_offset);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "xdna2: mmap failed for BO %u: %s\n",
                 bo->handle, strerror(errno));
@@ -421,7 +490,7 @@ static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap) {
 }
 
 int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
-    return xdna2_map_bo_ex(fd, bo, /* force_mmap */ false);
+    return xdna2_map_bo_ex(fd, bo, /* force_mmap */ false, /* align */ 0);
 }
 
 int xdna2_unmap_bo(xdna2_bo_t *bo) {

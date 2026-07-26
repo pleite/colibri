@@ -67,9 +67,10 @@ strix_xdna2_matmul()
 ```
 xdna2_open_device()                       /dev/accel/accel0
   └─ xdna2_create_hwctx()
-       ├─ xdna2_create_bo(AMDXDNA_BO_DEV_HEAP)   one heap per open fd, ≤ 64 MiB
-       ├─ xdna2_map_bo(heap)                     mmap it: the driver records the
-       │                                         heap user address only on mmap
+       ├─ xdna2_create_bo(AMDXDNA_BO_DEV_HEAP)   one heap per open fd, 64 MiB
+       ├─ xdna2_map_bo(heap)                     mmap it 64 MiB-aligned: the
+       │                                         driver records the heap user
+       │                                         address only on mmap
        ├─ xdna2_create_bo(AMDXDNA_BO_CMD) × 2    UMQ + log buffers
        └─ DRM_IOCTL_AMDXDNA_CREATE_HWCTX         → handle, timeline syncobj
 ```
@@ -103,6 +104,30 @@ as such rather than deferred to a bare `-EINVAL` from `CREATE_HWCTX`. When
 `CREATE_HWCTX` does fail with `-EINVAL`, the heap's address is read again and
 printed, which separates "the heap registration was lost" from "the firmware
 refused the partition".
+
+The mapping is also aligned to 64 MiB. `aie2_hwctx_init()` passes the heap's
+user address to the firmware through `aie2_map_host_buf()`, which sends
+`MSG_OP_MAP_HOST_BUFFER` in chunks of `dev_info->dev_mem_size` (`AIE2_DEVM_SIZE`,
+64 MiB). The firmware refuses a base that is not a multiple of that chunk: the
+mgmt message fails, the driver logs
+
+```
+aie2_send_mgmt_msg_wait: command opcode 0x106 failed, status 0x4000003
+aie2_hwctx_init: Map host buffer failed, ret -22
+amdxdna_drm_create_hwctx_ioctl: Init hwctx failed, ret -22
+```
+
+and `CREATE_HWCTX` returns `-EINVAL` with a correctly registered heap. The
+kernel applies the same alignment when it allocates the heap itself
+(`align = dev_info->dev_mem_size` for `AMDXDNA_BO_DEV_HEAP`), and both XRT and
+ROCr reserve `2 × align - 1` bytes and `MAP_FIXED` the heap into the aligned
+interior. `xdna2_map_bo_ex()` does the same. A plain `mmap()` is only page
+aligned, so it met the requirement by accident: that is why the context came up
+in some processes on the Strix Halo runner and not in others on the same
+machine and the same kernel.
+
+For the same reason the heap size must be a whole number of 64 MiB chunks, and
+`XDNA2_HEAP_BYTES` is rejected rather than rounded when it is not.
 
 Completion is reported on the per-context **timeline** syncobj returned by
 `CREATE_HWCTX`: the kernel calls `drm_syncobj_add_point(syncobj, chain,
@@ -214,6 +239,7 @@ hand-copied kernel structures and magic constants instead of the UAPI.
 | `xdna2_wait_command()` returned success unconditionally | results read before the NPU finished | Wait on the hardware context's timeline syncobj at point `last_seq` |
 | `CREATE_HWCTX` issued without a device heap | `aie2_hwctx_init()` returns `-ENOENT` ("The client dev heap object not exist"), so the NPU never initialises | `xdna2_create_hwctx()` allocates an `AMDXDNA_BO_DEV_HEAP` first and owns it for the context lifetime |
 | Device heap created but never mapped | `amdxdna_drm_alloc_dev_bo()` logs "Invalid dev heap userptr" and `CREATE_HWCTX` fails with `-EINVAL` | `xdna2_create_hwctx()` mmaps the heap before creating the context |
+| Device heap mapped at a page-aligned but not 64 MiB-aligned address | the firmware refuses `MSG_OP_MAP_HOST_BUFFER`, `aie2_hwctx_init()` logs "Map host buffer failed" and `CREATE_HWCTX` fails with `-EINVAL` in some processes and not others | `xdna2_map_bo_ex()` reserves `size + align - 1` bytes and `MAP_FIXED`s the heap into the 64 MiB-aligned interior |
 | `GET_BO_INFO`'s `AMDXDNA_INVALID_ADDR` (`~0`) stored as a real address | `xdna2_map_bo()` returned `(void *)-1` as the host pointer for an unmapped BO | Normalise the sentinel to 0 and refuse to map a BO with no offset |
 | `DRM_AMDXDNA_QUERY_RESOURCE_INFO` and `AMDXDNA_QOS_*` used unconditionally | build failure on every shipping kernel-headers package — both post-date Linux 6.18 | Build-system probe defines `COLI_HAVE_XDNA2_RESOURCE_INFO`; the QoS hint falls back to the driver default |
 | `xdna2_runtime_init()` created the hwctx in a stack local | hwctx and device fd leaked on every init | Runtime owns the hwctx; `shutdown` releases it |

@@ -27,10 +27,17 @@
  * DRM_IOCTL_AMDXDNA_CREATE_HWCTX, which otherwise fails with -ENOENT
  * ("The client dev heap object not exist"). The kernel caps it at
  * AIE2_DEVM_SIZE (64 MiB) and aligns device allocations to dev_mem_buf_shift
- * (32 KiB). Override the size with the XDNA2_HEAP_BYTES environment variable.
+ * (32 KiB).
+ *
+ * The firmware maps the heap in chunks of dev_mem_size (AIE2_DEVM_SIZE, the
+ * same 64 MiB) and rejects a base address or a size that is not a whole
+ * number of chunks, so the heap is sized and its mapping is aligned to
+ * XDNA2_DEV_HEAP_CHUNK_BYTES. Override the size with the XDNA2_HEAP_BYTES
+ * environment variable.
  */
-#define XDNA2_DEV_HEAP_ALIGN      (32u * 1024u)
-#define XDNA2_DEV_HEAP_MAX_BYTES  (64ull * 1024ull * 1024ull)
+#define XDNA2_DEV_HEAP_ALIGN       (32u * 1024u)
+#define XDNA2_DEV_HEAP_CHUNK_BYTES (64ull * 1024ull * 1024ull)
+#define XDNA2_DEV_HEAP_MAX_BYTES   XDNA2_DEV_HEAP_CHUNK_BYTES
 
 /* The driver reports "no such address" as ~0, not 0 (AMDXDNA_INVALID_ADDR in
  * the kernel's own headers, which do not export it to userspace). */
