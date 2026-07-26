@@ -89,7 +89,7 @@ With `r = 8` the row constraint decides which design each row tile lands on:
 | row tile | design | why |
 | --- | --- | --- |
 | 256 | `whole_array`, 8 columns, 32 cores | `256 % (8 * m) == 0` for `m = 32` (`m = 16` for `out = 16384`, where the C-drain stride binds) |
-| 32 | `single_core` | the whole array needs `rows % (8 * m) == 0` with `m` a multiple of 8, i.e. at least 64 rows; the single-core design needs only `rows % (2 * m) == 0`, i.e. 16 |
+| 32 | `single_core`, 1 core | the whole array needs `rows % (8 * m) == 0` with `m` a multiple of 8, i.e. at least 64 rows; the single-core design needs only `rows % (2 * m) == 0`, i.e. 16. `m = 16, k = 64, n = 64`, except `out = 16384`, which needs the wide `n = 256` tile (`k = 32` to stay inside L1) |
 | 1 | none | see below |
 
 ## What is not built, and why
