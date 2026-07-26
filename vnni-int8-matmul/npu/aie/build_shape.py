@@ -54,6 +54,13 @@ TILE_CANDIDATES = (64, 32, 16, 8)
 COLUMN_CANDIDATES = (8, 4, 2, 1)
 N_AIE_ROWS = 4  # rows of compute tiles used by the whole-array design
 TRANSFER_BLOCK_ROWS = 2  # whole_array's transfer-block granularity
+SINGLE_CORE_ROW_BLOCK = 2  # single_core's C tile-group height (rows_per_block // 2)
+
+# The shim ND-DMA encodes a stride in 32-bit words in a 20-bit field, so the
+# outermost stride of a transfer may not exceed 2**20 words (mlir-aie verifies
+# this in AIEX::verifyStridesWraps, "Stride 3 exceeds the [1:1048576] range").
+# C is int32, so one accumulator element is exactly one word.
+MAX_BD_STRIDE_WORDS = 1 << 20
 
 
 def mac_dims(m: int, k: int, n: int) -> tuple[int, int, int]:
@@ -76,6 +83,16 @@ def mac_dims(m: int, k: int, n: int) -> tuple[int, int, int]:
 def l1_bytes(m: int, k: int, n: int) -> int:
     """Bytes the (A, B, C) tiles of one core occupy: int8 in, int32 out."""
     return m * k + k * n + 4 * m * n
+
+
+def c_drain_stride_words(rows_per_transfer: int, out: int) -> int:
+    """Outermost stride of the C drain, in 32-bit words.
+
+    Both designs drain C by iterating over blocks of whole tile rows, so the
+    outer stride is the number of C rows in one block times the row pitch. C is
+    int32, hence one element per word.
+    """
+    return rows_per_transfer * out
 
 
 def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
@@ -110,6 +127,11 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
                         continue
                     if (rows // m // N_AIE_ROWS) % TRANSFER_BLOCK_ROWS != 0:
                         continue
+                    if (
+                        c_drain_stride_words(m * N_AIE_ROWS, out)
+                        > MAX_BD_STRIDE_WORDS
+                    ):
+                        continue
                     cand = {
                         "design": "whole_array",
                         "m": m,
@@ -121,18 +143,22 @@ def plan_tiling(rows: int, inner: int, out: int) -> dict | None:
                     if best is None or _score(cand) > _score(best):
                         best = cand
 
-                # single_core: the only constraint is exact tiling.
-                if rows % m == 0 and out % n == 0:
-                    cand = {
-                        "design": "single_core",
-                        "m": m,
-                        "k": k,
-                        "n": n,
-                        "n_aie_cols": 1,
-                        "cores": 1,
-                    }
-                    if best is None or _score(cand) > _score(best):
-                        best = cand
+                # single_core: C is drained in groups of two tile rows.
+                if rows % (m * SINGLE_CORE_ROW_BLOCK) == 0 and out % n == 0:
+                    if (
+                        c_drain_stride_words(m * SINGLE_CORE_ROW_BLOCK, out)
+                        <= MAX_BD_STRIDE_WORDS
+                    ):
+                        cand = {
+                            "design": "single_core",
+                            "m": m,
+                            "k": k,
+                            "n": n,
+                            "n_aie_cols": 1,
+                            "cores": 1,
+                        }
+                        if best is None or _score(cand) > _score(best):
+                            best = cand
     return best
 
 
@@ -230,18 +256,22 @@ def main() -> int:
                         "no tiling of the upstream int8 matmul designs divides "
                         f"({opts.rows}, {opts.inner}, {opts.out}): the AIE int8 "
                         f"MAC is {r}x{s}x{t}, so the row tile must be a multiple "
-                        f"of {r} (and of {r * N_AIE_ROWS} for the whole-array "
-                        "design)"
+                        f"of {r}, and the row count a multiple of "
+                        f"{r * SINGLE_CORE_ROW_BLOCK} (single core) or "
+                        f"{r * N_AIE_ROWS * TRANSFER_BLOCK_ROWS} (whole array)"
                     ),
                 }
             )
         )
         return 3
 
-    build_dir = opts.build_dir
+    build_dir = opts.build_dir.resolve()
     if build_dir.exists():
         shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True)
+    # The design runs with cwd=build_dir and resolves these paths itself, so
+    # they have to be absolute: a relative path would land in a nested copy of
+    # the build tree and the artifacts would look missing.
     xclbin = build_dir / "final.xclbin"
     insts = build_dir / "insts.bin"
 

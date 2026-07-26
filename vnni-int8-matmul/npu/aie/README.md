@@ -48,14 +48,35 @@ The shape set is never written down here: `build_all.py` reads it from
 `tools/npu_shapes_list`, which links `sched/npu_shapes.c`. Adding a shape to the
 scheduler is all it takes for the build to pick it up.
 
+## Tiling constraints
+
+`plan_tiling()` in `build_shape.py` searches for a tile that satisfies, in this
+order, everything the toolchain and the hardware impose:
+
+- **MAC dimensions.** `m % r`, `k % s`, `n % t` — read from
+  `aie.iron.kernels.mm(...).mac_dims`, which is `4x8x8` for int8 in / int32 out.
+- **L1 budget.** `A + B + C` for one core kept inside 32 KiB of the 64 KiB
+  compute-tile memory, leaving room for ObjectFifo double buffering.
+- **Design row blocking.** `whole_array` drains C in transfer blocks of two
+  `m * 4`-row blocks, so `rows % (8 * m) == 0`; `single_core` drains C in groups
+  of two tile rows, so `rows % (2 * m) == 0`. Getting this wrong surfaces inside
+  the design as `TensorTiler2D.group_tiler ... does not divide evenly into tile
+  groups in dimension 0`.
+- **Shim ND-DMA stride.** The outer stride of the C drain is `rows_per_block *
+  out` int32 words and the descriptor field is 20 bits, so it may not exceed
+  2^20. `256x4096x16384` is the shape this binds: `m = 32` needs a stride of
+  2097152 words and is rejected by `mlir-aie`'s verifier, so the planner drops
+  to `m = 16` (stride exactly 2^20).
+
 ## What is not built, and why
 
-The AIE int8 MAC has a row granularity of 8, and the upstream designs require
-the M tile to be a multiple of it. The decode row tile (`rows = 1`) therefore
-has no valid tiling, and `build_shape.py` reports it as `unsupported` rather
-than padding: padding would feed the array uninitialised activation rows, and
-the accumulator for the real row would be correct only by luck of what the
-buffer happened to contain.
+The AIE int8 MAC has a row granularity of 4, and on top of it each design needs
+whole row blocks: 8 tile rows for the whole-array design, 2 for the single-core
+one. The smallest row count either design can express is therefore 8. The decode
+row tile (`rows = 1`) has no valid tiling, and `build_shape.py` reports it as
+`unsupported` rather than padding: padding would feed the array uninitialised
+activation rows, and the accumulator for the real row would be correct only by
+luck of what the buffer happened to contain.
 
 So a full-set build is partial by construction, and CI passes `--allow-partial`.
 The consequence is visible and safe: no artifact exists for those shapes, the
