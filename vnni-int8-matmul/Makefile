@@ -31,9 +31,11 @@ CPPFLAGS += -DCOLI_HAVE_XDNA2_RESOURCE_INFO
 endif
 
 TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
-         tests/npu_device_test
+         tests/npu_device_test tests/test_placement tests/test_moe_schedule
 
-all: $(TESTS)
+TOOLS := bench/backend_bench
+
+all: $(TESTS) $(TOOLS)
 
 # ── Shader ────────────────────────────────────────────────────────────────────
 # gpu/comp.spv is committed so the backend works without glslang installed.
@@ -49,16 +51,33 @@ cpu/vnni_cpu_backend.o: cpu/vnni_cpu_backend.c cpu/vnni_cpu_backend.h
 gpu/vulkan_backend.o: gpu/vulkan_backend.c gpu/vulkan_backend.h gpu/vulkan_dispatch.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h
+npu/xdna2_backend.o: npu/xdna2_backend.c npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_xrt_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(NPU_DIR)/xdna2_driver.o: $(NPU_DIR)/xdna2_driver.c $(NPU_DIR)/xdna2_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h
+$(NPU_DIR)/xdna2_xrt_driver.o: $(NPU_DIR)/xdna2_xrt_driver.c $(NPU_DIR)/xdna2_xrt_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o $(NPU_DIR)/xdna2_matmul.o
+$(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h $(NPU_DIR)/xdna2_xrt_driver.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# The vnni building blocks never link XRT: xdna2_xrt_driver.c compiles to the
+# "no XRT" probe unless the build explicitly defines COLI_NPU_XRT_AVAILABLE.
+NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o \
+            $(NPU_DIR)/xdna2_xrt_driver.o $(NPU_DIR)/xdna2_matmul.o
+
+# The scheduler plans work; it dispatches none, so it needs neither the Vulkan
+# nor the amdxdna headers and its tests run on any host.
+sched/%.o: sched/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+SCHED_OBJS := sched/shape_profile.o sched/npu_shapes.o sched/backend_placement.o \
+              sched/moe_schedule.o
+
+bench/backend_bench.o: bench/backend_bench.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 tests/%.o: tests/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -77,6 +96,19 @@ tests/vulkan_debug_harness: tests/vulkan_debug_harness.o gpu/vulkan_backend.o cp
 tests/npu_device_test: tests/npu_device_test.o $(NPU_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+tests/test_placement: tests/test_placement.o $(SCHED_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+tests/test_moe_schedule: tests/test_moe_schedule.o $(SCHED_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Produces the measured table the placement policy reads. It must run on the
+# machine that has the silicon; engines that are absent are recorded as skipped
+# rather than guessed.
+bench/backend_bench: bench/backend_bench.o cpu/vnni_cpu_backend.o \
+                     gpu/vulkan_backend.o $(NPU_OBJS) $(SCHED_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 # ── Test / clean ──────────────────────────────────────────────────────────────
 
 test: $(TESTS)
@@ -84,6 +116,8 @@ test: $(TESTS)
 	./tests/vulkan_runtime_test
 	./tests/vulkan_debug_harness
 	./tests/npu_device_test
+	./tests/test_placement
+	./tests/test_moe_schedule
 
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
@@ -94,6 +128,7 @@ podman-test: scripts/strix-halo-podman-test.sh
 # the running `tee` still holds open, so the harness finishes with no log on
 # disk and CI reports "no test log produced".
 clean:
-	rm -f $(TESTS) tests/*.o cpu/*.o npu/*.o gpu/*.o $(NPU_DIR)/*.o
+	rm -f $(TESTS) $(TOOLS) tests/*.o cpu/*.o npu/*.o gpu/*.o sched/*.o bench/*.o \
+	      $(NPU_DIR)/*.o
 
 .PHONY: all shader test podman-test clean

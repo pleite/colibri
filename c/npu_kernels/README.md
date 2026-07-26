@@ -23,7 +23,10 @@ reference only.
 | Kernel driver | `amdxdna`, in-tree since Linux 6.14 |
 
 `/dev/dri/*` is the iGPU, not the NPU. XRT is not required; this code issues DRM
-ioctls directly.
+ioctls directly. When XRT and the XDNA shim (`libxrt_driver_xdna`) *are*
+installed, `XDNA2_DRIVER=xrt` makes initialisation require them — the probe
+opens the device through the official runtime and fails with `-ENOSYS` when it
+cannot. Dispatch remains DRM; see `docs/strix-halo-npu.md` §3.
 
 ## Stack
 
@@ -40,6 +43,7 @@ c/backend_npu.c            coli_npu_* dispatcher
 | File | Purpose |
 |---|---|
 | `xdna2_driver.h/.c` | DRM ioctl wrapper: device, hardware context, buffer objects, submit, wait, queries |
+| `xdna2_xrt_driver.h/.c` | XRT / XDNA shim control plane: availability probe and `XDNA2_DRIVER` policy. No execution path |
 | `xdna2_matmul.h/.c` | Fixed-shape INT8 matmul runtime, `.npukernel` loading, int4 → int8 expansion |
 | `npu_runtime.h` | `coli_npu_*` integration surface used by `c/backend_npu.c` |
 | `CMakeLists.txt` | Build; fails hard if `<drm/amdxdna_accel.h>` is missing, probes for post-6.18 UAPI additions |
@@ -54,6 +58,7 @@ the build fails.
 ```bash
 gcc -O2 -std=c11 -Wall -Wextra -D_GNU_SOURCE -I c/npu_kernels \
     c/npu_kernels/xdna2_driver.c \
+    c/npu_kernels/xdna2_xrt_driver.c \
     c/npu_kernels/xdna2_matmul.c \
     c/npu_kernels/tests/test_npu.c \
     -o c/npu_kernels/test_npu -ldl -lpthread -lm

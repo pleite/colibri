@@ -25,6 +25,7 @@
 
 #include "xdna2_driver.h"
 #include "xdna2_matmul.h"
+#include "xdna2_xrt_driver.h"
 #include <drm/amdxdna_accel.h>
 
 /* ── Test helpers ── */
@@ -266,6 +267,95 @@ static void test_kernel_lookup(void) {
     }
 }
 
+
+/* ── Test: control plane parsing (host logic, always runs) ── */
+
+static void test_control_plane_parse(void) {
+    TEST("XDNA2_DRIVER parsing");
+
+    struct { const char *value; xdna2_control_plane_t expected; } ok[] = {
+        { NULL,    XDNA2_CONTROL_PLANE_AUTO },
+        { "",      XDNA2_CONTROL_PLANE_AUTO },
+        { "auto",  XDNA2_CONTROL_PLANE_AUTO },
+        { "drm",   XDNA2_CONTROL_PLANE_DRM  },
+        { "xrt",   XDNA2_CONTROL_PLANE_XRT  },
+        { " XRT ", XDNA2_CONTROL_PLANE_XRT  },
+    };
+    const char *bad[] = { "cpu", "xrt2", "dr", "a very long name" };
+
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); ++i) {
+        xdna2_control_plane_t plane = XDNA2_CONTROL_PLANE_DRM;
+        if (xdna2_control_plane_parse(ok[i].value, &plane) != 0 ||
+            plane != ok[i].expected) {
+            printf("FAIL (value '%s')\n", ok[i].value ? ok[i].value : "(null)");
+            g_tests_failed++;
+            return;
+        }
+    }
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        xdna2_control_plane_t plane = XDNA2_CONTROL_PLANE_AUTO;
+        if (xdna2_control_plane_parse(bad[i], &plane) != -EINVAL) {
+            printf("FAIL ('%s' was accepted)\n", bad[i]);
+            g_tests_failed++;
+            return;
+        }
+    }
+
+    printf("PASS\n");
+    g_tests_passed++;
+}
+
+/* ── Test: XRT / XDNA shim control plane ── */
+
+static void test_control_plane_resolve(void) {
+    TEST("XRT control plane resolution");
+
+    const int probe = xdna2_xrt_probe();
+    const bool compiled_in = xdna2_xrt_compiled_in();
+
+    if (!compiled_in && probe != -ENOSYS) {
+        printf("FAIL (no XRT at build time but probe returned %d)\n", probe);
+        g_tests_failed++;
+        return;
+    }
+
+    /* "drm" must never consult XRT. */
+    xdna2_control_plane_t plane = XDNA2_CONTROL_PLANE_AUTO;
+    if (xdna2_control_plane_resolve(XDNA2_CONTROL_PLANE_DRM, &plane) != 0 ||
+        plane != XDNA2_CONTROL_PLANE_DRM) {
+        printf("FAIL (drm did not resolve to drm)\n");
+        g_tests_failed++;
+        return;
+    }
+
+    /* "auto" always succeeds and never resolves to AUTO. */
+    if (xdna2_control_plane_resolve(XDNA2_CONTROL_PLANE_AUTO, &plane) != 0 ||
+        (plane != XDNA2_CONTROL_PLANE_DRM && plane != XDNA2_CONTROL_PLANE_XRT)) {
+        printf("FAIL (auto resolved to '%s')\n", xdna2_control_plane_name(plane));
+        g_tests_failed++;
+        return;
+    }
+
+    /* "xrt" must fail loudly when the official stack is not usable. */
+    int ret = xdna2_control_plane_resolve(XDNA2_CONTROL_PLANE_XRT, &plane);
+    if (probe == 0) {
+        if (ret != 0 || plane != XDNA2_CONTROL_PLANE_XRT) {
+            printf("FAIL (xrt probe succeeded but resolve returned %d)\n", ret);
+            g_tests_failed++;
+            return;
+        }
+        printf("PASS (%s)\n", xdna2_xrt_status());
+    } else {
+        if (ret != -ENOSYS) {
+            printf("FAIL (expected -ENOSYS, got %d)\n", ret);
+            g_tests_failed++;
+            return;
+        }
+        printf("PASS (xrt refused: %s)\n", xdna2_xrt_status());
+    }
+    g_tests_passed++;
+}
+
 /* ── Main ── */
 
 int main(void) {
@@ -278,6 +368,8 @@ int main(void) {
     test_no_cpu_fallback();
     test_int4_expansion();
     test_kernel_lookup();
+    test_control_plane_parse();
+    test_control_plane_resolve();
 
     printf("\n=== Results: %d/%d passed", g_tests_passed, g_tests_run);
     if (g_tests_failed > 0) {

@@ -26,6 +26,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -41,6 +43,22 @@ static int xdna2_ioctl(int fd, unsigned long cmd, void *arg) {
                 (unsigned long)cmd, strerror(errno));
     }
     return ret;
+}
+
+/*
+ * The user address the driver associates with a BO, exactly as GET_BO_INFO
+ * reports it: XDNA2_INVALID_ADDR when the driver holds no address, which is a
+ * meaningful state and must not be folded into 0 here.
+ */
+static int xdna2_bo_userptr(int fd, uint32_t handle, uint64_t *uva) {
+    struct amdxdna_drm_get_bo_info info;
+    memset(&info, 0, sizeof(info));
+    info.handle = handle;
+    if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &info) < 0) {
+        return -1;
+    }
+    if (uva) *uva = info.vaddr;
+    return 0;
 }
 
 /* ── Device Management ── */
@@ -78,6 +96,13 @@ void xdna2_close_device(int fd) {
 
 /* ── Hardware Context ── */
 
+/* Defined with the other BO helpers below. `force_mmap` ignores any user
+ * address the driver already reports and insists on a real mmap(); `align`
+ * constrains the address that mmap() hands back (0 or 1 for "page alignment is
+ * enough"). */
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap,
+                           uint64_t align);
+
 /*
  * The amdxdna client owns exactly one device heap. `aie2_hwctx_init()` fails
  * with -ENOENT ("The client dev heap object not exist") when DRM_IOCTL_
@@ -88,19 +113,27 @@ void xdna2_close_device(int fd) {
  * The kernel caps the heap at dev_info->dev_mem_size, which is 64 MiB
  * (AIE2_DEVM_SIZE) on every AIE2 part including Strix Halo, and rounds device
  * allocations to dev_mem_buf_shift = 32 KiB.
+ *
+ * The size itself must be a whole number of dev_mem_size chunks: that is what
+ * the driver checks when it creates the heap BO and what `aie2_map_host_buf()`
+ * hands to the firmware one chunk at a time. A smaller heap is refused rather
+ * than silently rounded, because a rounded-down size would fail later, inside
+ * CREATE_HWCTX, as a bare -EINVAL.
  */
 static uint64_t xdna2_dev_heap_bytes(void) {
     const char *env = getenv("XDNA2_HEAP_BYTES");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long value = strtoull(env, &end, 0);
-        if (end && *end == '\0' && value >= XDNA2_DEV_HEAP_ALIGN &&
-            value <= XDNA2_DEV_HEAP_MAX_BYTES) {
-            return (uint64_t)(value & ~(uint64_t)(XDNA2_DEV_HEAP_ALIGN - 1));
+        if (end && *end == '\0' && value >= XDNA2_DEV_HEAP_CHUNK_BYTES &&
+            value <= XDNA2_DEV_HEAP_MAX_BYTES &&
+            (value % XDNA2_DEV_HEAP_CHUNK_BYTES) == 0) {
+            return (uint64_t)value;
         }
         fprintf(stderr,
-                "xdna2: ignoring XDNA2_HEAP_BYTES='%s' (expected %u..%llu bytes)\n",
-                env, XDNA2_DEV_HEAP_ALIGN,
+                "xdna2: ignoring XDNA2_HEAP_BYTES='%s' (expected a multiple of "
+                "%llu bytes, at most %llu)\n",
+                env, (unsigned long long)XDNA2_DEV_HEAP_CHUNK_BYTES,
                 (unsigned long long)XDNA2_DEV_HEAP_MAX_BYTES);
     }
     return XDNA2_DEV_HEAP_MAX_BYTES;
@@ -132,12 +165,47 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
      * with -EINVAL ("Invalid dev heap userptr") while that address is still
      * AMDXDNA_INVALID_ADDR. aie2_hwctx_init() allocates its command buffers
      * exactly that way, so an unmapped heap turns CREATE_HWCTX into -EINVAL.
+     *
+     * The mapping is forced: a heap's user address exists *because* this
+     * process mapped it, so an address reported before that has to be treated
+     * as stale rather than as permission to skip the mmap.
+     *
+     * It is also aligned to the firmware's chunk size. `aie2_map_host_buf()`
+     * hands the heap's user address to the firmware in `dev_mem_size`-sized
+     * chunks (MSG_OP_MAP_HOST_BUFFER), and the firmware rejects a base that is
+     * not a multiple of that chunk: the mgmt message fails, `aie2_hwctx_init()`
+     * logs "Map host buffer failed" and CREATE_HWCTX returns -EINVAL. The
+     * kernel applies the same alignment when it allocates the heap itself
+     * (`align = dev_info->dev_mem_size` for AMDXDNA_BO_DEV_HEAP), and both XRT
+     * and ROCr align their heap mapping the same way. A plain mmap() is only
+     * page aligned, so it satisfies this by luck: that is why the context came
+     * up in some processes and not in others on the same machine.
      */
-    if (xdna2_map_bo(fd, &heap_bo) < 0) {
+    if (xdna2_map_bo_ex(fd, &heap_bo, /* force_mmap */ true,
+                        /* align */ XDNA2_DEV_HEAP_CHUNK_BYTES) < 0) {
         xdna2_destroy_bo(fd, &heap_bo);
         fprintf(stderr,
                 "xdna2: failed to map the device heap; the driver needs the "
                 "heap's user address before it can carve device BOs out of it\n");
+        return -1;
+    }
+
+    /*
+     * Confirm the driver actually recorded that address. Without this the only
+     * evidence of a heap the kernel considers unmapped is a bare -EINVAL from
+     * CREATE_HWCTX several calls later, with the real cause visible only in
+     * dmesg on the host.
+     */
+    uint64_t heap_uva = XDNA2_INVALID_ADDR;
+    if (xdna2_bo_userptr(fd, heap_bo.handle, &heap_uva) < 0 ||
+        heap_uva == XDNA2_INVALID_ADDR) {
+        fprintf(stderr,
+                "xdna2: the device heap is mapped at %p but the driver still "
+                "reports no user address for it; every AMDXDNA_BO_DEV "
+                "allocation, and so CREATE_HWCTX, would fail with -EINVAL "
+                "(\"Invalid dev heap userptr\")\n",
+                heap_bo.mapped);
+        xdna2_destroy_bo(fd, &heap_bo);
         return -1;
     }
 
@@ -174,6 +242,11 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
 
     if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &create_ctx) < 0) {
         int err = errno;
+        /* Read the heap state the driver held at the moment it refused, before
+         * the BOs are released: whether the heap was still mapped decides
+         * between a client-side bookkeeping fault and a partitioning refusal. */
+        uint64_t heap_uva_now = XDNA2_INVALID_ADDR;
+        int heap_known = (xdna2_bo_userptr(fd, heap_bo.handle, &heap_uva_now) == 0);
         xdna2_destroy_bo(fd, &log_bo);
         xdna2_destroy_bo(fd, &umq_bo);
         xdna2_destroy_bo(fd, &heap_bo);
@@ -188,6 +261,20 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                     "find this client's device heap, not that the ioctl is "
                     "unsupported (that would be ENOTTY)\n");
         } else if (err == EINVAL) {
+            if (!heap_known || heap_uva_now == XDNA2_INVALID_ADDR) {
+                fprintf(stderr,
+                        "xdna2: the driver reports no user address for the "
+                        "device heap now, though it reported 0x%" PRIx64 " right "
+                        "after the mapping; the heap registration was dropped "
+                        "between the two calls\n",
+                        heap_uva);
+            } else {
+                fprintf(stderr,
+                        "xdna2: the device heap is still registered at "
+                        "0x%" PRIx64 ", so the rejection is not the "
+                        "\"Invalid dev heap userptr\" case\n",
+                        heap_uva_now);
+            }
             /* Report the geometry the driver derives the partition from rather
              * than asserting a cause: the column count is only one of the ways
              * context init can return -EINVAL, and guessing at the reason is
@@ -215,7 +302,11 @@ int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                     "xdna2: the driver logs the exact rejection; check "
                     "`dmesg | grep -i amdxdna` on the host. "
                     "\"Invalid dev heap userptr\" there means the device heap "
-                    "was not mapped before the context was created\n");
+                    "was not mapped before the context was created; "
+                    "\"Map host buffer failed\" means the firmware refused the "
+                    "heap's user address, which must be a multiple of %llu "
+                    "bytes\n",
+                    (unsigned long long)XDNA2_DEV_HEAP_CHUNK_BYTES);
         }
         return -1;
     }
@@ -324,13 +415,58 @@ int xdna2_destroy_bo(int fd, xdna2_bo_t *bo) {
     return ret < 0 ? -1 : 0;
 }
 
-int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
+/*
+ * mmap() a BO at an address that is a multiple of `align`.
+ *
+ * mmap() only guarantees page alignment, and there is no portable way to ask
+ * for more, so a slack region of `size + align - 1` bytes is reserved first and
+ * the real mapping is placed over its aligned interior with MAP_FIXED. The
+ * unused head and tail are released afterwards, which keeps munmap(mapped,
+ * size) correct at teardown. MAP_FIXED lands inside a reservation this call
+ * owns, so it can never replace an unrelated mapping.
+ */
+static void *xdna2_mmap_aligned(int fd, uint64_t size, uint64_t align,
+                                uint64_t offset) {
+    if (align <= 1) {
+        return mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fd, (off_t)offset);
+    }
+
+    size_t reserve = (size_t)size + (size_t)align - 1;
+    char *base = mmap(NULL, reserve, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    char *aligned = (char *)(((uintptr_t)base + (uintptr_t)align - 1) &
+                             ~((uintptr_t)align - 1));
+    void *addr = mmap(aligned, (size_t)size, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_FIXED, fd, (off_t)offset);
+    if (addr == MAP_FAILED) {
+        munmap(base, reserve);
+        return MAP_FAILED;
+    }
+
+    if (aligned > base) {
+        munmap(base, (size_t)(aligned - base));
+    }
+    char *tail = aligned + size;
+    if (tail < base + reserve) {
+        munmap(tail, (size_t)((base + reserve) - tail));
+    }
+    return addr;
+}
+
+static int xdna2_map_bo_ex(int fd, xdna2_bo_t *bo, bool force_mmap,
+                           uint64_t align) {
     if (!bo) return -1;
     if (bo->mapped) return 0;
 
     /* Some BO types are already mapped into the process by the driver and
-     * report the address directly. */
-    if (bo->vaddr) {
+     * report the address directly. A caller that owns the registration itself
+     * (the device heap) passes force_mmap and never takes this shortcut. */
+    if (bo->vaddr && !force_mmap) {
         bo->mapped = (void *)(uintptr_t)bo->vaddr;
         return 0;
     }
@@ -343,9 +479,7 @@ int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
         return -1;
     }
 
-    void *addr = mmap(NULL, (size_t)bo->size,
-                      PROT_READ | PROT_WRITE,
-                      MAP_SHARED, fd, (off_t)bo->map_offset);
+    void *addr = xdna2_mmap_aligned(fd, bo->size, align, bo->map_offset);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "xdna2: mmap failed for BO %u: %s\n",
                 bo->handle, strerror(errno));
@@ -355,6 +489,10 @@ int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
     bo->mapped = addr;
     bo->owns_mapping = true;
     return 0;
+}
+
+int xdna2_map_bo(int fd, xdna2_bo_t *bo) {
+    return xdna2_map_bo_ex(fd, bo, /* force_mmap */ false, /* align */ 0);
 }
 
 int xdna2_unmap_bo(xdna2_bo_t *bo) {
@@ -531,6 +669,69 @@ int xdna2_query_aie_metadata(int fd, xdna2_aie_metadata_t *meta) {
 }
 
 /*
+ * The NPU generation is a property of the part, not of the firmware protocol.
+ * `struct amdxdna_drm_query_aie_metadata.version` is the AIE tile-info version
+ * the firmware answers with — Strix Halo, an XDNA 2 part, reports 1.1 there —
+ * so it cannot be used to tell AIE-2 silicon from AIE-1 silicon. The PCI
+ * identity can: it is exactly what amdxdna's own device table matches on.
+ * There is no DRM query for it, so it is read from sysfs for the character
+ * device behind the fd; a host without /sys leaves the generation unknown
+ * rather than assumed.
+ */
+static int xdna2_read_sysfs_u32(const char *path, uint32_t *out) {
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    unsigned long value = 0;
+    int fields = fscanf(f, "%lx", &value); /* sysfs prints "0x1022" */
+    fclose(f);
+    if (fields != 1) return -1;
+    *out = (uint32_t)value;
+    return 0;
+}
+
+int xdna2_query_pci_ids(int fd, xdna2_pci_ids_t *ids) {
+    if (!ids || fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
+        return -1;
+    }
+
+    char base[128];
+    int n = snprintf(base, sizeof(base), "/sys/dev/char/%u:%u/device",
+                     (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev));
+    if (n <= 0 || (size_t)n >= sizeof(base)) return -1;
+
+    xdna2_pci_ids_t out;
+    memset(&out, 0, sizeof(out));
+
+    static const char *const attrs[3] = {"vendor", "device", "revision"};
+    uint32_t *slots[3] = {&out.vendor, &out.device, &out.revision};
+    for (int i = 0; i < 3; ++i) {
+        char path[192];
+        n = snprintf(path, sizeof(path), "%s/%s", base, attrs[i]);
+        if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+        if (xdna2_read_sysfs_u32(path, slots[i]) != 0) return -1;
+    }
+
+    *ids = out;
+    return 0;
+}
+
+int xdna2_is_xdna2_hardware(int fd) {
+    xdna2_pci_ids_t ids;
+    if (xdna2_query_pci_ids(fd, &ids) != 0) {
+        return -1;
+    }
+    if (ids.vendor != XDNA2_PCI_VENDOR_AMD) {
+        return 0;
+    }
+    /* Every XDNA 2 part shipped so far shares one device id and differs only
+     * in the revision; the XDNA 1 parts use different device ids entirely. */
+    return ids.device == XDNA2_PCI_DEVICE_NPU4 ? 1 : 0;
+}
+
+/*
  * DRM_AMDXDNA_QUERY_RESOURCE_INFO and struct amdxdna_drm_get_resource_info
  * were added to the amdxdna UAPI after Linux 6.18, so they are absent from
  * every currently shipping kernel-headers package. The build system probes for
@@ -598,6 +799,13 @@ void xdna2_print_device_info(int fd) {
     memset(&info, 0, sizeof(info));
 
     printf("=== XDNA 2 NPU Device Info ===\n");
+
+    xdna2_pci_ids_t ids;
+    if (xdna2_query_pci_ids(fd, &ids) == 0) {
+        printf("PCI: %04x:%04x rev %02x (%s)\n", ids.vendor, ids.device,
+               ids.revision,
+               xdna2_is_xdna2_hardware(fd) == 1 ? "XDNA 2" : "not XDNA 2");
+    }
 
     if (xdna2_query_firmware_version(fd, &fw_major, &fw_minor, &fw_patch, &fw_build) == 0) {
         printf("Firmware: %u.%u.%u (build %u)\n",

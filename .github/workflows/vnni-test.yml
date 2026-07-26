@@ -103,16 +103,21 @@ jobs:
       # The NPU can only fail inside the amdxdna driver, and the driver reports
       # why in the kernel log. The output goes to the job log and the artifact
       # as well as the summary: a step summary is easy to miss and cannot be
-      # downloaded. This step reports, it never gates.
+      # downloaded. This step reports, it never gates — hence the explicit
+      # `set +e`: the runner starts every `shell: bash` step with `-e -o
+      # pipefail`, so once the driver stopped logging errors the `grep` below
+      # matched nothing, exited 1 and failed a job whose tests had all passed.
       - name: Capture amdxdna kernel messages
         if: always()
         working-directory: vnni-int8-matmul
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           if dmesg >/tmp/dmesg.txt 2>/dev/null || sudo -n dmesg >/tmp/dmesg.txt 2>/dev/null; then
             # Filtered separately from the capture so that an unreadable kernel
-            # log is never mistaken for "no amdxdna messages".
+            # log is never mistaken for "no amdxdna messages". A clean log is the
+            # good outcome, so no match must not be an error.
             grep -i -e amdxdna -e aie2 /tmp/dmesg.txt | tail -n 40 > amdxdna.log
             if [ ! -s amdxdna.log ]; then
               echo "kernel log readable, but it holds no amdxdna messages" > amdxdna.log
@@ -152,6 +157,34 @@ jobs:
             exit 1
           fi
 
+      - name: Assert the placement profile was measured, not invented
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile=data/strix_halo_profile.csv
+          test -f "${profile}" || {
+            echo "the benchmark produced no profile table" >&2
+            exit 1
+          }
+          # Records only; comments carry the skip reasons for absent engines.
+          records=$(grep -vc '^\(#\|backend,\|$\)' "${profile}" || true)
+          echo "profile records: ${records}"
+          # On the machine that has the silicon an empty table means the sweep
+          # measured nothing, which is a failure rather than a quiet pass.
+          if [ "${REQUIRE_NPU}" = "1" ] && [ "${SKIP_NPU}" != "1" ] && \
+             [ "${records}" -eq 0 ]; then
+            echo "no engine produced a measurement on a runner that has the hardware" >&2
+            exit 1
+          fi
+          # An NPU row can only exist when an exact-shape kernel artifact ran.
+          if grep -q '^npu,' "${profile}" && \
+             ! grep -q 'npukernel' test_output.log; then
+            echo "the profile has NPU rows with no kernel artifact loaded" >&2
+            exit 1
+          fi
+
       - name: Publish test summary
         if: always()
         shell: bash
@@ -181,3 +214,4 @@ jobs:
             vnni-int8-matmul/amdxdna.log
             vnni-int8-matmul/tests/test_backends
             vnni-int8-matmul/tests/vulkan_runtime_test
+            vnni-int8-matmul/data/strix_halo_profile.csv

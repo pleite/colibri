@@ -22,6 +22,7 @@
 #include <stdbool.h>
 
 #include "xdna2_driver.h"
+#include "xdna2_xrt_driver.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,7 +80,13 @@ typedef struct {
 
 /* ── Runtime state ── */
 
-#define XDNA2_MAX_KERNELS 16
+/*
+ * Sized from the enumerated shape set, not guessed. Qwen 3.6 MoE has five
+ * distinct (inner, out) projections and three row tiles (1 / 32 / 256), which
+ * is 15 artifacts — see vnni-int8-matmul/sched/npu_shapes.h. 32 leaves room for
+ * the MTP head and a second prefill tile without another audit of this constant.
+ */
+#define XDNA2_MAX_KERNELS 32
 
 typedef struct {
     int             device_fd;
@@ -87,6 +94,9 @@ typedef struct {
     xdna2_kernel_t  kernels[XDNA2_MAX_KERNELS];
     int             kernel_count;
     uint32_t        timeout_ms;   /* Command wait timeout, default 5000 */
+    /* Control plane the device was validated through (never AUTO). Dispatch
+     * itself is always DRM ioctls; see xdna2_xrt_driver.h. */
+    xdna2_control_plane_t control_plane;
     bool            initialized;
 } xdna2_runtime_t;
 
@@ -96,6 +106,10 @@ typedef struct {
 
 /**
  * xdna2_runtime_init — open the NPU, create a hardware context.
+ *
+ * The control plane is chosen from XDNA2_DRIVER (auto, drm, xrt); see
+ * xdna2_xrt_driver.h. Returns -EINVAL for an unknown value and -ENOSYS when
+ * XDNA2_DRIVER=xrt but the XRT/XDNA shim stack is unusable.
  *
  * Returns 0 on success, negative on failure. On failure the runtime owns no
  * resources and must not be shut down.
@@ -133,6 +147,35 @@ const xdna2_kernel_t *xdna2_find_kernel(const xdna2_runtime_t *runtime,
  * ═══════════════════════════════════════════════════════════ */
 
 /**
+ * Per-stage wall-clock cost of one dispatch, in nanoseconds.
+ *
+ * At S=1 the NPU spends almost all of its time outside the MAC array, so a
+ * single "matmul took N ns" number cannot drive a placement decision. These
+ * stages are what a benchmark has to report separately:
+ *
+ *   alloc_ns     BO creation and mmap for x, w, y and the command packet
+ *   upload_ns    host copy plus SYNC_DIRECT_TO_DEVICE cache maintenance
+ *   submit_ns    ERT packet construction and DRM_IOCTL_AMDXDNA_EXEC_CMD
+ *   wait_ns      DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT until the command retires
+ *   readback_ns  SYNC_DIRECT_FROM_DEVICE, host copy and per-column scaling
+ *   teardown_ns  GEM_CLOSE of every BO
+ *
+ * Only wait_ns contains array time. Everything else is fixed cost.
+ */
+typedef struct {
+    uint64_t alloc_ns;
+    uint64_t upload_ns;
+    uint64_t submit_ns;
+    uint64_t wait_ns;
+    uint64_t readback_ns;
+    uint64_t teardown_ns;
+    uint64_t total_ns;
+} xdna2_matmul_timing_t;
+
+/** Sum of every stage that is not array time (i.e. everything but wait_ns). */
+uint64_t xdna2_timing_fixed_ns(const xdna2_matmul_timing_t *timing);
+
+/**
  * xdna2_matmul_int8 — y[S x O] = x[S x I] * weights^T[O x I], per-column scaled.
  *
  * x:       int8 activations, row-major [S][I]
@@ -147,6 +190,18 @@ int xdna2_matmul_int8(xdna2_runtime_t *runtime,
                       const int8_t *x, const int8_t *weights,
                       const float *scales, float *y,
                       int S, int I, int O);
+
+/**
+ * xdna2_matmul_int8_timed — as xdna2_matmul_int8(), filling `timing` with the
+ * per-stage breakdown. `timing` may be NULL, in which case the two entry points
+ * are identical. Stages that were not reached (because an earlier one failed)
+ * are left at zero.
+ */
+int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
+                            const int8_t *x, const int8_t *weights,
+                            const float *scales, float *y,
+                            int S, int I, int O,
+                            xdna2_matmul_timing_t *timing);
 
 /**
  * xdna2_dequant_int4 — expand packed int4 weights to int8, two nibbles per

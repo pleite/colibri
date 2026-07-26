@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+/* For xdna2_matmul_timing_t. This header is pure stdint/stdbool; it does not
+ * drag the amdxdna UAPI in. */
+#include "c/npu_kernels/xdna2_matmul.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +39,21 @@ int strix_xdna2_matmul(const int8_t *input,
                        int out_cols,
                        float *output,
                        const float *scales);
+
+/**
+ * As strix_xdna2_matmul(), additionally reporting the per-stage cost of the
+ * dispatch. `timing` may be NULL. Used by bench/backend_bench.c, which has to
+ * separate the NPU's fixed cost from array time: at rows=1 the fixed cost is
+ * the whole story and a single total would hide it.
+ */
+int strix_xdna2_matmul_timed(const int8_t *input,
+                             int rows,
+                             int inner_dim,
+                             const int8_t *weights,
+                             int out_cols,
+                             float *output,
+                             const float *scales,
+                             xdna2_matmul_timing_t *timing);
 
 /** "xdna2-npu" when usable, "xdna2-unavailable" otherwise. */
 const char *strix_xdna2_backend_name(void);
