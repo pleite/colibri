@@ -22,10 +22,12 @@ cannot.
 | `npu/xdna2_backend.[ch]` | XDNA 2 NPU backend, driving `c/npu_kernels/` |
 | `npu/aie/` | Containerised AIE toolchain that compiles the `.npukernel` artifacts |
 | `tools/npu_shapes_list.c` | Prints the enumerated shape set, so the kernel build has one source of truth |
+| `tools/placement_report.c` | Prints, per shape, which engine this host would use and why the others were refused |
 | `sched/shape_profile.[ch]` | The measured per-shape, per-engine cost table |
 | `sched/npu_shapes.[ch]` | Qwen 3.6 MoE shape enumeration and host-side row tiling |
 | `sched/backend_placement.[ch]` | `coli_choose_backend()`, the one placement decision |
-| `sched/moe_schedule.[ch]` | Router grouping, lane caps, expert weight residency |
+| `sched/moe_schedule.[ch]` | Router grouping, lane caps, plan execution, expert weight residency |
+| `sched/engine_caps.[ch]` | Fills the placement capability snapshot by probing the real devices |
 | `bench/backend_bench.c` | Sweeps the shapes and writes the measured table |
 | `data/` | Where the measured table lives; see `data/README.md` |
 | `kernel/vnni_matmul_test.c` | Small CPU-backend demo |

@@ -23,11 +23,17 @@ c/tests/test_grammar
 
 # build artefacts for the Strix Halo VNNI prototype
 vnni-int8-matmul/**/*.o
+# vnni-int8-matmul/Makefile compiles the shared NPU driver objects in place.
+c/npu_kernels/*.o
 vnni-int8-matmul/tests/test_backends
 vnni-int8-matmul/tests/vulkan_runtime_test
 vnni-int8-matmul/tests/vulkan_debug_harness
 vnni-int8-matmul/tests/npu_device_test
+vnni-int8-matmul/tests/test_placement
+vnni-int8-matmul/tests/test_moe_schedule
 vnni-int8-matmul/tools/npu_shapes_list
+vnni-int8-matmul/tools/placement_report
+vnni-int8-matmul/bench/backend_bench
 
 # NPU kernel artifacts: built from npu/aie by `make npu-kernels`, published as
 # a CI artifact rather than committed (they are megabytes of instruction stream

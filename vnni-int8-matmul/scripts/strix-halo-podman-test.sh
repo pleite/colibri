@@ -144,6 +144,12 @@ echo "--- profile ---"
 # has the silicon. Absent engines record a skip comment, never a guess.
 ./bench/backend_bench data/strix_halo_profile.csv
 cat data/strix_halo_profile.csv
+echo "--- placement ---"
+# What the table just produced actually decides: one row per enumerated shape,
+# with the engine, the decision source (measured/estimated/structural) and the
+# refusal reason for every engine that lost. Without this, "the NPU is being
+# used" stays an assertion.
+./tools/placement_report --profile data/strix_halo_profile.csv
 ')
 
 : > "${log_path}"

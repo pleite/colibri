@@ -266,13 +266,40 @@ static double mac_count(int rows, int inner, int out) {
     return (double)rows * (double)inner * (double)out;
 }
 
-coli_profile_match_t coli_profile_estimate_ns(const coli_shape_profile_t *profile,
-                                              coli_engine_t engine,
-                                              int rows, int inner, int out, int fmt,
-                                              double *ns_out) {
+/* Bytes one int8 dispatch moves: activations, weights, and the f32 output. */
+static double operand_bytes(int rows, int inner, int out) {
+    return (double)rows * (double)inner +
+           (double)inner * (double)out +
+           (double)rows * (double)out * 4.0;
+}
+
+static double weight_bytes(int inner, int out) {
+    return (double)inner * (double)out;
+}
+
+coli_row_class_t coli_row_class(int rows) {
+    return (rows > 1) ? COLI_ROW_CLASS_PREFILL : COLI_ROW_CLASS_DECODE;
+}
+
+const char *coli_row_class_name(coli_row_class_t klass) {
+    return (klass == COLI_ROW_CLASS_PREFILL) ? "prefill" : "decode";
+}
+
+/*
+ * The record an estimate for this shape is based on: an exact match if there is
+ * one, otherwise the nearest record in the same engine, format and row-tile
+ * class. Both estimate_ns() and upload_ns() go through here so they can never
+ * disagree about which measurement they are quoting.
+ */
+static coli_profile_match_t find_basis(const coli_shape_profile_t *profile,
+                                       coli_engine_t engine,
+                                       int rows, int inner, int out, int fmt,
+                                       const coli_shape_record_t **basis) {
+    if (basis) *basis = NULL;
     if (!profile || rows <= 0 || inner <= 0 || out <= 0) return COLI_PROFILE_MISS;
 
     const double want = mac_count(rows, inner, out);
+    const coli_row_class_t want_class = coli_row_class(rows);
     const coli_shape_record_t *nearest = NULL;
     double nearest_distance = 0.0;
 
@@ -281,9 +308,13 @@ coli_profile_match_t coli_profile_estimate_ns(const coli_shape_profile_t *profil
         if (r->engine != engine || r->fmt != fmt) continue;
 
         if (r->rows == rows && r->inner == inner && r->out == out) {
-            if (ns_out) *ns_out = r->total_ns;
+            if (basis) *basis = r;
             return COLI_PROFILE_EXACT;
         }
+
+        /* Hard class filter: decode and prefill records never estimate each
+         * other, because that is precisely where fixed-cost dominance flips. */
+        if (coli_row_class(r->rows) != want_class) continue;
 
         /* Log-space distance: a record two orders of magnitude away is a worse
          * basis than one 2x away, regardless of which side it is on. */
@@ -297,17 +328,58 @@ coli_profile_match_t coli_profile_estimate_ns(const coli_shape_profile_t *profil
     }
 
     if (!nearest) return COLI_PROFILE_MISS;
+    if (basis) *basis = nearest;
+    return COLI_PROFILE_ESTIMATE;
+}
+
+coli_profile_match_t coli_profile_estimate_ns(const coli_shape_profile_t *profile,
+                                              coli_engine_t engine,
+                                              int rows, int inner, int out, int fmt,
+                                              double *ns_out) {
+    const coli_shape_record_t *basis = NULL;
+    const coli_profile_match_t match =
+        find_basis(profile, engine, rows, inner, out, fmt, &basis);
+    if (match == COLI_PROFILE_MISS || !basis) return COLI_PROFILE_MISS;
+
+    if (match == COLI_PROFILE_EXACT) {
+        if (ns_out) *ns_out = basis->total_ns;
+        return COLI_PROFILE_EXACT;
+    }
 
     /*
      * Fixed cost does not scale with the shape; array time does. When the
      * record did not attribute a fixed cost (-1), treat the whole measurement
      * as array time rather than inventing a split.
      */
-    const double have = mac_count(nearest->rows, nearest->inner, nearest->out);
-    double fixed = (nearest->fixed_ns >= 0.0) ? nearest->fixed_ns : 0.0;
-    if (fixed > nearest->total_ns) fixed = nearest->total_ns;
-    const double array_time = nearest->total_ns - fixed;
+    const double want = mac_count(rows, inner, out);
+    const double have = mac_count(basis->rows, basis->inner, basis->out);
+    double fixed = (basis->fixed_ns >= 0.0) ? basis->fixed_ns : 0.0;
+    if (fixed > basis->total_ns) fixed = basis->total_ns;
+    const double array_time = basis->total_ns - fixed;
 
     if (ns_out) *ns_out = fixed + array_time * (want / have);
     return COLI_PROFILE_ESTIMATE;
+}
+
+coli_profile_match_t coli_profile_upload_ns(const coli_shape_profile_t *profile,
+                                            coli_engine_t engine,
+                                            int rows, int inner, int out, int fmt,
+                                            double *ns_out) {
+    if (ns_out) *ns_out = 0.0;
+    const coli_shape_record_t *basis = NULL;
+    const coli_profile_match_t match =
+        find_basis(profile, engine, rows, inner, out, fmt, &basis);
+    if (match == COLI_PROFILE_MISS || !basis) return COLI_PROFILE_MISS;
+
+    /* An unattributed upload stage is not a measured saving. */
+    if (basis->upload_ns < 0.0) return match;
+
+    const double basis_bytes = operand_bytes(basis->rows, basis->inner, basis->out);
+    if (basis_bytes <= 0.0) return match;
+
+    /* upload_ns per byte moved, applied to the weights this call needs. */
+    double ns = basis->upload_ns * (weight_bytes(inner, out) / basis_bytes);
+    if (ns < 0.0) ns = 0.0;
+    if (ns_out) *ns_out = ns;
+    return match;
 }

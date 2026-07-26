@@ -99,6 +99,13 @@ int strix_xdna2_is_supported(void) {
     return ensure_runtime();
 }
 
+int strix_xdna2_kernel_exists(int rows, int inner_dim, int out_cols, int fmt) {
+    if (rows <= 0 || inner_dim <= 0 || out_cols <= 0) return 0;
+    if (fmt != XDNA2_FMT_INT8) return 0;
+    if (!ensure_runtime()) return 0;
+    return ensure_kernel_for_shape(rows, inner_dim, out_cols);
+}
+
 int strix_xdna2_matmul(const int8_t *input,
                        int rows,
                        int inner_dim,
@@ -137,6 +144,20 @@ int strix_xdna2_matmul_timed(const int8_t *input,
 
 const char *strix_xdna2_backend_name(void) {
     return ensure_runtime() ? "xdna2-npu" : "xdna2-unavailable";
+}
+
+size_t strix_xdna2_resident_bytes(void) {
+    /*
+     * The device heap is the whole budget: the driver carves every
+     * AMDXDNA_BO_DEV allocation out of it and CREATE_HWCTX will not even
+     * succeed without it. Report what was actually mapped rather than the
+     * XDNA2_DEV_HEAP_MAX_BYTES constant, because XDNA2_HEAP_BYTES can lower it
+     * and a budget that is not the real one is worse than none.
+     */
+    if (!ensure_runtime()) return 0;
+    const uint64_t bytes = g_runtime.hwctx.dev_heap_bo.size;
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
+    return (size_t)bytes;
 }
 
 const char *strix_xdna2_failure_reason(void) {

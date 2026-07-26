@@ -1,6 +1,7 @@
 #ifndef VULKAN_BACKEND_H
 #define VULKAN_BACKEND_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -33,6 +34,17 @@ int strix_vulkan_matmul(const int8_t *input,
 
 /** "vulkan-compute-strix-halo" when usable, "vulkan-unavailable" otherwise. */
 const char *strix_vulkan_backend_name(void);
+
+/**
+ * Bytes the iGPU can hold resident for one dispatch, from the largest
+ * DEVICE_LOCAL memory heap, or 0 when the context is unavailable.
+ *
+ * The number belongs in `coli_placement_caps_t::gpu_resident_bytes`. On this
+ * unified-memory part the DEVICE_LOCAL heap is system memory, so it is a real
+ * bound rather than a discrete-GPU VRAM figure; 0 means "unknown", which the
+ * placement policy reads as "do not use residency as a constraint".
+ */
+size_t strix_vulkan_resident_bytes(void);
 
 /** VkPhysicalDeviceProperties::deviceName of the selected iGPU, or "". */
 const char *strix_vulkan_device_name(void);

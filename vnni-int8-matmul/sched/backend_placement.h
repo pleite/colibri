@@ -40,8 +40,31 @@ typedef struct {
      * is capped at XDNA2_DEV_HEAP_MAX_BYTES (64 MiB); a caller that knows its
      * real budget should pass it, and 0 means "unknown, do not use residency as
      * a constraint".
+     *
+     * `strix_xdna2_resident_bytes()` (npu/xdna2_backend.h) probes it from the
+     * device; `strix_vulkan_resident_bytes()` (gpu/vulkan_backend.h) does the
+     * equivalent from the Vulkan heap sizes.
      */
     size_t npu_resident_bytes;
+
+    /**
+     * Bytes the iGPU can hold resident for one dispatch, from the largest
+     * device-local heap. 0 means "unknown", exactly as for the NPU.
+     */
+    size_t gpu_resident_bytes;
+
+    /**
+     * Per engine: are this call's *weights* already uploaded there?
+     *
+     * On a UMA part this is the axis that decides expert placement. Every bench
+     * record is cold — it uploads its operands on every iteration — so an
+     * engine that already holds the weights is being over-charged by the
+     * measured number, and a warm expert on the GPU can beat a cold one on the
+     * CPU. Ranking subtracts the measured weight-upload share for an engine
+     * flagged here, and nothing at all when the bench did not attribute an
+     * upload stage. Default (all false) reproduces the cold measurement.
+     */
+    bool weights_resident[COLI_ENGINE_COUNT_];
 
     /**
      * Callback answering "is there a compiled .npukernel for exactly this
@@ -75,8 +98,25 @@ typedef struct {
     const char *reason;
     /* Per-engine refusal reason, NULL when the engine was a candidate. */
     const char *rejected[COLI_ENGINE_COUNT_];
+    /**
+     * True when the matching refusal is a property of the silicon rather than
+     * of this build: no artifact, driver or capability will ever make it pass.
+     *
+     * The only such refusal today is rows=1 on the NPU: the AIE2P int8 MAC has
+     * an 8-row granularity and the smallest tiling the array can express is 64
+     * rows, so a 1-row matmul is inexpressible (npu/aie/README.md). A caller
+     * that would otherwise retry once the kernels are built must not retry
+     * this one, and a report that lumps it in with "not built yet" is telling
+     * the operator to wait for something that is never coming.
+     */
+    bool rejected_permanent[COLI_ENGINE_COUNT_];
     /* Estimated per-call cost, or a negative value when not estimated. */
     double estimate_ns[COLI_ENGINE_COUNT_];
+    /**
+     * Weight-upload cost included in `estimate_ns` and removed again for an
+     * engine flagged in `caps.weights_resident`. 0.0 when nothing was measured.
+     */
+    double upload_ns[COLI_ENGINE_COUNT_];
     coli_profile_match_t match[COLI_ENGINE_COUNT_];
 } coli_placement_decision_t;
 
@@ -111,14 +151,20 @@ const char *coli_placement_profile_path(void);
  * Hard constraints, applied before any ranking:
  *   * an engine that is not available is never chosen;
  *   * the NPU additionally requires an exact-shape kernel artifact and, when
- *     `npu_resident_bytes` is known, an operand set that fits it;
+ *     `npu_resident_bytes` is known, an operand set that fits it; rows=1 is a
+ *     *permanent* refusal, flagged in `decision.rejected_permanent`;
+ *   * the iGPU likewise refuses an operand set larger than
+ *     `gpu_resident_bytes` when that is known;
  *   * a forced engine that fails a constraint yields COLI_ENGINE_NONE with the
  *     constraint named — it is never quietly replaced by another engine.
  *
  * Among the survivors the cheapest engine wins, ranked from the measured table:
  * exact records first, and only when no engine has one do estimates scaled from
- * nearby shapes compete. With no table at all, the structural default order
- * documented in docs/placement-policy.md is used and `source` says so.
+ * nearby shapes compete. An engine listed in `caps.weights_resident` is charged
+ * the measured cost minus the measured weight-upload share, because the record
+ * that produced it uploaded on every iteration. With no table at all, the
+ * structural default order documented in docs/placement-policy.md is used and
+ * `source` says so.
  *
  * `decision` may be NULL. Returns the chosen engine, which is
  * COLI_ENGINE_NONE when nothing can run the shape.

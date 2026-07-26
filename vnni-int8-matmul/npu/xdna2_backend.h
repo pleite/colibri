@@ -1,6 +1,7 @@
 #ifndef XDNA2_BACKEND_H
 #define XDNA2_BACKEND_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* For xdna2_matmul_timing_t. This header is pure stdint/stdbool; it does not
@@ -27,6 +28,17 @@ extern "C" {
 
 /** Returns 1 when the NPU is open and a hardware context exists. */
 int strix_xdna2_is_supported(void);
+
+/**
+ * Returns 1 when a kernel artifact exists for exactly this shape, loading it
+ * from COLI_NPU_KERNEL_DIR on first use, and 0 otherwise.
+ *
+ * This is the predicate the placement policy needs
+ * (`coli_placement_caps_t::npu_kernel_exists`): an exact-shape artifact is a
+ * hard precondition for choosing the NPU, and asking the backend is the only
+ * way to answer it without a second copy of the artifact-naming rule.
+ */
+int strix_xdna2_kernel_exists(int rows, int inner_dim, int out_cols, int fmt);
 
 /**
  * output[rows][out_cols] = input[rows][inner_dim] * weights^T[out_cols][inner_dim]
@@ -57,6 +69,20 @@ int strix_xdna2_matmul_timed(const int8_t *input,
 
 /** "xdna2-npu" when usable, "xdna2-unavailable" otherwise. */
 const char *strix_xdna2_backend_name(void);
+
+/**
+ * Bytes the NPU can hold resident for one dispatch, or 0 when unknown.
+ *
+ * This is the size of the client device heap the runtime actually mapped —
+ * every AMDXDNA_BO_DEV allocation is carved out of it, and the kernel caps it
+ * at XDNA2_DEV_HEAP_MAX_BYTES (64 MiB). It is the number that belongs in
+ * `coli_placement_caps_t::npu_resident_bytes`: an operand set larger than this
+ * cannot be made resident, whatever the shape says.
+ *
+ * Returns 0 rather than a guess when the NPU is unavailable, which the
+ * placement policy reads as "do not use residency as a constraint".
+ */
+size_t strix_xdna2_resident_bytes(void);
 
 /** Human-readable reason the backend is unusable ("none" when usable). */
 const char *strix_xdna2_failure_reason(void);

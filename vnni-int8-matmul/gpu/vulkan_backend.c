@@ -883,6 +883,29 @@ const char *strix_vulkan_device_name(void) {
     return ensure_context() ? g_ctx.device_name : "";
 }
 
+size_t strix_vulkan_resident_bytes(void) {
+    if (!ensure_context()) return 0;
+
+    VkPhysicalDeviceMemoryProperties props;
+    memset(&props, 0, sizeof(props));
+    g_ctx.vk.vkGetPhysicalDeviceMemoryProperties(g_ctx.physical_device, &props);
+
+    /*
+     * The largest DEVICE_LOCAL heap. On Strix Halo that heap is system memory,
+     * so this is a genuine upper bound on what one dispatch can hold — not the
+     * discrete-GPU sense of "VRAM". Heaps with no DEVICE_LOCAL bit are ignored:
+     * an allocation there is not somewhere the shader reads from cheaply, and
+     * counting it would inflate the budget placement is checking against.
+     */
+    VkDeviceSize best = 0;
+    for (uint32_t i = 0; i < props.memoryHeapCount; ++i) {
+        if (!(props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        if (props.memoryHeaps[i].size > best) best = props.memoryHeaps[i].size;
+    }
+    if (best == 0 || (uint64_t)best > (uint64_t)SIZE_MAX) return 0;
+    return (size_t)best;
+}
+
 void strix_vulkan_shutdown(void) {
     if (g_init_attempted) {
         destroy_context(&g_ctx);
