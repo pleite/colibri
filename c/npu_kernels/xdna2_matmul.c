@@ -13,6 +13,7 @@
 #include <drm/amdxdna_accel.h>
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,14 +40,35 @@ typedef struct {
     uint32_t data[1]; /* variable length */
 } ert_packet_t;
 
-/* Start payload for ERT_START_NPU (see XRT/kernel amdxdna_cmd_start_npu):
- * instruction buffer address and size in bytes, followed by regular args. */
+/* Compatible with XRT's ert.h layout for ERT_START_NPU (struct ert_npu_data). */
 typedef struct {
-    uint64_t instr_addr;
-    uint32_t instr_size;
-    uint32_t instr_prop_count;
-    uint32_t args[1]; /* variable length */
-} xdna2_ert_start_npu_t;
+    uint64_t instruction_buffer;
+    uint32_t instruction_buffer_size;
+    uint32_t instruction_prop_count;
+} xdna2_ert_npu_data_t;
+
+/* Kernel argument register payload after ert_npu_data, matching firmware ABI:
+ * x, w, y device pointers as 64-bit values, then I and O. */
+typedef struct {
+    uint64_t x;
+    uint64_t w;
+    uint64_t y;
+    uint32_t I;
+    uint32_t O;
+} xdna2_ert_kernel_args_t;
+
+/* Full payload area written into ert_start_kernel_cmd::data[] for START_NPU. */
+typedef struct {
+    xdna2_ert_npu_data_t npu;
+    xdna2_ert_kernel_args_t args;
+} xdna2_ert_start_npu_payload_t;
+
+_Static_assert(sizeof(xdna2_ert_npu_data_t) == 16, "ert_npu_data size mismatch");
+_Static_assert(sizeof(xdna2_ert_kernel_args_t) == 32, "kernel arg payload size mismatch");
+_Static_assert(offsetof(xdna2_ert_start_npu_payload_t, args) == 16,
+               "START_NPU payload order mismatch");
+_Static_assert((sizeof(xdna2_ert_start_npu_payload_t) % sizeof(uint32_t)) == 0,
+               "START_NPU payload must be 32-bit word aligned");
 
 static uint32_t ert_make_header(uint32_t opcode, uint32_t count) {
     return (ERT_STATE_NEW & 0xFu) |
@@ -365,14 +387,8 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     }
     if (timing) { uint64_t t = now_ns(); timing->upload_ns = t - t_mark; t_mark = t; }
 
-    /*
-     * ERT_START_NPU payload:
-     *   struct start_npu { u64 instr_addr; u32 instr_size; u32 prop_count; }
-     *   then regular kernel args (x, w, y device pointers as 64-bit + I + O).
-     */
-    const uint32_t arg_words = 8; /* x(2) + w(2) + y(2) + I + O */
-    const uint32_t start_words = (uint32_t)(sizeof(xdna2_ert_start_npu_t) / sizeof(uint32_t)) - 1u;
-    const uint32_t payload_words = start_words + arg_words;
+    const uint32_t payload_words =
+        (uint32_t)(sizeof(xdna2_ert_start_npu_payload_t) / sizeof(uint32_t));
     const size_t cmd_bytes = sizeof(uint32_t) * (2u + payload_words);
     if ((ret = alloc_and_map(fd, &bos.cmd, cmd_bytes, AMDXDNA_BO_CMD)) < 0) goto out;
 
@@ -381,18 +397,15 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     pkt->header = ert_make_header(kernel->ert_opcode, payload_words + 1u /* cu_mask */);
     pkt->cu_mask = kernel->cu_mask;
 
-    xdna2_ert_start_npu_t *npu = (xdna2_ert_start_npu_t *)pkt->data;
-    npu->instr_addr = kernel->instr_bo.xdna_addr;
-    npu->instr_size = (uint32_t)kernel->instr_bo.size;
-    npu->instr_prop_count = 0;
-    npu->args[0] = (uint32_t)(bos.x.xdna_addr & 0xFFFFFFFFu);
-    npu->args[1] = (uint32_t)(bos.x.xdna_addr >> 32);
-    npu->args[2] = (uint32_t)(bos.w.xdna_addr & 0xFFFFFFFFu);
-    npu->args[3] = (uint32_t)(bos.w.xdna_addr >> 32);
-    npu->args[4] = (uint32_t)(bos.y.xdna_addr & 0xFFFFFFFFu);
-    npu->args[5] = (uint32_t)(bos.y.xdna_addr >> 32);
-    npu->args[6] = (uint32_t)I;
-    npu->args[7] = (uint32_t)O;
+    xdna2_ert_start_npu_payload_t *payload = (xdna2_ert_start_npu_payload_t *)pkt->data;
+    payload->npu.instruction_buffer = kernel->instr_bo.xdna_addr;
+    payload->npu.instruction_buffer_size = (uint32_t)kernel->instr_bo.size;
+    payload->npu.instruction_prop_count = 0;
+    payload->args.x = bos.x.xdna_addr;
+    payload->args.w = bos.w.xdna_addr;
+    payload->args.y = bos.y.xdna_addr;
+    payload->args.I = (uint32_t)I;
+    payload->args.O = (uint32_t)O;
 
     uint32_t arg_handles[3] = { bos.x.handle, bos.w.handle, bos.y.handle };
     if (xdna2_submit_command(fd, &runtime->hwctx, bos.cmd.handle, arg_handles, 3) < 0) {
