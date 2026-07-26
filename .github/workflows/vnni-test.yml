@@ -103,16 +103,21 @@ jobs:
       # The NPU can only fail inside the amdxdna driver, and the driver reports
       # why in the kernel log. The output goes to the job log and the artifact
       # as well as the summary: a step summary is easy to miss and cannot be
-      # downloaded. This step reports, it never gates.
+      # downloaded. This step reports, it never gates — hence the explicit
+      # `set +e`: the runner starts every `shell: bash` step with `-e -o
+      # pipefail`, so once the driver stopped logging errors the `grep` below
+      # matched nothing, exited 1 and failed a job whose tests had all passed.
       - name: Capture amdxdna kernel messages
         if: always()
         working-directory: vnni-int8-matmul
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           if dmesg >/tmp/dmesg.txt 2>/dev/null || sudo -n dmesg >/tmp/dmesg.txt 2>/dev/null; then
             # Filtered separately from the capture so that an unreadable kernel
-            # log is never mistaken for "no amdxdna messages".
+            # log is never mistaken for "no amdxdna messages". A clean log is the
+            # good outcome, so no match must not be an error.
             grep -i -e amdxdna -e aie2 /tmp/dmesg.txt | tail -n 40 > amdxdna.log
             if [ ! -s amdxdna.log ]; then
               echo "kernel log readable, but it holds no amdxdna messages" > amdxdna.log
