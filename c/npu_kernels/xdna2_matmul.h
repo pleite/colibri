@@ -93,6 +93,7 @@ typedef struct {
     xdna2_hwctx_t   hwctx;
     xdna2_kernel_t  kernels[XDNA2_MAX_KERNELS];
     int             kernel_count;
+    bool            cu_configured;
     uint32_t        timeout_ms;   /* Command wait timeout, default 5000 */
     /* Control plane the device was validated through (never AUTO). Dispatch
      * itself is always DRM ioctls; see xdna2_xrt_driver.h. */

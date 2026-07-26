@@ -39,6 +39,15 @@ typedef struct {
     uint32_t data[1]; /* variable length */
 } ert_packet_t;
 
+/* Start payload for ERT_START_NPU (see XRT/kernel amdxdna_cmd_start_npu):
+ * instruction buffer address and size in bytes, followed by regular args. */
+typedef struct {
+    uint64_t instr_addr;
+    uint32_t instr_size;
+    uint32_t instr_prop_count;
+    uint32_t args[1]; /* variable length */
+} xdna2_ert_start_npu_t;
+
 static uint32_t ert_make_header(uint32_t opcode, uint32_t count) {
     return (ERT_STATE_NEW & 0xFu) |
            ((count & 0x7FFu) << 12) |
@@ -139,6 +148,16 @@ int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
                       SYNC_DIRECT_TO_DEVICE, 0, instr_size) < 0) {
         xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
         return -EIO;
+    }
+
+    if (!runtime->cu_configured) {
+        if (xdna2_config_hwctx_single_cu(runtime->device_fd, &runtime->hwctx,
+                                         entry.instr_bo.handle,
+                                         /* DPU CU function */ 0) < 0) {
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -EIO;
+        }
+        runtime->cu_configured = true;
     }
 
     entry.loaded = true;
@@ -347,11 +366,13 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     if (timing) { uint64_t t = now_ns(); timing->upload_ns = t - t_mark; t_mark = t; }
 
     /*
-     * ERT payload: instruction stream address and word count, then the
-     * device addresses of the three data buffers, in the order the AIE kernel
-     * declares its arguments.
+     * ERT_START_NPU payload:
+     *   struct start_npu { u64 instr_addr; u32 instr_size; u32 prop_count; }
+     *   then regular kernel args (x, w, y device pointers as 64-bit + I + O).
      */
-    const uint32_t payload_words = 8;
+    const uint32_t arg_words = 8; /* x(2) + w(2) + y(2) + I + O */
+    const uint32_t start_words = (uint32_t)(sizeof(xdna2_ert_start_npu_t) / sizeof(uint32_t)) - 1u;
+    const uint32_t payload_words = start_words + arg_words;
     const size_t cmd_bytes = sizeof(uint32_t) * (2u + payload_words);
     if ((ret = alloc_and_map(fd, &bos.cmd, cmd_bytes, AMDXDNA_BO_CMD)) < 0) goto out;
 
@@ -360,15 +381,18 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
     pkt->header = ert_make_header(kernel->ert_opcode, payload_words + 1u /* cu_mask */);
     pkt->cu_mask = kernel->cu_mask;
 
-    uint32_t *d = pkt->data;
-    d[0] = (uint32_t)(kernel->instr_bo.xdna_addr & 0xFFFFFFFFu);
-    d[1] = (uint32_t)(kernel->instr_bo.xdna_addr >> 32);
-    d[2] = kernel->instr_words;
-    d[3] = (uint32_t)(bos.x.xdna_addr & 0xFFFFFFFFu);
-    d[4] = (uint32_t)(bos.w.xdna_addr & 0xFFFFFFFFu);
-    d[5] = (uint32_t)(bos.y.xdna_addr & 0xFFFFFFFFu);
-    d[6] = (uint32_t)I;
-    d[7] = (uint32_t)O;
+    xdna2_ert_start_npu_t *npu = (xdna2_ert_start_npu_t *)pkt->data;
+    npu->instr_addr = kernel->instr_bo.xdna_addr;
+    npu->instr_size = (uint32_t)kernel->instr_bo.size;
+    npu->instr_prop_count = 0;
+    npu->args[0] = (uint32_t)(bos.x.xdna_addr & 0xFFFFFFFFu);
+    npu->args[1] = (uint32_t)(bos.x.xdna_addr >> 32);
+    npu->args[2] = (uint32_t)(bos.w.xdna_addr & 0xFFFFFFFFu);
+    npu->args[3] = (uint32_t)(bos.w.xdna_addr >> 32);
+    npu->args[4] = (uint32_t)(bos.y.xdna_addr & 0xFFFFFFFFu);
+    npu->args[5] = (uint32_t)(bos.y.xdna_addr >> 32);
+    npu->args[6] = (uint32_t)I;
+    npu->args[7] = (uint32_t)O;
 
     uint32_t arg_handles[3] = { bos.x.handle, bos.w.handle, bos.y.handle };
     if (xdna2_submit_command(fd, &runtime->hwctx, bos.cmd.handle, arg_handles, 3) < 0) {

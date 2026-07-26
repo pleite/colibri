@@ -351,6 +351,47 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx) {
     return ret < 0 ? -1 : 0;
 }
 
+int xdna2_config_hwctx_single_cu(int fd, xdna2_hwctx_t *ctx,
+                                 uint32_t cu_bo_handle, uint8_t cu_func) {
+    if (!ctx || !ctx->initialized || cu_bo_handle == 0) return -1;
+#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) && \
+    defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
+    struct {
+        struct amdxdna_hwctx_param_config_cu hdr;
+        struct amdxdna_cu_config cu;
+    } cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.hdr.num_cus = 1;
+    cfg.cu.cu_bo = cu_bo_handle;
+    cfg.cu.cu_func = cu_func;
+
+    struct amdxdna_drm_config_hwctx req;
+    memset(&req, 0, sizeof(req));
+    req.handle = ctx->hwctx_handle;
+    req.param_type = DRM_AMDXDNA_HWCTX_CONFIG_CU;
+    req.param_val = (__u64)(uintptr_t)&cfg;
+    req.param_val_size = (uint32_t)sizeof(cfg);
+
+    if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &req) < 0) {
+        fprintf(stderr,
+                "xdna2: failed to configure CU on hwctx=%u with BO=%u\n",
+                ctx->hwctx_handle, cu_bo_handle);
+        return -1;
+    }
+    return 0;
+#else
+    (void)fd;
+    (void)ctx;
+    (void)cu_bo_handle;
+    (void)cu_func;
+    fprintf(stderr,
+            "xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
+            "cannot register CU/PDI on this build\n");
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 /* ── Buffer Objects ── */
 
 int xdna2_create_bo(int fd, xdna2_bo_t *bo, uint64_t size, uint32_t type) {
