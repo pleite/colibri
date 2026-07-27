@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <time.h>
 
 /* ── ERT command packet ──────────────────────────────────────────────────────
@@ -338,12 +339,17 @@ int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
         }
         if (xdna2_config_hwctx_cus(runtime->device_fd, &runtime->hwctx, cu_configs,
                                    (uint16_t)ip_count) < 0) {
+            const int saved_errno = errno;
             free(cu_configs);
             free(ip_entries);
             free(xclbin_path);
             free(xclbin);
             destroy_cu_config_bos(runtime->device_fd, &entry);
             xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            if (saved_errno == ENOTSUP || saved_errno == ENOTTY ||
+                saved_errno == EOPNOTSUPP) {
+                return -ENOTSUP;
+            }
             return -EIO;
         }
         free(cu_configs);
@@ -386,6 +392,23 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
     memset(runtime, 0, sizeof(*runtime));
     runtime->device_fd = -1;
     runtime->timeout_ms = 5000;
+
+#if !defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) || \
+    !defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
+    struct utsname uts;
+    const char *release = "unknown";
+    if (uname(&uts) == 0 && uts.release[0] != '\0') {
+        release = uts.release;
+    }
+    fprintf(stderr,
+            "xdna2: startup check failed: build-time UAPI is missing "
+            "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX (host kernel: %s)\n",
+            release);
+    fprintf(stderr,
+            "xdna2: install kernel headers with <drm/amdxdna_accel.h> that "
+            "define CONFIG_HWCTX symbols (Linux >= 6.14)\n");
+    return -ENOTSUP;
+#endif
 
     /*
      * Pick the control plane before touching the device. This decides how the

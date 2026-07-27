@@ -91,5 +91,6 @@ Tests passed: 40
 ## Troubleshooting
 
 - **Kernel not found**: Run `make npu-kernels` to build kernels
+- **Missing `DRM_IOCTL_AMDXDNA_CONFIG_HWCTX`**: host kernel/UAPI is too old for CU/PDI registration; use amdxdna headers and kernel >= 6.14 with `CONFIG_DRM_AMDXDNA`
 - **Permission denied**: Add user to `render` group or run as root
 - **Module not loaded**: `sudo modprobe amdxdna`

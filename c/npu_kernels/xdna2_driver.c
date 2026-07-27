@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,6 +54,27 @@ static uint32_t xdna2_read_le32(const uint8_t *p) {
 static uint64_t xdna2_read_le64(const uint8_t *p) {
     return ((uint64_t)xdna2_read_le32(p)) |
            ((uint64_t)xdna2_read_le32(p + 4) << 32);
+}
+
+static void xdna2_print_config_hwctx_requirement_once(void) {
+    static bool printed = false;
+    if (printed) return;
+    printed = true;
+
+    struct utsname uts;
+    const char *release = "unknown";
+    if (uname(&uts) == 0 && uts.release[0] != '\0') {
+        release = uts.release;
+    }
+
+    fprintf(stderr, "xdna2: host kernel release: %s\n", release);
+    fprintf(stderr,
+            "xdna2: CU/PDI registration requires "
+            "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX and "
+            "DRM_AMDXDNA_HWCTX_CONFIG_CU\n");
+    fprintf(stderr,
+            "xdna2: requirement: Linux amdxdna UAPI from kernel headers >= 6.14 "
+            "and CONFIG_DRM_AMDXDNA enabled on the host kernel\n");
 }
 
 static void xdna2_copy_section_name(char *dst, size_t dst_size,
@@ -472,6 +494,14 @@ int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
     int ret = xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &req);
     free(cfg_bytes);
     if (ret < 0) {
+        if (errno == ENOTTY || errno == EOPNOTSUPP) {
+            fprintf(stderr,
+                    "xdna2: running kernel does not support "
+                    "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX\n");
+            xdna2_print_config_hwctx_requirement_once();
+            errno = ENOTSUP;
+            return -1;
+        }
         fprintf(stderr,
                 "xdna2: failed to configure %u CUs on hwctx=%u\n",
                 cu_count, ctx->hwctx_handle);
@@ -486,6 +516,7 @@ int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
     fprintf(stderr,
             "xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
             "cannot register CU/PDI on this build\n");
+    xdna2_print_config_hwctx_requirement_once();
     errno = ENOTSUP;
     return -1;
 #endif

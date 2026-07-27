@@ -13,6 +13,10 @@ Enable NPU execution by resolving the kernel UAPI limitation and validating all 
 
 ### 1.1 Investigate Kernel Requirements
 
+**Known baseline (from upstream kernel headers):**
+- `DRM_IOCTL_AMDXDNA_CONFIG_HWCTX` and `DRM_AMDXDNA_HWCTX_CONFIG_CU` are present in mainline Linux `include/uapi/drm/amdxdna_accel.h` starting with **v6.14**.
+- The ioctl is part of the in-tree `amdxdna` driver; ensure host kernel is built with `CONFIG_DRM_AMDXDNA`.
+
 **Tasks for Copilot:**
 
 1. **Check current kernel version**

@@ -16,6 +16,7 @@
 static xdna2_runtime_t g_runtime;
 static int g_init_attempted = 0;
 static int g_ready = 0;
+static int g_last_kernel_error = 0;
 static const char *g_failure_reason = "not initialised";
 
 static const char *kernel_dir(void) {
@@ -64,6 +65,11 @@ static int ensure_runtime(void) {
             case -EINVAL:
                 g_failure_reason = "XDNA2_DRIVER is not auto, drm or xrt";
                 break;
+            case -ENOTSUP:
+                g_failure_reason =
+                    "kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
+                    "install amdxdna headers/kernel >= 6.14";
+                break;
             default:
                 g_failure_reason = "failed to create an XDNA 2 hardware context";
                 break;
@@ -80,6 +86,7 @@ static int ensure_runtime(void) {
 /* Resolve a kernel for this exact shape, loading it from disk on first use. */
 static int ensure_kernel_for_shape(int rows, int inner_dim, int out_cols) {
     if (xdna2_find_kernel(&g_runtime, rows, inner_dim, out_cols, XDNA2_FMT_INT8)) {
+        g_last_kernel_error = 0;
         return 1;
     }
 
@@ -87,12 +94,27 @@ static int ensure_kernel_for_shape(int rows, int inner_dim, int out_cols) {
     int n = snprintf(path, sizeof(path), "%s/matmul_int8_%dx%dx%d.npukernel",
                      kernel_dir(), rows, inner_dim, out_cols);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
+        g_last_kernel_error = -ENAMETOOLONG;
         return 0;
     }
-    if (xdna2_load_kernel(&g_runtime, path) < 0) {
+    int load_ret = xdna2_load_kernel(&g_runtime, path);
+    if (load_ret < 0) {
+        g_last_kernel_error = load_ret;
+        if (load_ret == -ENOTSUP) {
+            g_failure_reason =
+                "kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
+                "CU/PDI registration is unavailable";
+        } else if (load_ret != -ENOENT) {
+            g_failure_reason = "failed to load NPU kernel artifact";
+        }
         return 0;
     }
-    return xdna2_find_kernel(&g_runtime, rows, inner_dim, out_cols, XDNA2_FMT_INT8) != NULL;
+    if (!xdna2_find_kernel(&g_runtime, rows, inner_dim, out_cols, XDNA2_FMT_INT8)) {
+        g_last_kernel_error = -ENOENT;
+        return 0;
+    }
+    g_last_kernel_error = 0;
+    return 1;
 }
 
 int strix_xdna2_is_supported(void) {
@@ -132,10 +154,14 @@ int strix_xdna2_matmul_timed(const int8_t *input,
         return 0;
     }
     if (!ensure_kernel_for_shape(rows, inner_dim, out_cols)) {
-        fprintf(stderr,
-                "xdna2 backend: no kernel for shape (%d, %d, %d); "
-                "AIE-2 is fixed-shape and this backend has no CPU fallback\n",
-                rows, inner_dim, out_cols);
+        if (g_last_kernel_error == -ENOENT) {
+            fprintf(stderr,
+                    "xdna2 backend: no kernel for shape (%d, %d, %d); "
+                    "AIE-2 is fixed-shape and this backend has no CPU fallback\n",
+                    rows, inner_dim, out_cols);
+        } else {
+            fprintf(stderr, "xdna2 backend unavailable: %s\n", g_failure_reason);
+        }
         return 0;
     }
     return xdna2_matmul_int8_timed(&g_runtime, input, weights, scales, output,
@@ -170,5 +196,6 @@ void strix_xdna2_shutdown(void) {
     }
     g_init_attempted = 0;
     g_ready = 0;
+    g_last_kernel_error = 0;
     g_failure_reason = "not initialised";
 }
