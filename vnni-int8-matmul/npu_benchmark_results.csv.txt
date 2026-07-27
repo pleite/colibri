@@ -1,0 +1,156 @@
+xdna2: hwctx created, handle=1, tiles=16, doorbell=0x0
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (256, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 1024); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 1024, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 16384); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 4096, 512); AIE-2 is fixed-shape and this backend has no CPU fallback
+xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; cannot register CU/PDI on this build
+xdna2 backend: no kernel for shape (32, 8192, 4096); AIE-2 is fixed-shape and this backend has no CPU fallback
+=== NPU Matmul Benchmark Suite ===
+Testing 10 shapes across different execution modes
+
+Phase 1: Sequential execution
+  Testing 256x4096x1024 (whole core)... 7.86 ms, accuracy: FAIL
+  Testing 256x1024x4096 (whole core)... 0.02 ms, accuracy: FAIL
+  Testing 256x4096x16384 (whole core)... 0.09 ms, accuracy: FAIL
+  Testing 256x4096x512 (whole core)... 0.04 ms, accuracy: FAIL
+  Testing 256x8192x4096 (whole core)... 0.07 ms, accuracy: FAIL
+  Testing 32x4096x1024 (single core)... 0.04 ms, accuracy: FAIL
+  Testing 32x1024x4096 (single core)... 0.01 ms, accuracy: FAIL
+  Testing 32x4096x16384 (single core)... 0.06 ms, accuracy: FAIL
+  Testing 32x4096x512 (single core)... 0.04 ms, accuracy: FAIL
+  Testing 32x8192x4096 (single core)... 0.17 ms, accuracy: FAIL
+
+Phase 2: Parallel execution (all shapes)
+  Running 10 shapes in parallel...
+  Total parallel time: 1397.16 ms (avg 139.72 ms per shape)
+
+Phase 3: Mixed parallelism (2 shapes at a time)
+  Testing shapes 1 and 2 in parallel...
+  Testing shapes 3 and 4 in parallel...
+  Testing shapes 5 and 6 in parallel...
+  Testing shapes 7 and 8 in parallel...
+  Testing shapes 9 and 10 in parallel...
+
+Phase 4: All core types simultaneously
+  Testing 5 whole-array + 5 single-core shapes...
+
+=== Benchmark Summary ===
+Total tests: 40
+Tests passed: 0
+
+=== CSV Output ===
+rows,inner_dim,out_cols,core_type,test_type,parallel_count,elapsed_ms,accuracy_ok
+256,4096,1024,whole,sequential,1,7.86,0
+256,1024,4096,whole,sequential,1,0.02,0
+256,4096,16384,whole,sequential,1,0.09,0
+256,4096,512,whole,sequential,1,0.04,0
+256,8192,4096,whole,sequential,1,0.07,0
+32,4096,1024,single,sequential,1,0.04,0
+32,1024,4096,single,sequential,1,0.01,0
+32,4096,16384,single,sequential,1,0.06,0
+32,4096,512,single,sequential,1,0.04,0
+32,8192,4096,single,sequential,1,0.17,0
+256,4096,1024,whole,parallel,10,0.05,0
+256,1024,4096,whole,parallel,10,0.04,0
+256,4096,16384,whole,parallel,10,0.10,0
+256,4096,512,whole,parallel,10,0.04,0
+256,8192,4096,whole,parallel,10,0.06,0
+32,4096,1024,single,parallel,10,0.03,0
+32,1024,4096,single,parallel,10,0.02,0
+32,4096,16384,single,parallel,10,0.07,0
+32,4096,512,single,parallel,10,0.03,0
+32,8192,4096,single,parallel,10,0.05,0
+256,4096,1024,whole,mixed,2,0.04,0
+256,1024,4096,whole,mixed,2,0.02,0
+256,4096,16384,whole,mixed,2,0.07,0
+256,4096,512,whole,mixed,2,0.04,0
+256,8192,4096,whole,mixed,2,0.06,0
+32,4096,1024,single,mixed,2,0.03,0
+32,1024,4096,single,mixed,2,0.01,0
+32,4096,16384,single,mixed,2,0.07,0
+32,4096,512,single,mixed,2,0.03,0
+32,8192,4096,single,mixed,2,0.05,0
+256,4096,1024,whole,all_types,10,0.03,0
+256,1024,4096,whole,all_types,10,0.03,0
+256,4096,16384,whole,all_types,10,0.06,0
+256,4096,512,whole,all_types,10,0.05,0
+256,8192,4096,whole,all_types,10,0.05,0
+32,4096,1024,single,all_types,10,0.04,0
+32,1024,4096,single,all_types,10,0.01,0
+32,4096,16384,single,all_types,10,0.07,0
+32,4096,512,single,all_types,10,0.03,0
+32,8192,4096,single,all_types,10,0.06,0

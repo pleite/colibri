@@ -16,7 +16,7 @@
           }
         ],
         "file_name": "/work/vnni-int8-matmul/npu/aie/.build/256x8192x4096/final.prj/main.pdi",
-        "uuid": "86a346cf-2311-41cc-9264-0c0012fa10c0"
+        "uuid": "d5b976a9-ac54-418a-a8c3-28c446774934"
       }
     ],
     "inference_fingerprint": "23423",
