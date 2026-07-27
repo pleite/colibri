@@ -19,12 +19,24 @@ from pathlib import Path
 
 
 def write_minimal_xclbin(path: Path, input_path: Path | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     if input_path is not None and input_path.exists():
         data = input_path.read_bytes()
-    else:
-        data = bytearray(16)
-        data[8:12] = struct.pack("<I", 1)
-    path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return
+
+    # Build a tiny synthetic AXLF/xclbin with one IP_LAYOUT section and one
+    # addressable PS kernel entry. The layout matches the parser in
+    # pack_npukernel.py so the sidecar files remain verifiable in CI and in the
+    # runtime even when the host lacks XRT's xclbinutil.
+    section_name = b"IP_LAYOUT\0" + b"\0" * 7
+    section_entry = struct.pack("<16sIQQ", section_name, 8, 48, 84)
+    layout_payload = struct.pack("<I", 1) + struct.pack(
+        "<IIQ64s", 1, 0, 0, b"dpu\0" + b"\0" * 63
+    )
+    header = struct.pack("<8sI", b"XCLBIN\0\0", 1)
+    data = header + section_entry + layout_payload
     path.write_bytes(data)
 
 

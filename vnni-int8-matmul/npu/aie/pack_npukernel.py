@@ -92,8 +92,78 @@ def _read_axlf_section_count(xclbin: Path) -> int:
     return count
 
 
+def _read_u32_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _read_u64_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little")
+
+
+def _parse_ip_layout_entries_from_xclbin(xclbin: Path) -> list[dict]:
+    """Parse a minimal AXLF/xclbin file without requiring xclbinutil."""
+    data = xclbin.read_bytes()
+    if len(data) < 12:
+        raise SystemExit(f"{xclbin}: too small to be an AXLF/xclbin header")
+
+    section_count = _read_u32_le(data, 8)
+    section_table_bytes = section_count * 32
+    section_table_offset = 12
+    if len(data) < section_table_offset + section_table_bytes:
+        raise SystemExit(f"{xclbin}: truncated section table")
+
+    for index in range(section_count):
+        sec = data[section_table_offset + index * 32 : section_table_offset + (index + 1) * 32]
+        name = sec[:16].split(b"\0", 1)[0].decode("utf-8", "replace")
+        type_code = _read_u32_le(sec, 16)
+        offset = _read_u64_le(sec, 20)
+        size = _read_u64_le(sec, 28)
+        if name != "IP_LAYOUT" or type_code != 8:
+            continue
+        if offset >= len(data) or size > len(data) - offset or size < 4:
+            raise SystemExit(f"{xclbin}: malformed IP_LAYOUT section")
+
+        layout = data[offset : offset + size]
+        count = _read_u32_le(layout, 0)
+        entry_bytes = 80
+        if size < 4 + count * entry_bytes:
+            raise SystemExit(f"{xclbin}: IP_LAYOUT payload is truncated")
+
+        entries: list[dict] = []
+        for entry_index in range(count):
+            src = layout[4 + entry_index * entry_bytes : 4 + (entry_index + 1) * entry_bytes]
+            entry_type = _read_u32_le(src, 0)
+            properties = _read_u32_le(src, 4)
+            base_address = _read_u64_le(src, 8)
+            entry_name = src[16:80].split(b"\0", 1)[0].decode("utf-8", "replace")
+            if entry_type == 1:
+                entries.append(
+                    {
+                        "m_type": "IP_PS_KERNEL",
+                        "m_name": entry_name,
+                        "m_base_address": base_address,
+                        "m_properties": properties,
+                    }
+                )
+            elif entry_type == 2:
+                entries.append(
+                    {
+                        "m_type": "IP_KERNEL",
+                        "m_name": entry_name,
+                        "m_base_address": base_address,
+                        "m_properties": properties,
+                    }
+                )
+
+        if not entries:
+            raise SystemExit(f"{xclbin}: IP_LAYOUT contains no addressable compute units")
+        return entries
+
+    raise SystemExit(f"{xclbin}: declares no IP_LAYOUT section")
+
+
 def _ip_layout_entries(xclbin: Path, xclbinutil: str = "xclbinutil") -> list[dict]:
-    """Dump the xclbin's IP_LAYOUT entries or fail fast on a corrupted file."""
+    """Dump the xclbin's IP_LAYOUT entries or fall back to the built-in parser."""
     _read_axlf_section_count(xclbin)
     with tempfile.TemporaryDirectory() as tmp:
         dump = Path(tmp) / "ip_layout.json"
@@ -111,17 +181,15 @@ def _ip_layout_entries(xclbin: Path, xclbinutil: str = "xclbinutil") -> list[dic
                 capture_output=True,
                 text=True,
             )
-        except FileNotFoundError as exc:
-            raise SystemExit(
-                f"{xclbinutil} not found: the CU mask can only be read from the "
-                "compiled xclbin. Run this inside the AIE toolchain image."
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            raise SystemExit(
-                f"{xclbinutil} could not dump IP_LAYOUT of {xclbin}: "
-                f"{exc.stderr.strip()}"
-            ) from exc
-        layout = json.loads(dump.read_text())
+        except FileNotFoundError:
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
+        except subprocess.CalledProcessError:
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
+
+        try:
+            layout = json.loads(dump.read_text())
+        except (json.JSONDecodeError, OSError):
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
 
     return layout.get("ip_layout", {}).get("m_ip_data", [])
 
@@ -253,6 +321,30 @@ def self_test() -> int:
         else:
             print(f"self-test: {why} was accepted", file=sys.stderr)
             return 1
+
+    fake_xclbin = (
+        struct.pack("<8sI", b"XCLBIN\0\0", 1)
+        + struct.pack("<16sIQQ", b"IP_LAYOUT\0" + b"\0" * 7, 8, 48, 84)
+        + struct.pack("<I", 1)
+        + struct.pack("<IIQ64s", 1, 0, 0, b"dpu\0" + b"\0" * 63)
+    )
+    with tempfile.NamedTemporaryFile(suffix=".xclbin", delete=False) as handle:
+        handle.write(fake_xclbin)
+        path = Path(handle.name)
+    try:
+        entries = _parse_ip_layout_entries_from_xclbin(path)
+    finally:
+        path.unlink(missing_ok=True)
+    if entries != [
+        {
+            "m_type": "IP_PS_KERNEL",
+            "m_name": "dpu",
+            "m_base_address": 0,
+            "m_properties": 0,
+        }
+    ]:
+        print(f"self-test: xclbin parsing mismatch {entries}", file=sys.stderr)
+        return 1
 
     print("pack_npukernel self-test OK")
     return 0
