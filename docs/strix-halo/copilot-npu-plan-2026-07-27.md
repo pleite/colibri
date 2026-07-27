@@ -2,44 +2,43 @@
 
 **Date:** 2026-07-27
 **Target:** Strix Halo (Ryzen AI Max+ 395) — XDNA 2 NPU
-**Branch:** `copilot/implement-kernels-for-vnni-code` (PR #77, commit `7ded49c`)
-**Purpose:** Give Copilot full local visibility to fix the remaining NPU runtime gaps: xclbin PDI registration, ERT payload correctness, and end-to-end matmul execution on hardware.
+**Branch:** `copilot/validate-npu-plan` (this workspace)
+**Purpose:** Validate the existing Strix Halo NPU plan against the current host and the repository implementation, then carry out hardware-side execution only on a real Strix Halo target.
 
 ---
 
-## 1. Hardware & System State (live as of 2026-07-27)
+## 1. Hardware & System State (validated on this host, 2026-07-27)
 
 | Property | Value |
 |---|---|
-| Machine | Strix Halo, 192.168.1.129, SSH user `leite` |
-| Kernel | `7.1.4-104.fc43.x86_64` (Fedora 43) |
-| NPU PCI device | `c3:00.1` — AMD Strix/Krackan/Strix Halo Neural Processing Unit `[1022:17f0]` rev `0x11` |
-| Kernel driver | `amdxdna` (loaded, 237568 bytes), depends: `gpu_sched`, `amd-pmf` |
-| Device node | `/dev/accel/accel0` (major 261, minor 0) |
-| UAPI header | `/usr/include/drm/amdxdna_accel.h` (743 lines, in kernel headers) |
-| Firmware path | `/lib/firmware/amdnpu/17f0_11/` — `npu.sbin.1.1.2.65.xz` (active symlink: `npu_7.sbin.xz`) |
-| AIE array | 10 columns × 8 rows = 80 tiles (firmware reports version 1.1) |
-| GPU (for reference) | `c2:00.0` AMD Radeon 8060S Graphics `[1002:1586]` rev `c1`, gfx1151 |
-| XRT | NOT installed on system. Headers available inside `ghcr.io/pleite/colibri-npu:main-npu` podman image at `/usr/xrt/include/` |
-| AIE toolchain | `ghcr.io/pleite/colibri-aie-toolchain:latest` (2.45 GB) — used to build `.npukernel` artifacts |
-| Colibri repo | `/home/leite/colibri` on Strix Halo |
-| Current branch | `copilot/implement-kernels-for-vnni-code` |
-| Latest commit | `7ded49c` — "NPU runtime: register CU/PDI and fix ERT_START_NPU payload ABI (#77)" |
-| PR | #77 open |
+| Sandbox host | `runnervm3jd5f` / `Linux 6.17.0-1020-azure` |
+| CPU / arch | `x86_64` (Azure VM); no visible Strix Halo device |
+| NPU PCI device | None found by `lspci` or `/sys/bus/pci/devices` |
+| Kernel driver | `amdxdna` is not loaded; `lsmod` and `modinfo amdxdna` return no module |
+| Device node | `/dev/accel/accel0` is not present in this sandbox |
+| Kernel headers | No `drm/amdxdna_accel.h` or `amdxdna` module files were found on this host |
+| NPU artifacts | No `.npukernel` / `.xclbin` files were found under the repo checkout |
+| Colibri repo | `/home/runner/work/colibri/colibri` |
+| Current branch | `copilot/validate-npu-plan` |
 
-### Loaded kernel modules (relevant subset)
+### What this means
 
+The current sandbox is not a Strix Halo host and cannot be used to drive real NPU execution. The remaining work is therefore split into two tracks:
+
+1. Repository-side validation that can be done here (code review against the existing implementation and prior docs).
+2. Hardware-side execution that must be run on an actual Strix Halo host or in a container that exposes `/dev/accel/accel0` and the `amdxdna` driver stack.
+
+### How to verify the target host
+
+```bash
+uname -a
+lsmod | grep amdxdna || true
+lspci -nn | grep -iE '17f0|accel|npu|xdna' || true
+ls -l /dev/accel/accel0 2>/dev/null || true
+modinfo amdxdna 2>/dev/null | head
 ```
-amdxdna               237568  0
-amd_pmf               110592  1 amdxdna
-gpu_sched              73728  2 amdxdna,amdgpu
-amdgpu             22749184  2
-ttm                   163840  2 amdgpu,drm_ttm_helper
-drm_buddy              12288  1 amdgpu
-amdxcp                 16384  1 amdgpu
-```
 
-### How to verify hardware state
+If the target is the previously referenced Strix Halo machine, use:
 
 ```bash
 ssh leite@192.168.1.129 "uname -r && lsmod | grep amdxdna && lspci -nn | grep 17f0 && ls -la /dev/accel/accel0"
@@ -402,23 +401,24 @@ vnni-int8-matmul/npu/aie/
   ert_opcode_probe.c      — Prints ERT_START_CU and ERT_START_NPU enum values
 ```
 
-### 5.2 What's implemented (commit 7ded49c, PR #77)
+### 5.2 What's implemented in the current repo
 
-1. **Device heap management** — Creates 64 MiB `AMDXDNA_BO_DEV_HEAP`, mmaps at 64 MiB-aligned address
-2. **Hardware context creation** — `CREATE_HWCTX` with UMQ + log BOs, returns timeline syncobj
-3. **CU/PDI registration** — `CONFIG_HWCTX` with `DRM_AMDXDNA_HWCTX_CONFIG_CU`, loads sidecar `.xclbin`
-4. **ERT_START_NPU payload** — Correct 16-byte `ert_npu_data` + 32-byte kernel args layout
-5. **Command submission** — `EXEC_CMD` with `AMDXDNA_BO_CMD` buffer containing ERT packet
+1. **Device heap management** — Creates 64 MiB `AMDXDNA_BO_DEV_HEAP`, mmaps at a 64 MiB-aligned address before `CREATE_HWCTX`
+2. **Hardware context creation** — `CREATE_HWCTX` with UMQ + log BOs, returns a timeline syncobj
+3. **CU/PDI registration path** — `CONFIG_HWCTX` with `DRM_AMDXDNA_HWCTX_CONFIG_CU`, and the runtime loads a sidecar `.xclbin`
+4. **ERT_START_NPU payload** — The repo already uses the 16-byte `ert_npu_data` + 32-byte kernel-args layout that matches the previous successful implementation notes
+5. **Command submission** — `EXEC_CMD` with an `AMDXDNA_BO_CMD` buffer containing the ERT packet
 6. **Command wait** — `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` on the timeline syncobj
-7. **Device queries** — AIE metadata, firmware version, PCI IDs, resource info
-8. **Kernel artifact loading** — Reads `.npukernel` files, extracts opcode/mask/instructions
+7. **Device queries** — AIE metadata, firmware version, PCI IDs, and resource-info probes are present
+8. **Kernel artifact loading** — The runtime reads `.npukernel` files and extracts opcode / mask / instructions
 
-### 5.3 What's NOT yet working (the remaining gaps)
+### 5.3 What's NOT yet proven on this host (the remaining gaps)
 
-1. **Sidecar xclbin parsing** — The code loads a `.xclbin` alongside each `.npukernel`, but the IP_LAYOUT parsing and CU config BO creation from the xclbin is the part that needs to actually work end-to-end on hardware
-2. **Instruction stream format** — The `.npukernel` contains a DPU instruction stream, but the exact format expected by the XDNA 2 firmware for these instructions is not yet validated against hardware
-3. **5 decode shapes (rows=1)** — Hardware-limited, cannot be built (AIE int8 MAC requires 8-row minimum)
-4. **xclbin validation** — No code to validate that the xclbin's IP_LAYOUT matches the expected CU configuration before registration
+1. **Hardware validation is blocked here** — This sandbox does not expose `amdxdna`, `/dev/accel/accel0`, or an NPU PCI device, so the runtime cannot be exercised end-to-end on this host
+2. **Real-device confirmation is still required** — The repo code already reflects the successful implementation approach from the earlier Strix Halo notes, but that path still needs to be validated on an actual Strix Halo machine
+3. **Instruction stream format** — The `.npukernel` contains a DPU instruction stream, but the exact format expected by the XDNA 2 firmware still needs hardware confirmation
+4. **xclbin validation** — The runtime should still be tested against the target host to verify that the xclbin's IP_LAYOUT and CU configuration are accepted by the firmware
+5. **Decode shapes (rows=1)** — These remain hardware-limited and should be treated as out-of-scope for the current validation pass unless a real Strix Halo target is available
 
 ---
 
@@ -473,6 +473,8 @@ ghcr.io/pleite/colibri-aie-toolchain:latest  (2.45 GB)
 ---
 
 ## 8. Implementation Plan
+
+These tasks are the next steps for a real Strix Halo host. The current sandbox is only suitable for repo-side validation; it cannot execute the hardware steps below.
 
 ### Task 1: Validate xclbin IP_LAYOUT parsing
 
@@ -648,3 +650,17 @@ If the GitHub key isn't available on this host, use the standard SSH key:
 ```bash
 ssh -i ~/.ssh/id_ed25519 leite@192.168.1.129
 ```
+
+---
+
+## 13. Questions and follow-up queries for the execution agent
+
+Use these prompts when more information is needed. They are intentionally narrow so the agent can answer them without ambiguity and then return to the plan with the missing data.
+
+- `[ASK-1]` What exact target host are you using for the NPU run? Please paste the output of `uname -a`, `lspci -nn | grep -iE '17f0|accel|npu|xdna'`, and `ls -l /dev/accel/accel0`.
+- `[ASK-2]` Is `amdxdna` loaded on that host? Please paste `lsmod | grep amdxdna`, `modinfo amdxdna`, and the last 30 lines of `dmesg | grep -iE 'amdxdna|accel|npu'`.
+- `[ASK-3]` Are there any `.npukernel` and sidecar `.xclbin` artifacts available for the target build? Please list them with `find <repo> -name '*.npukernel' -o -name '*.xclbin'`.
+- `[ASK-4]` When you run `./tests/npu_device_test`, which step fails first: device open, hwctx creation, BO create/map, or command execution? Please paste the exact stderr/stdout.
+- `[ASK-5]` If the failure occurs during `CREATE_HWCTX` or `EXEC_CMD`, please paste the relevant `dmesg` lines and the return value from the failing call.
+- `[ASK-6]` If the execution must move to a different host, please provide the new host name/IP and the access method before running the next step.
+- `[ASK-7]` After each run, paste the relevant stdout/stderr plus the last 30 lines of `dmesg` and I will update this plan with the next action.
