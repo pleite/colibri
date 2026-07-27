@@ -65,9 +65,13 @@ NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
+VULKAN_AVAILABLE ?= $(shell printf '#include <vulkan/vulkan.h>\nint main(void){return 0;}\n' | $(CC) -x c - -lvulkan -o /dev/null >/dev/null 2>&1 && echo 1 || echo 0)
 BACKEND_OBJ :=
 BACKEND_OBJ += backend_runtime.o
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_vulkan$(EXE) tests/test_backend_runtime$(EXE) tests/test_backend_parallel$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_qwen35_moe$(EXE) tests/test_backend_npu$(EXE) tests/test_backend_runtime$(EXE) tests/test_backend_parallel$(EXE)
+ifeq ($(VULKAN_AVAILABLE),1)
+TEST_BINS += tests/test_backend_vulkan$(EXE)
+endif
 NPU_BACKEND_CFLAGS =
 NPU_BACKEND_TEST_OBJ = backend_npu.o
 NPU_BACKEND_RUNTIME_TEST_OBJ =
@@ -77,6 +81,9 @@ endif
 VULKAN_BACKEND_CFLAGS =
 VULKAN_BACKEND_RUNTIME_TEST_OBJ =
 ifeq ($(VULKAN),1)
+ifeq ($(VULKAN_AVAILABLE),0)
+$(error Vulkan headers/library are not available; install libvulkan-dev or rerun without VULKAN=1)
+endif
 VULKAN_BACKEND_RUNTIME_TEST_OBJ = backend_vulkan.o
 endif
 ifeq ($(CUDA),1)
@@ -275,7 +282,16 @@ tests/test_qwen35_moe$(EXE): tests/test_qwen35_moe.c qwen35_moe$(EXE)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: qwen35_moe$(EXE) $(TEST_BINS)
-	@for test in $(TEST_BINS); do ./$$test || exit 1; done
+	@for test in $(TEST_BINS); do \
+		echo "==> $$test"; \
+		./$$test; \
+		status=$$?; \
+		if [ "$$status" -eq 77 ]; then \
+			echo "skipped (exit 77)"; \
+		elif [ "$$status" -ne 0 ]; then \
+			exit 1; \
+		fi; \
+	done
 
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'

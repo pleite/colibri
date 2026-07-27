@@ -1749,6 +1749,8 @@ static bool expert_tables_ready(const QLayer *cur) {
            cur->expert_up_proj != NULL && cur->expert_down_proj != NULL;
 }
 
+static size_t eviction_threshold_bytes(void);
+
 static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_idx) {
     if (!expert_tables_ready(cur)) {
         return;
@@ -1759,9 +1761,11 @@ static void ensure_expert(qwen35_model *m, QLayer *cur, int layer, int expert_id
     if (cur->expert_state[expert_idx] != QWEN_EXPERT_STATE_UNLOADED) {
         return;
     }
-    if (get_mem_used(MEM_CAT_ROUTED_EXPERTS) > g_ram_limit_bytes * g_evict_threshold_pct / 100) {
+    const size_t threshold = eviction_threshold_bytes();
+    if (threshold != 0 && get_mem_used(MEM_CAT_ROUTED_EXPERTS) > threshold) {
+        const size_t used = get_mem_used(MEM_CAT_ROUTED_EXPERTS);
         model_debug("RAM usage at %zu%% of limit, evicting LRU expert from layer %d",
-                    get_mem_used(MEM_CAT_ROUTED_EXPERTS) * 100 / g_ram_limit_bytes, layer);
+                    used * 100 / g_ram_limit_bytes, layer);
         expert_evict_lru_from_layer(m, cur, layer);
     }
     char expert_name[1024];
@@ -1830,9 +1834,15 @@ static void configure_parallelism(int requested_threads) {
 #endif
 }
 
+static size_t eviction_threshold_bytes(void) {
+    if (g_ram_limit_bytes == 0 || g_evict_threshold_pct <= 0) return 0;
+    return g_ram_limit_bytes * (size_t)g_evict_threshold_pct / 100u;
+}
+
 static void check_and_evict_if_needed(qwen35_model *m) {
+    const size_t threshold = eviction_threshold_bytes();
+    if (threshold == 0) return;
     size_t expert_usage = get_mem_used(MEM_CAT_ROUTED_EXPERTS);
-    size_t threshold = g_ram_limit_bytes * g_evict_threshold_pct / 100;
     if (expert_usage < threshold) return;
     model_debug("RAM usage at %zu%% of threshold (%zu/%zu bytes), performing preemptive eviction",
         expert_usage * 100 / threshold, expert_usage, threshold);
