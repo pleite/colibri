@@ -589,7 +589,7 @@ To resume NPU runtime development from this point:
 
 ## 10. Reference: Current Source Code Summary
 
-### xdna2_driver.c (~500 lines)
+### xdna2_driver.c (879 lines)
 - `xdna2_open_device()` — Opens `/dev/accel/accel0`
 - `xdna2_create_hwctx()` — Creates device heap (64 MiB), maps it (64 MiB-aligned), creates UMQ+log BOs, issues CREATE_HWCTX
 - `xdna2_config_hwctx_single_cu()` — Registers one CU via CONFIG_HWCTX (uses `#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX)` guard)
@@ -601,14 +601,14 @@ To resume NPU runtime development from this point:
 - `xdna2_query_resource_info()` — GET_INFO with DRM_AMDXDNA_QUERY_RESOURCE_INFO (param 12)
 - `xdna2_query_firmware_version()` — GET_INFO with DRM_AMDXDNA_QUERY_FIRMWARE_VERSION
 
-### xdna2_matmul.c (~400 lines)
+### xdna2_matmul.c (564 lines)
 - `xdna2_runtime_init()` — Opens device, creates hwctx with 16 tiles, 32 KiB mem_size, max_opc=4
 - `xdna2_load_kernel()` — Reads `.npukernel` artifact, uploads instruction stream to DEV BO, loads sidecar `.xclbin` for CU registration
 - `xdna2_matmul_int8_timed()` — Full dispatch: alloc SHMEM BOs for x/w/y, sync to device, build ERT packet, submit, wait, sync back, dequantize
 - `xdna2_dequant_i32()` — Converts int32 accumulators to f32 with per-column scales
 - `xdna2_dequant_int4()` — Expands packed int4 to int8
 
-### xdna2_backend.c (~120 lines)
+### xdna2_backend.c (174 lines)
 - `strix_xdna2_matmul()` — Backend entry point for VNNI building blocks
 - `strix_xdna2_is_supported()` — Checks if NPU is available
 - `strix_xdna2_kernel_exists()` — Checks if kernel artifact exists for shape
