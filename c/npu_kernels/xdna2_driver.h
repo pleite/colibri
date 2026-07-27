@@ -11,6 +11,7 @@
  * This wrapper is Strix Halo exclusive and has no software-emulation path.
  */
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -70,6 +71,23 @@ typedef struct {
     uint64_t last_seq;      /* Timeline point of the last submitted command */
     bool initialized;
 } xdna2_hwctx_t;
+
+/* ── xclbin / CU config parsing ── */
+
+#define XDNA2_XCLBIN_IP_TYPE_PS_KERNEL 1u
+
+typedef struct {
+    uint32_t type;
+    uint32_t properties;
+    uint64_t base_address;
+    char name[64];
+} xdna2_xclbin_ip_data_t;
+
+typedef struct {
+    uint32_t cu_bo_handle;
+    uint8_t cu_func;
+    uint8_t pad[3];
+} xdna2_cu_config_t;
 
 /* ── AIE metadata ── */
 
@@ -156,6 +174,27 @@ void xdna2_close_device(int fd);
 int xdna2_create_hwctx(int fd, xdna2_hwctx_t *ctx,
                        uint32_t num_tiles, uint32_t mem_size,
                        uint32_t max_opc, uint32_t qos);
+
+/**
+ * xdna2_parse_xclbin_ip_layout — parse an AXLF/xclbin IP_LAYOUT section
+ *
+ * The caller receives a newly allocated array of `IP_PS_KERNEL` entries in the
+ * order they appear in the xclbin. The returned storage must be freed with
+ * `free()` by the caller.
+ */
+int xdna2_parse_xclbin_ip_layout(const uint8_t *xclbin, size_t xclbin_size,
+                                 xdna2_xclbin_ip_data_t **entries_out,
+                                 size_t *entry_count_out);
+
+/**
+ * xdna2_config_hwctx_cus — register one or more CU/PDI BOs on a hardware context
+ *
+ * Each entry in `cus` carries the BO handle of a CU configuration buffer that
+ * must stay alive while the context uses it.
+ * Returns 0 on success, negative on failure.
+ */
+int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
+                           const xdna2_cu_config_t *cus, uint16_t cu_count);
 
 /**
  * xdna2_config_hwctx_single_cu — register one CU/PDI BO on a hardware context

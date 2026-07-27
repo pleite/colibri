@@ -68,6 +68,7 @@ typedef struct {
 #define XDNA2_KERNEL_MAGIC   0x324E4458u
 #define XDNA2_KERNEL_VERSION 1u
 #define XDNA2_KERNEL_HEADER_BYTES 40u
+#define XDNA2_MAX_CU_CONFIG_BOS 32
 
 typedef struct {
     xdna2_matmul_shape_t shape;
@@ -75,7 +76,8 @@ typedef struct {
     uint32_t   cu_mask;
     uint32_t   instr_words;
     xdna2_bo_t instr_bo;   /* Instruction stream resident on the NPU */
-    xdna2_bo_t pdi_bo;     /* Sidecar xclbin/PDI BO used for CU registration */
+    xdna2_bo_t cu_config_bos[XDNA2_MAX_CU_CONFIG_BOS];
+    uint32_t   cu_config_count;
     bool       loaded;
 } xdna2_kernel_t;
 
