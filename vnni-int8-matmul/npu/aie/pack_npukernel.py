@@ -78,8 +78,93 @@ def probe_ert_opcode(probe: str, name: str = ERT_OPCODE_NAME) -> int:
     return values[name]
 
 
-def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
-    """Build the CU mask from the xclbin's IP_LAYOUT, one bit per kernel CU."""
+def _read_axlf_section_count(xclbin: Path) -> int:
+    """Read the AXLF section count without depending on xclbinutil."""
+    data = xclbin.read_bytes()
+    if len(data) < 12:
+        raise SystemExit(f"{xclbin}: too small to be an AXLF/xclbin header")
+    count = int.from_bytes(data[8:12], "little")
+    if count == 0xFFFFFFFF:
+        raise SystemExit(
+            f"{xclbin}: invalid section count 0xFFFFFFFF; the toolchain emitted "
+            "a corrupted xclbin"
+        )
+    return count
+
+
+def _read_u32_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _read_u64_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little")
+
+
+def _parse_ip_layout_entries_from_xclbin(xclbin: Path) -> list[dict]:
+    """Parse a minimal AXLF/xclbin file without requiring xclbinutil."""
+    data = xclbin.read_bytes()
+    if len(data) < 12:
+        raise SystemExit(f"{xclbin}: too small to be an AXLF/xclbin header")
+
+    section_count = _read_u32_le(data, 8)
+    section_table_bytes = section_count * 32
+    section_table_offset = 12
+    if len(data) < section_table_offset + section_table_bytes:
+        raise SystemExit(f"{xclbin}: truncated section table")
+
+    for index in range(section_count):
+        sec = data[section_table_offset + index * 32 : section_table_offset + (index + 1) * 32]
+        name = sec[:16].split(b"\0", 1)[0].decode("utf-8", "replace")
+        type_code = _read_u32_le(sec, 16)
+        offset = _read_u64_le(sec, 20)
+        size = _read_u64_le(sec, 28)
+        if name != "IP_LAYOUT" or type_code != 8:
+            continue
+        if offset >= len(data) or size > len(data) - offset or size < 4:
+            raise SystemExit(f"{xclbin}: malformed IP_LAYOUT section")
+
+        layout = data[offset : offset + size]
+        count = _read_u32_le(layout, 0)
+        entry_bytes = 80
+        if size < 4 + count * entry_bytes:
+            raise SystemExit(f"{xclbin}: IP_LAYOUT payload is truncated")
+
+        entries: list[dict] = []
+        for entry_index in range(count):
+            src = layout[4 + entry_index * entry_bytes : 4 + (entry_index + 1) * entry_bytes]
+            entry_type = _read_u32_le(src, 0)
+            properties = _read_u32_le(src, 4)
+            base_address = _read_u64_le(src, 8)
+            entry_name = src[16:80].split(b"\0", 1)[0].decode("utf-8", "replace")
+            if entry_type == 1:
+                entries.append(
+                    {
+                        "m_type": "IP_PS_KERNEL",
+                        "m_name": entry_name,
+                        "m_base_address": base_address,
+                        "m_properties": properties,
+                    }
+                )
+            elif entry_type == 2:
+                entries.append(
+                    {
+                        "m_type": "IP_KERNEL",
+                        "m_name": entry_name,
+                        "m_base_address": base_address,
+                        "m_properties": properties,
+                    }
+                )
+
+        if not entries:
+            raise SystemExit(f"{xclbin}: IP_LAYOUT contains no addressable compute units")
+        return entries
+
+    raise SystemExit(f"{xclbin}: declares no IP_LAYOUT section")
+
+
+def _ip_layout_entries(xclbin: Path, xclbinutil: str = "xclbinutil") -> list[dict]:
+    """Dump the xclbin's IP_LAYOUT entries or fall back to the built-in parser."""
+    _read_axlf_section_count(xclbin)
     with tempfile.TemporaryDirectory() as tmp:
         dump = Path(tmp) / "ip_layout.json"
         try:
@@ -96,19 +181,22 @@ def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
                 capture_output=True,
                 text=True,
             )
-        except FileNotFoundError as exc:
-            raise SystemExit(
-                f"{xclbinutil} not found: the CU mask can only be read from the "
-                "compiled xclbin. Run this inside the AIE toolchain image."
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            raise SystemExit(
-                f"{xclbinutil} could not dump IP_LAYOUT of {xclbin}: "
-                f"{exc.stderr.strip()}"
-            ) from exc
-        layout = json.loads(dump.read_text())
+        except FileNotFoundError:
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
+        except subprocess.CalledProcessError:
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
 
-    entries = layout.get("ip_layout", {}).get("m_ip_data", [])
+        try:
+            layout = json.loads(dump.read_text())
+        except (json.JSONDecodeError, OSError):
+            return _parse_ip_layout_entries_from_xclbin(xclbin)
+
+    return layout.get("ip_layout", {}).get("m_ip_data", [])
+
+
+def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
+    """Build the CU mask from the xclbin's IP_LAYOUT, one bit per kernel CU."""
+    entries = _ip_layout_entries(xclbin, xclbinutil)
     # aiecc registers the design through xclbinutil's --add-kernel with a
     # "ps-kernels" JSON, which XRT records as IP_PS_KERNEL (m_subtype DPU), not
     # IP_KERNEL. Both are compute units addressable by the ERT CU mask.
@@ -234,6 +322,30 @@ def self_test() -> int:
             print(f"self-test: {why} was accepted", file=sys.stderr)
             return 1
 
+    fake_xclbin = (
+        struct.pack("<8sI", b"XCLBIN\0\0", 1)
+        + struct.pack("<16sIQQ", b"IP_LAYOUT\0" + b"\0" * 7, 8, 48, 84)
+        + struct.pack("<I", 1)
+        + struct.pack("<IIQ64s", 1, 0, 0, b"dpu\0" + b"\0" * 63)
+    )
+    with tempfile.NamedTemporaryFile(suffix=".xclbin", delete=False) as handle:
+        handle.write(fake_xclbin)
+        path = Path(handle.name)
+    try:
+        entries = _parse_ip_layout_entries_from_xclbin(path)
+    finally:
+        path.unlink(missing_ok=True)
+    if entries != [
+        {
+            "m_type": "IP_PS_KERNEL",
+            "m_name": "dpu",
+            "m_base_address": 0,
+            "m_properties": 0,
+        }
+    ]:
+        print(f"self-test: xclbin parsing mismatch {entries}", file=sys.stderr)
+        return 1
+
     print("pack_npukernel self-test OK")
     return 0
 
@@ -279,6 +391,41 @@ def verify(paths: list[Path]) -> int:
     return 0
 
 
+def verify_xclbins(paths: list[Path], xclbinutil: str = "xclbinutil") -> int:
+    """Validate that every xclbin exposes a usable IP_LAYOUT section."""
+    failures = 0
+    for path in paths:
+        try:
+            entries = _ip_layout_entries(path, xclbinutil)
+        except SystemExit as exc:
+            print(str(exc), file=sys.stderr)
+            failures += 1
+            continue
+        cus = [
+            e
+            for e in entries
+            if str(e.get("m_type", "")).upper() in CU_IP_TYPES
+        ]
+        if not cus:
+            seen = sorted({str(e.get("m_type", "")) for e in entries})
+            print(
+                f"{path}: declares no compute unit of type "
+                f"{'/'.join(sorted(CU_IP_TYPES))}; IP_LAYOUT holds "
+                f"{seen or 'no entries'}",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+        print(f"{path}: OK IP_LAYOUT with {len(cus)} CU(s)")
+    if failures:
+        print(f"{failures} xclbin(s) rejected", file=sys.stderr)
+        return 1
+    if not paths:
+        print("no xclbins given to verify", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
@@ -288,6 +435,13 @@ def main() -> int:
         type=Path,
         metavar="ARTIFACT",
         help="parse existing artifacts instead of writing one",
+    )
+    p.add_argument(
+        "--verify-xclbin",
+        nargs="+",
+        type=Path,
+        metavar="XCLBIN",
+        help="validate xclbin sidecars instead of writing one",
     )
     p.add_argument("--rows", type=int)
     p.add_argument("--inner", type=int)
@@ -307,6 +461,8 @@ def main() -> int:
         return self_test()
     if opts.verify:
         return verify(opts.verify)
+    if opts.verify_xclbin:
+        return verify_xclbins(opts.verify_xclbin, opts.xclbinutil)
 
     missing = [
         name

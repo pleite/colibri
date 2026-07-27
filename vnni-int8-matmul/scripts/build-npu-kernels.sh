@@ -99,6 +99,7 @@ fi
 
 echo "Building kernel artifacts into ${kernel_dir}"
 "${podman_bin}" run --rm \
+    --user root \
     --security-opt label=disable \
     --volume "${repo_dir}:/work:rw,z" \
     --workdir /work/vnni-int8-matmul \

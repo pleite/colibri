@@ -1,0 +1,33 @@
+{
+  "aie_partition": {
+    "PDIs": [
+      {
+        "cdo_groups": [
+          {
+            "dpu_kernel_ids": [
+              "0x901"
+            ],
+            "name": "DPU",
+            "pdi_id": "0x01",
+            "pre_cdo_groups": [
+              "0xC1"
+            ],
+            "type": "PRIMARY"
+          }
+        ],
+        "file_name": "/work/vnni-int8-matmul/npu/aie/.build/256x8192x4096/final.prj/main.pdi",
+        "uuid": "86a346cf-2311-41cc-9264-0c0012fa10c0"
+      }
+    ],
+    "inference_fingerprint": "23423",
+    "name": "QoS",
+    "operations_per_cycle": "2048",
+    "partition": {
+      "column_width": 8,
+      "start_columns": [
+        0
+      ]
+    },
+    "pre_post_fingerprint": "12345"
+  }
+}
