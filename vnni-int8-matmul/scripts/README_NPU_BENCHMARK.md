@@ -38,6 +38,9 @@ Comprehensive benchmark for AMD XDNA 2 NPU on Strix Halo.
 ```bash
 # From the vnni-int8-matmul directory
 ./scripts/npu_full_benchmark.sh
+
+# Full host/container debug capture (kernel/modules/headers/libs/devices)
+COLI_CAPTURE_DEBUG=1 ./scripts/run_npu_benchmark_in_container.sh
 ```
 
 ## Output

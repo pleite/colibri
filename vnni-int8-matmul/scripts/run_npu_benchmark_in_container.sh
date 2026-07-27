@@ -15,11 +15,19 @@ REPO_DIR="$(cd "${VNNI_DIR}/../.." && pwd)"  # colibri repo root
 BASE_IMAGE="${BASE_IMAGE:-ghcr.io/pleite/colibri-vulkan:latest}"
 HARNESS_IMAGE="${CONTAINER_IMAGE:-localhost/colibri-strix-halo-test:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-colibri-npu-benchmark}"
+DEBUG_ENABLED="${COLI_CAPTURE_DEBUG:-0}"
+DEBUG_DIR="${VNNI_DIR}/debug"
+HOST_DEBUG_LOG="${DEBUG_DIR}/host-benchmark-preflight.log"
 
 echo "=== NPU Benchmark in Container ==="
 echo "Base image: ${BASE_IMAGE}"
 echo "Harness image: ${HARNESS_IMAGE}"
 echo ""
+
+if [[ "${DEBUG_ENABLED}" == "1" ]]; then
+    mkdir -p "${DEBUG_DIR}"
+    "${VNNI_DIR}/scripts/capture_debug_snapshot.sh" "${HOST_DEBUG_LOG}" || true
+fi
 
 # Check if container image exists, build if needed
 if ! podman image exists "${HARNESS_IMAGE}" 2>/dev/null; then
@@ -287,6 +295,7 @@ podman run --rm \
     --env VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/radeon_icd.x86_64.json" \
     --env VNNI_VULKAN_DEBUG=1 \
     --env XDNA2_VERBOSE=1 \
+    --env COLI_CAPTURE_DEBUG="${DEBUG_ENABLED}" \
     --env HSA_OVERRIDE_GFX_VERSION=11.5.1 \
     --env GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
     --volume "${REPO_DIR}:/work:rw" \
@@ -301,6 +310,10 @@ echo "Linker: $(ld --version | head -1)"
 echo "Kernel UAPI: $(test -f /usr/include/drm/amdxdna_accel.h && echo present || echo missing)"
 echo "Vulkan: $(test -f /usr/include/vulkan/vulkan.h && echo present || echo missing)"
 echo ""
+
+if [[ "${COLI_CAPTURE_DEBUG:-0}" == "1" ]]; then
+  /work/vnni-int8-matmul/scripts/capture_debug_snapshot.sh /work/vnni-int8-matmul/debug/container-benchmark-preflight.log || true
+fi
 
 echo "=== Building NPU Benchmark ==="
 cd /work/vnni-int8-matmul
@@ -317,6 +330,10 @@ gcc -I. -I.. -O3 -march=native -std=c11 -o /tmp/npu_benchmark_test \
 echo "Running benchmark..."
 echo ""
 /tmp/npu_benchmark_test 2>&1 | tee /work/npu_benchmark_results.txt
+
+if [[ "${COLI_CAPTURE_DEBUG:-0}" == "1" ]]; then
+  /work/vnni-int8-matmul/scripts/capture_debug_snapshot.sh /work/vnni-int8-matmul/debug/container-benchmark-post.log || true
+fi
 
 echo ""
 echo "=== Results saved to /work/npu_benchmark_results.txt ==="

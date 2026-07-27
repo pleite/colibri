@@ -31,6 +31,7 @@
 #   VNNI_VULKAN_ICD   path to the RADV ICD manifest inside the container
 #   SKIP_NPU=1        do not require/pass the NPU device
 #   REQUIRE_NPU=1     fail instead of warning when the NPU node is absent
+#   COLI_CAPTURE_DEBUG=1 capture host/container debug snapshots
 
 set -euo pipefail
 
@@ -43,10 +44,27 @@ container_name="${CONTAINER_NAME:-colibri-vnni-strix-halo-test}"
 log_path="${vnni_dir}/test_output.log"
 container_vulkan_icd="${VNNI_VULKAN_ICD:-/usr/share/vulkan/icd.d/radeon_icd.x86_64.json}"
 npu_device="/dev/accel/accel0"
+debug_enabled="${COLI_CAPTURE_DEBUG:-0}"
+debug_dir="${vnni_dir}/debug"
+host_debug_log="${debug_dir}/host-preflight.log"
+container_debug_log="${debug_dir}/container-preflight.log"
+container_post_debug_log="${debug_dir}/container-post-test.log"
 
 if ! command -v podman >/dev/null 2>&1; then
     echo "podman is required for the Strix Halo test harness" >&2
     exit 1
+fi
+
+if [[ "${debug_enabled}" == "1" ]]; then
+    for extra_log in "${host_debug_log}" "${container_debug_log}" "${container_post_debug_log}"; do
+        if [[ -f "${extra_log}" ]]; then
+            {
+                echo
+                echo "--- $(basename "${extra_log}") ---"
+                cat "${extra_log}"
+            } >> "${log_path}"
+        fi
+    done
 fi
 
 if ! podman info >/dev/null 2>&1; then
@@ -94,6 +112,11 @@ else
         "${vnni_dir}"
 fi
 
+if [[ "${debug_enabled}" == "1" ]]; then
+    mkdir -p "${debug_dir}"
+    "${vnni_dir}/scripts/capture_debug_snapshot.sh" "${host_debug_log}" || true
+fi
+
 podman_args=(
     run --rm
     --name "${container_name}"
@@ -105,6 +128,7 @@ podman_args=(
     --env VK_ICD_FILENAMES="${container_vulkan_icd}"
     --env VNNI_VULKAN_DEBUG=1
     --env XDNA2_VERBOSE=1
+    --env COLI_CAPTURE_DEBUG="${debug_enabled}"
     --env HSA_OVERRIDE_GFX_VERSION=11.5.1
     --env GGML_HIP_ENABLE_UNIFIED_MEMORY=1
     # The repository root is mounted because the NPU backend compiles the
@@ -115,6 +139,9 @@ podman_args=(
 
 podman_args+=("${harness_image}" bash -lc '
 set -euo pipefail
+if [[ "${COLI_CAPTURE_DEBUG:-0}" == "1" ]]; then
+  /work/vnni-int8-matmul/scripts/capture_debug_snapshot.sh /work/vnni-int8-matmul/debug/container-preflight.log || true
+fi
 echo "--- toolchain ---"
 gcc --version | head -1
 command -v ld >/dev/null || {
@@ -150,6 +177,9 @@ echo "--- placement ---"
 # refusal reason for every engine that lost. Without this, "the NPU is being
 # used" stays an assertion.
 ./tools/placement_report --profile data/strix_halo_profile.csv
+if [[ "${COLI_CAPTURE_DEBUG:-0}" == "1" ]]; then
+  /work/vnni-int8-matmul/scripts/capture_debug_snapshot.sh /work/vnni-int8-matmul/debug/container-post-test.log || true
+fi
 ')
 
 : > "${log_path}"
