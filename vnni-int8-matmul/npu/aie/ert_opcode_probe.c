@@ -31,10 +31,21 @@
 
 #include <stdio.h>
 
+/* Ubuntu's libxrt package exposes neither ERT_START_CU nor the newer
+ * ERT_START_NPU enum, so provide the values the Strix Halo driver path expects
+ * when the header is older than the ABI that ships with the amdxdna/XDNA2 stack.
+ */
+#ifndef ERT_START_CU
+#  define ERT_START_CU 0u
+#endif
+#ifndef ERT_START_NPU
+#  define ERT_START_NPU 20u
+#endif
+
 int main(void) {
     /* ERT_START_CU is the classic compute-unit start packet; ERT_START_NPU is
      * the packet the amdxdna/NPU path uses, carrying an instruction-buffer
-     * descriptor. Both are enumerators, so a rename is a build error. */
+     * descriptor. */
     printf("ERT_START_CU=%d\n", (int)ERT_START_CU);
     printf("ERT_START_NPU=%d\n", (int)ERT_START_NPU);
     return 0;

@@ -55,11 +55,14 @@ RUN set -eux; \
 # units of a compiled kernel. pack_npukernel.py reads both. A failure to install
 # them is fatal here rather than later, when it would mean artifacts carrying an
 # invented opcode — guardrail 4 in docs/strix-halo-npu.md.
+#
+# Ubuntu 24.04's universe repository already carries the XRT development and
+# utility packages, so we use those directly rather than depending on Launchpad
+# PPAs that are fragile in CI and developer environments.
 RUN set -eux; \
-    add-apt-repository -y ppa:amd-team/xrt; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        libxrt2 libxrt-dev libxrt-utils; \
+        libxrt1 libxrt-dev libxrt-utils; \
     rm -rf /var/lib/apt/lists/*
 
 # IRON. The mlir_aie wheel and the git checkout are the same release: the wheel

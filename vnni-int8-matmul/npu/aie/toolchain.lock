@@ -27,6 +27,7 @@ PEANO_REQUIREMENTS=utils/peano-requirements.txt
 # wheels; 3.12 is the version mlir-aie's own env_install.sh requires.
 PYTHON_VERSION=3.12
 
-# Base image. Ubuntu 24.04 is what AMD packages XRT and the amdxdna userspace
-# for (ppa:amd-team/xrt), and the manylinux_2_35 wheels resolve against it.
+# Base image. Ubuntu 24.04's universe repository already provides the XRT
+# development and utility packages the kernel build needs, and the
+# manylinux_2_35 wheels resolve against it.
 BASE_IMAGE=docker.io/library/ubuntu:24.04

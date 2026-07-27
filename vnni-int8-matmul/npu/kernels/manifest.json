@@ -46,26 +46,10 @@
         "--n-aie-cols",
         "8"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/256x4096x1024/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/256x4096x1024/insts.bin",
-      "insts_bytes": 4208,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_256x4096x1024.npukernel",
-      "role": "expert gate_proj/up_proj, shared expert gate/up",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_256x4096x1024.npukernel",
-        "rows": 256,
-        "inner": 4096,
-        "out": 1024,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 4208,
-        "instr_words": 1052,
-        "bytes": 4248
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_256x4096x1024.xclbin"
+      "role": "expert gate_proj/up_proj, shared expert gate/up"
     },
     {
       "rows": 256,
@@ -112,26 +96,10 @@
         "--n-aie-cols",
         "8"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/256x1024x4096/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/256x1024x4096/insts.bin",
-      "insts_bytes": 4208,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_256x1024x4096.npukernel",
-      "role": "expert down_proj, shared expert down",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_256x1024x4096.npukernel",
-        "rows": 256,
-        "inner": 1024,
-        "out": 4096,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 4208,
-        "instr_words": 1052,
-        "bytes": 4248
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_256x1024x4096.xclbin"
+      "role": "expert down_proj, shared expert down"
     },
     {
       "rows": 256,
@@ -178,26 +146,10 @@
         "--n-aie-cols",
         "8"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/256x4096x16384/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/256x4096x16384/insts.bin",
-      "insts_bytes": 8400,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_256x4096x16384.npukernel",
-      "role": "self_attn q_proj",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_256x4096x16384.npukernel",
-        "rows": 256,
-        "inner": 4096,
-        "out": 16384,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 8400,
-        "instr_words": 2100,
-        "bytes": 8440
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_256x4096x16384.xclbin"
+      "role": "self_attn q_proj"
     },
     {
       "rows": 256,
@@ -244,26 +196,10 @@
         "--n-aie-cols",
         "8"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/256x4096x512/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/256x4096x512/insts.bin",
-      "insts_bytes": 4208,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_256x4096x512.npukernel",
-      "role": "self_attn k_proj/v_proj, MoE router gate",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_256x4096x512.npukernel",
-        "rows": 256,
-        "inner": 4096,
-        "out": 512,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 4208,
-        "instr_words": 1052,
-        "bytes": 4248
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_256x4096x512.xclbin"
+      "role": "self_attn k_proj/v_proj, MoE router gate"
     },
     {
       "rows": 256,
@@ -310,26 +246,10 @@
         "--n-aie-cols",
         "8"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/256x8192x4096/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/256x8192x4096/insts.bin",
-      "insts_bytes": 4208,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_256x8192x4096.npukernel",
-      "role": "self_attn o_proj",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_256x8192x4096.npukernel",
-        "rows": 256,
-        "inner": 8192,
-        "out": 4096,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 4208,
-        "instr_words": 1052,
-        "bytes": 4248
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_256x8192x4096.xclbin"
+      "role": "self_attn o_proj"
     },
     {
       "rows": 32,
@@ -374,26 +294,10 @@
         "--insts-path",
         "/work/vnni-int8-matmul/npu/aie/build/32x4096x1024/insts.bin"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/32x4096x1024/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/32x4096x1024/insts.bin",
-      "insts_bytes": 660,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_32x4096x1024.npukernel",
-      "role": "expert gate_proj/up_proj, shared expert gate/up",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_32x4096x1024.npukernel",
-        "rows": 32,
-        "inner": 4096,
-        "out": 1024,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 660,
-        "instr_words": 165,
-        "bytes": 700
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_32x4096x1024.xclbin"
+      "role": "expert gate_proj/up_proj, shared expert gate/up"
     },
     {
       "rows": 32,
@@ -438,26 +342,10 @@
         "--insts-path",
         "/work/vnni-int8-matmul/npu/aie/build/32x1024x4096/insts.bin"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/32x1024x4096/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/32x1024x4096/insts.bin",
-      "insts_bytes": 660,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_32x1024x4096.npukernel",
-      "role": "expert down_proj, shared expert down",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_32x1024x4096.npukernel",
-        "rows": 32,
-        "inner": 1024,
-        "out": 4096,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 660,
-        "instr_words": 165,
-        "bytes": 700
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_32x1024x4096.xclbin"
+      "role": "expert down_proj, shared expert down"
     },
     {
       "rows": 32,
@@ -502,26 +390,10 @@
         "--insts-path",
         "/work/vnni-int8-matmul/npu/aie/build/32x4096x16384/insts.bin"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/32x4096x16384/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/32x4096x16384/insts.bin",
-      "insts_bytes": 660,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_32x4096x16384.npukernel",
-      "role": "self_attn q_proj",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_32x4096x16384.npukernel",
-        "rows": 32,
-        "inner": 4096,
-        "out": 16384,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 660,
-        "instr_words": 165,
-        "bytes": 700
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_32x4096x16384.xclbin"
+      "role": "self_attn q_proj"
     },
     {
       "rows": 32,
@@ -566,26 +438,10 @@
         "--insts-path",
         "/work/vnni-int8-matmul/npu/aie/build/32x4096x512/insts.bin"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/32x4096x512/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/32x4096x512/insts.bin",
-      "insts_bytes": 660,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_32x4096x512.npukernel",
-      "role": "self_attn k_proj/v_proj, MoE router gate",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_32x4096x512.npukernel",
-        "rows": 32,
-        "inner": 4096,
-        "out": 512,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 660,
-        "instr_words": 165,
-        "bytes": 700
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_32x4096x512.xclbin"
+      "role": "self_attn k_proj/v_proj, MoE router gate"
     },
     {
       "rows": 32,
@@ -630,26 +486,10 @@
         "--insts-path",
         "/work/vnni-int8-matmul/npu/aie/build/32x8192x4096/insts.bin"
       ],
-      "status": "built",
-      "xclbin": "/work/vnni-int8-matmul/npu/aie/build/32x8192x4096/final.xclbin",
-      "insts": "/work/vnni-int8-matmul/npu/aie/build/32x8192x4096/insts.bin",
-      "insts_bytes": 660,
+      "status": "failed",
+      "reason": "design compile exited 1",
       "artifact": "matmul_int8_32x8192x4096.npukernel",
-      "role": "self_attn o_proj",
-      "packed": {
-        "artifact": "npu/kernels/matmul_int8_32x8192x4096.npukernel",
-        "rows": 32,
-        "inner": 8192,
-        "out": 4096,
-        "fmt": 1,
-        "ert_opcode": 20,
-        "ert_opcode_name": "ERT_START_NPU",
-        "cu_mask": 1,
-        "instr_size": 660,
-        "instr_words": 165,
-        "bytes": 700
-      },
-      "xclbin_artifact": "npu/kernels/matmul_int8_32x8192x4096.xclbin"
+      "role": "self_attn o_proj"
     },
     {
       "rows": 1,
@@ -697,8 +537,8 @@
       "role": "self_attn o_proj"
     }
   ],
-  "built": 10,
-  "failed": 0,
+  "built": 0,
+  "failed": 10,
   "unsupported": 5,
   "total": 15
 }
