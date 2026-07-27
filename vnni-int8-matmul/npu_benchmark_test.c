@@ -79,6 +79,25 @@ static int count_passed(test_result_t *results, int count) {
     return passed;
 }
 
+static int benchmark_uapi_available(void) {
+    if (!strix_xdna2_is_supported()) {
+        printf("NPU benchmark SKIP (%s)\n", strix_xdna2_failure_reason());
+        return 0;
+    }
+
+    /*
+     * Force one real kernel-registration attempt so a running kernel that lacks
+     * CONFIG_HWCTX support is detected up front for this benchmark flow.
+     */
+    (void)strix_xdna2_kernel_exists(256, 4096, 1024, XDNA2_FMT_INT8);
+    const char *reason = strix_xdna2_failure_reason();
+    if (reason && strstr(reason, "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX")) {
+        printf("NPU benchmark SKIP (%s)\n", reason);
+        return 0;
+    }
+    return 1;
+}
+
 static void run_benchmark_suite(void) {
     test_result_t results[100];
     int result_count = 0;
@@ -197,6 +216,11 @@ static void run_benchmark_suite(void) {
 }
 
 int main(void) {
+    if (!benchmark_uapi_available()) {
+        strix_xdna2_shutdown();
+        return 0;
+    }
     run_benchmark_suite();
+    strix_xdna2_shutdown();
     return 0;
 }
