@@ -45,6 +45,26 @@ static int xdna2_ioctl(int fd, unsigned long cmd, void *arg) {
     return ret;
 }
 
+static uint32_t xdna2_read_le32(const uint8_t *p) {
+    return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t xdna2_read_le64(const uint8_t *p) {
+    return ((uint64_t)xdna2_read_le32(p)) |
+           ((uint64_t)xdna2_read_le32(p + 4) << 32);
+}
+
+static void xdna2_copy_section_name(char *dst, size_t dst_size,
+                                    const uint8_t *src) {
+    size_t len = 0;
+    while (len + 1 < dst_size && len < 16 && src[len] != '\0') {
+        dst[len] = (char)src[len];
+        len++;
+    }
+    dst[len] = '\0';
+}
+
 /*
  * The user address the driver associates with a BO, exactly as GET_BO_INFO
  * reports it: XDNA2_INVALID_ADDR when the driver holds no address, which is a
@@ -59,6 +79,72 @@ static int xdna2_bo_userptr(int fd, uint32_t handle, uint64_t *uva) {
     }
     if (uva) *uva = info.vaddr;
     return 0;
+}
+
+int xdna2_parse_xclbin_ip_layout(const uint8_t *xclbin, size_t xclbin_size,
+                                 xdna2_xclbin_ip_data_t **entries_out,
+                                 size_t *entry_count_out) {
+    if (!xclbin || !entries_out || !entry_count_out) return -EINVAL;
+    *entries_out = NULL;
+    *entry_count_out = 0;
+
+    if (xclbin_size < 12u) return -EINVAL;
+
+    struct {
+        char magic[8];
+        uint32_t section_count;
+    } axlf_header;
+    memcpy(&axlf_header, xclbin, sizeof(axlf_header));
+    (void)axlf_header;
+
+    size_t section_bytes = (size_t)xdna2_read_le32((const uint8_t *)(xclbin + 8)) * 32u;
+    size_t section_table = 12u + section_bytes;
+    if (xclbin_size < section_table) return -EINVAL;
+
+    for (uint32_t i = 0; i < xdna2_read_le32((const uint8_t *)(xclbin + 8)); ++i) {
+        const uint8_t *sec = xclbin + 12u + (size_t)i * 32u;
+        char name[17];
+        xdna2_copy_section_name(name, sizeof(name), sec);
+        uint32_t type = xdna2_read_le32(sec + 16);
+        uint64_t offset = xdna2_read_le64(sec + 20);
+        uint64_t size = xdna2_read_le64(sec + 28);
+        if (strcmp(name, "IP_LAYOUT") == 0 && type == 8u) {
+            if (offset >= xclbin_size || size > xclbin_size - offset) {
+                return -EINVAL;
+            }
+            const uint8_t *layout = xclbin + offset;
+            if (size < 4u) return -EINVAL;
+            uint32_t count = xdna2_read_le32(layout);
+            size_t entry_bytes = sizeof(xdna2_xclbin_ip_data_t);
+            if ((size_t)count > ((size - 4u) / entry_bytes)) {
+                return -EINVAL;
+            }
+
+            xdna2_xclbin_ip_data_t *entries = calloc(count, entry_bytes);
+            if (!entries) return -ENOMEM;
+            size_t matched = 0;
+            for (uint32_t idx = 0; idx < count; ++idx) {
+                const uint8_t *src = layout + 4u + (size_t)idx * entry_bytes;
+                xdna2_xclbin_ip_data_t entry;
+                memcpy(&entry, src, entry_bytes);
+                if (entry.type != XDNA2_XCLBIN_IP_TYPE_PS_KERNEL) {
+                    continue;
+                }
+                entry.name[sizeof(entry.name) - 1] = '\0';
+                memcpy(&entries[matched], &entry, entry_bytes);
+                matched++;
+            }
+            if (matched == 0) {
+                free(entries);
+                return -ENOENT;
+            }
+            *entries_out = entries;
+            *entry_count_out = matched;
+            return 0;
+        }
+    }
+
+    return -ENOENT;
 }
 
 /* ── Device Management ── */
@@ -351,45 +437,64 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx) {
     return ret < 0 ? -1 : 0;
 }
 
-int xdna2_config_hwctx_single_cu(int fd, xdna2_hwctx_t *ctx,
-                                 uint32_t cu_bo_handle, uint8_t cu_func) {
-    if (!ctx || !ctx->initialized || cu_bo_handle == 0) return -1;
+int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
+                           const xdna2_cu_config_t *cus, uint16_t cu_count) {
+    if (!ctx || !ctx->initialized || !cus || cu_count == 0) return -1;
 #if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) && \
     defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
-    struct {
-        struct amdxdna_hwctx_param_config_cu hdr;
-        struct amdxdna_cu_config cu;
-    } cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.hdr.num_cus = 1;
-    cfg.cu.cu_bo = cu_bo_handle;
-    cfg.cu.cu_func = cu_func;
+    size_t payload_size = sizeof(struct amdxdna_hwctx_param_config_cu) +
+                           (size_t)cu_count * sizeof(struct amdxdna_cu_config);
+    uint8_t *cfg_bytes = calloc(1, payload_size);
+    if (!cfg_bytes) return -1;
+
+    struct amdxdna_hwctx_param_config_cu *hdr =
+            (struct amdxdna_hwctx_param_config_cu *)cfg_bytes;
+    struct amdxdna_cu_config *cu_configs =
+            (struct amdxdna_cu_config *)(cfg_bytes + sizeof(*hdr));
+    hdr->num_cus = cu_count;
+    for (uint16_t i = 0; i < cu_count; ++i) {
+        if (cus[i].cu_bo_handle == 0) {
+            free(cfg_bytes);
+            errno = EINVAL;
+            return -1;
+        }
+        cu_configs[i].cu_bo = cus[i].cu_bo_handle;
+        cu_configs[i].cu_func = cus[i].cu_func;
+    }
 
     struct amdxdna_drm_config_hwctx req;
     memset(&req, 0, sizeof(req));
     req.handle = ctx->hwctx_handle;
     req.param_type = DRM_AMDXDNA_HWCTX_CONFIG_CU;
-    req.param_val = (__u64)(uintptr_t)&cfg;
-    req.param_val_size = (uint32_t)sizeof(cfg);
+    req.param_val = (__u64)(uintptr_t)cfg_bytes;
+    req.param_val_size = (uint32_t)payload_size;
 
-    if (xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &req) < 0) {
+    int ret = xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &req);
+    free(cfg_bytes);
+    if (ret < 0) {
         fprintf(stderr,
-                "xdna2: failed to configure CU on hwctx=%u with BO=%u\n",
-                ctx->hwctx_handle, cu_bo_handle);
+                "xdna2: failed to configure %u CUs on hwctx=%u\n",
+                cu_count, ctx->hwctx_handle);
         return -1;
     }
     return 0;
 #else
     (void)fd;
     (void)ctx;
-    (void)cu_bo_handle;
-    (void)cu_func;
+    (void)cus;
+    (void)cu_count;
     fprintf(stderr,
             "xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
             "cannot register CU/PDI on this build\n");
     errno = ENOTSUP;
     return -1;
 #endif
+}
+
+int xdna2_config_hwctx_single_cu(int fd, xdna2_hwctx_t *ctx,
+                                 uint32_t cu_bo_handle, uint8_t cu_func) {
+    xdna2_cu_config_t cu = { .cu_bo_handle = cu_bo_handle, .cu_func = cu_func };
+    return xdna2_config_hwctx_cus(fd, ctx, &cu, 1);
 }
 
 /* ── Buffer Objects ── */

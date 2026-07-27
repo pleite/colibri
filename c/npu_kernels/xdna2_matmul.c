@@ -98,6 +98,14 @@ static char *sidecar_xclbin_path(const char *kernel_path) {
     return path;
 }
 
+static void destroy_cu_config_bos(int fd, xdna2_kernel_t *kernel) {
+    if (!kernel) return;
+    for (uint32_t i = 0; i < kernel->cu_config_count; ++i) {
+        xdna2_destroy_bo(fd, &kernel->cu_config_bos[i]);
+    }
+    kernel->cu_config_count = 0;
+}
+
 int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
     if (!runtime || !runtime->initialized || !kernel_path) return -EINVAL;
     if (runtime->kernel_count >= XDNA2_MAX_KERNELS) {
@@ -237,37 +245,111 @@ int xdna2_load_kernel(xdna2_runtime_t *runtime, const char *kernel_path) {
         }
         fclose(xclfp);
 
-        if (xdna2_create_bo(runtime->device_fd, &entry.pdi_bo, xcl_size, AMDXDNA_BO_DEV) < 0) {
+        xdna2_xclbin_ip_data_t *ip_entries = NULL;
+        size_t ip_count = 0;
+        if (xdna2_parse_xclbin_ip_layout(xclbin, xcl_size, &ip_entries, &ip_count) < 0) {
+            fprintf(stderr, "xdna2: '%s' did not expose any IP_PS_KERNEL entries\n",
+                    xclbin_path);
             free(xclbin_path);
             free(xclbin);
             xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
-            return -EIO;
+            return -EINVAL;
         }
-        if (xdna2_map_bo(runtime->device_fd, &entry.pdi_bo) < 0) {
+        if (ip_count > 32u) {
+            fprintf(stderr, "xdna2: '%s' exposes too many (%zu) DPU CUs\n",
+                    xclbin_path, ip_count);
+            free(ip_entries);
             free(xclbin_path);
             free(xclbin);
-            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
             xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
-            return -EIO;
+            return -EINVAL;
         }
-        memcpy(entry.pdi_bo.mapped, xclbin, xcl_size);
-        free(xclbin);
-        if (xdna2_sync_bo(runtime->device_fd, &entry.pdi_bo,
-                          SYNC_DIRECT_TO_DEVICE, 0, xcl_size) < 0) {
+        uint32_t expected_mask = 0;
+        for (size_t i = 0; i < ip_count; ++i) {
+            expected_mask |= (1u << i);
+        }
+        if (entry.cu_mask != expected_mask) {
+            fprintf(stderr,
+                    "xdna2: xclbin '%s' exposes %zu DPU CU(s) but kernel mask=0x%x\n",
+                    xclbin_path, ip_count, entry.cu_mask);
+            free(ip_entries);
             free(xclbin_path);
-            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
+            free(xclbin);
             xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
-            return -EIO;
+            return -EINVAL;
         }
-        if (xdna2_config_hwctx_single_cu(runtime->device_fd, &runtime->hwctx,
-                                         entry.pdi_bo.handle,
-                                         /* DPU CU function */ 0) < 0) {
-            xdna2_destroy_bo(runtime->device_fd, &entry.pdi_bo);
-            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+
+        xdna2_cu_config_t *cu_configs = calloc(ip_count, sizeof(*cu_configs));
+        if (!cu_configs) {
+            free(ip_entries);
             free(xclbin_path);
+            free(xclbin);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+            return -ENOMEM;
+        }
+        for (size_t i = 0; i < ip_count; ++i) {
+            if (entry.cu_config_count >= XDNA2_MAX_CU_CONFIG_BOS) {
+                fprintf(stderr, "xdna2: too many CU config BOs for kernel '%s'\n",
+                        kernel_path);
+                free(cu_configs);
+                free(ip_entries);
+                free(xclbin_path);
+                free(xclbin);
+                destroy_cu_config_bos(runtime->device_fd, &entry);
+                xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+                return -ENOSPC;
+            }
+            if (xdna2_create_bo(runtime->device_fd, &entry.cu_config_bos[entry.cu_config_count],
+                                sizeof(ip_entries[i]), AMDXDNA_BO_DEV) < 0) {
+                free(cu_configs);
+                free(ip_entries);
+                free(xclbin_path);
+                free(xclbin);
+                destroy_cu_config_bos(runtime->device_fd, &entry);
+                xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+                return -EIO;
+            }
+            if (xdna2_map_bo(runtime->device_fd, &entry.cu_config_bos[entry.cu_config_count]) < 0) {
+                xdna2_destroy_bo(runtime->device_fd, &entry.cu_config_bos[entry.cu_config_count]);
+                free(cu_configs);
+                free(ip_entries);
+                free(xclbin_path);
+                free(xclbin);
+                destroy_cu_config_bos(runtime->device_fd, &entry);
+                xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+                return -EIO;
+            }
+            memcpy(entry.cu_config_bos[entry.cu_config_count].mapped, &ip_entries[i],
+                   sizeof(ip_entries[i]));
+            if (xdna2_sync_bo(runtime->device_fd, &entry.cu_config_bos[entry.cu_config_count],
+                              SYNC_DIRECT_TO_DEVICE, 0, sizeof(ip_entries[i])) < 0) {
+                xdna2_destroy_bo(runtime->device_fd, &entry.cu_config_bos[entry.cu_config_count]);
+                free(cu_configs);
+                free(ip_entries);
+                free(xclbin_path);
+                free(xclbin);
+                destroy_cu_config_bos(runtime->device_fd, &entry);
+                xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
+                return -EIO;
+            }
+            cu_configs[i].cu_bo_handle = entry.cu_config_bos[entry.cu_config_count].handle;
+            cu_configs[i].cu_func = 0;
+            entry.cu_config_count++;
+        }
+        if (xdna2_config_hwctx_cus(runtime->device_fd, &runtime->hwctx, cu_configs,
+                                   (uint16_t)ip_count) < 0) {
+            free(cu_configs);
+            free(ip_entries);
+            free(xclbin_path);
+            free(xclbin);
+            destroy_cu_config_bos(runtime->device_fd, &entry);
+            xdna2_destroy_bo(runtime->device_fd, &entry.instr_bo);
             return -EIO;
         }
+        free(cu_configs);
+        free(ip_entries);
         free(xclbin_path);
+        free(xclbin);
         runtime->cu_configured = true;
     }
 
@@ -363,7 +445,7 @@ void xdna2_runtime_shutdown(xdna2_runtime_t *runtime) {
 
     for (int i = 0; i < runtime->kernel_count; ++i) {
         if (runtime->kernels[i].loaded) {
-            xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].pdi_bo);
+            destroy_cu_config_bos(runtime->device_fd, &runtime->kernels[i]);
             xdna2_destroy_bo(runtime->device_fd, &runtime->kernels[i].instr_bo);
             runtime->kernels[i].loaded = false;
         }
