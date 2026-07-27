@@ -653,7 +653,71 @@ ssh -i ~/.ssh/id_ed25519 leite@192.168.1.129
 
 ---
 
-## 13. Questions and follow-up queries for the execution agent
+## 13. Local self-hosted agent runbook (Strix Halo)
+
+Use this when the execution agent is running on the Strix Halo machine itself, via the self-hosted GitHub Actions runner, rather than on a cloud runner.
+
+### 13.1 What to do first
+
+1. Treat the self-hosted runner as the target. The GitHub cloud runners are not a valid target for this work because they do not expose the hardware.
+2. Verify the host before doing anything else:
+   ```bash
+   uname -a
+   ls -l /dev/dri /dev/kfd /dev/accel/accel0 2>/dev/null || true
+   lsmod | grep amdxdna || true
+   sudo dmesg | grep -iE 'amdxdna|accel|aie2|xclbin' | tail -n 40 || true
+   ```
+3. If the host kernel / `amdxdna` module rejects the xclbin or reports a loader/version mismatch, stop and do not try a fresh hand-built xclbin with a guessed format. The correct response is to use the artifact set that the self-hosted NPU-kernel build workflow produced, or to run that workflow again on the same Strix Halo runner and use its output.
+
+### 13.2 Preferred execution path
+
+Use the self-hosted workflows that already exist in this repo:
+
+1. Build the kernel artifacts on the self-hosted runner:
+   - Workflow: `.github/workflows/npu-kernels.yml`
+   - Equivalent local command on the Strix Halo host:
+     ```bash
+     cd /home/leite/colibri/vnni-int8-matmul
+     ./scripts/build-npu-kernels.sh --allow-partial
+     python3 npu/aie/pack_npukernel.py --verify npu/kernels/*.npukernel
+     ```
+2. Run the Strix Halo harness against the resulting artifacts:
+   - Workflow: `.github/workflows/vnni-test.yml`
+   - Equivalent local command on the Strix Halo host:
+     ```bash
+     cd /home/leite/colibri/vnni-int8-matmul
+     REQUIRE_NPU=1 ./scripts/strix-halo-podman-test.sh
+     ```
+
+### 13.3 If the host rejects the xclbin version
+
+If the host logs a failure such as an xclbin/loader version mismatch, unsupported xclbin load, or a similar `amdxdna`/firmware rejection, then:
+
+1. Do not change the runtime to a different guessed xclbin format.
+2. Reuse the artifact bundle produced by the self-hosted `npu-kernels` workflow (or rerun that workflow on the same host) and test that artifact set.
+3. Keep the test run focused on the host/kernel/module that is actually present. The answer is not "use a cloud runner"; it is "use the known-good artifact set from the self-hosted Strix Halo workflow".
+
+### 13.4 What the agent must capture
+
+After every run, the agent should save and report:
+
+- `vnni-int8-matmul/test_output.log`
+- `vnni-int8-matmul/amdxdna.log` (if produced)
+- the first 40 lines of `dmesg` that mention `amdxdna`, `accel`, `aie2`, or `xclbin`
+- whether the run used a locally built artifact set or the workflow artifact set
+
+### 13.5 Acceptance criteria
+
+The run is successful only when:
+
+- the Strix Halo host exposes `/dev/accel/accel0` and the `amdxdna` stack is available,
+- the harness actually runs the NPU path rather than silently falling back to CPU,
+- the run log shows the `.npukernel` artifact being used, and
+- any rejection is reported as a real kernel/module/firmware issue rather than a silent skip.
+
+---
+
+## 14. Questions and follow-up queries for the execution agent
 
 Use these prompts when more information is needed. They are intentionally narrow so the agent can answer them without ambiguity and then return to the plan with the missing data.
 
