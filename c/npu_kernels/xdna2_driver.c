@@ -462,8 +462,7 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx) {
 int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
                            const xdna2_cu_config_t *cus, uint16_t cu_count) {
     if (!ctx || !ctx->initialized || !cus || cu_count == 0) return -1;
-#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) && \
-    defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
+#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX)
     size_t payload_size = sizeof(struct amdxdna_hwctx_param_config_cu) +
                            (size_t)cu_count * sizeof(struct amdxdna_cu_config);
     uint8_t *cfg_bytes = calloc(1, payload_size);

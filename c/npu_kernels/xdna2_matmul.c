@@ -393,8 +393,7 @@ int xdna2_runtime_init(xdna2_runtime_t *runtime) {
     runtime->device_fd = -1;
     runtime->timeout_ms = 5000;
 
-#if !defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) || \
-    !defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
+#if !defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX)
     struct utsname uts;
     const char *release = "unknown";
     if (uname(&uts) == 0 && uts.release[0] != '\0') {
