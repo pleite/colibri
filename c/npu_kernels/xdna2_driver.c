@@ -692,8 +692,34 @@ int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
     sync.direction = direction;
     sync.offset = offset;
     sync.size = size;
-
-    return xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_SYNC_BO, &sync);
+    int ret;
+    do {
+        ret = ioctl(fd, DRM_IOCTL_AMDXDNA_SYNC_BO, &sync);
+    } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
+    if (ret < 0) {
+        const bool valid_direction =
+            (direction == SYNC_DIRECT_TO_DEVICE ||
+             direction == SYNC_DIRECT_FROM_DEVICE);
+        const bool valid_range =
+            (size > 0 && offset <= bo->size && size <= bo->size - offset);
+        if ((errno == ENOTTY || errno == EOPNOTSUPP ||
+             (errno == EINVAL && valid_direction && valid_range))) {
+            static bool printed = false;
+            if (!printed) {
+                printed = true;
+                fprintf(stderr,
+                        "xdna2: DRM_IOCTL_AMDXDNA_SYNC_BO is unavailable on this "
+                        "kernel/UAPI path (errno=%d: %s); continuing without "
+                        "explicit BO cache sync\n",
+                        errno, strerror(errno));
+            }
+            return 0;
+        }
+        fprintf(stderr, "xdna2: ioctl 0x%lx failed: %s\n",
+                (unsigned long)DRM_IOCTL_AMDXDNA_SYNC_BO, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Command Submission ── */
