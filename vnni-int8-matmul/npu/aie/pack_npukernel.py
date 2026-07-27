@@ -78,8 +78,23 @@ def probe_ert_opcode(probe: str, name: str = ERT_OPCODE_NAME) -> int:
     return values[name]
 
 
-def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
-    """Build the CU mask from the xclbin's IP_LAYOUT, one bit per kernel CU."""
+def _read_axlf_section_count(xclbin: Path) -> int:
+    """Read the AXLF section count without depending on xclbinutil."""
+    data = xclbin.read_bytes()
+    if len(data) < 12:
+        raise SystemExit(f"{xclbin}: too small to be an AXLF/xclbin header")
+    count = int.from_bytes(data[8:12], "little")
+    if count == 0xFFFFFFFF:
+        raise SystemExit(
+            f"{xclbin}: invalid section count 0xFFFFFFFF; the toolchain emitted "
+            "a corrupted xclbin"
+        )
+    return count
+
+
+def _ip_layout_entries(xclbin: Path, xclbinutil: str = "xclbinutil") -> list[dict]:
+    """Dump the xclbin's IP_LAYOUT entries or fail fast on a corrupted file."""
+    _read_axlf_section_count(xclbin)
     with tempfile.TemporaryDirectory() as tmp:
         dump = Path(tmp) / "ip_layout.json"
         try:
@@ -108,7 +123,12 @@ def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
             ) from exc
         layout = json.loads(dump.read_text())
 
-    entries = layout.get("ip_layout", {}).get("m_ip_data", [])
+    return layout.get("ip_layout", {}).get("m_ip_data", [])
+
+
+def cu_mask_from_xclbin(xclbin: Path, xclbinutil: str = "xclbinutil") -> int:
+    """Build the CU mask from the xclbin's IP_LAYOUT, one bit per kernel CU."""
+    entries = _ip_layout_entries(xclbin, xclbinutil)
     # aiecc registers the design through xclbinutil's --add-kernel with a
     # "ps-kernels" JSON, which XRT records as IP_PS_KERNEL (m_subtype DPU), not
     # IP_KERNEL. Both are compute units addressable by the ERT CU mask.
@@ -279,6 +299,41 @@ def verify(paths: list[Path]) -> int:
     return 0
 
 
+def verify_xclbins(paths: list[Path], xclbinutil: str = "xclbinutil") -> int:
+    """Validate that every xclbin exposes a usable IP_LAYOUT section."""
+    failures = 0
+    for path in paths:
+        try:
+            entries = _ip_layout_entries(path, xclbinutil)
+        except SystemExit as exc:
+            print(str(exc), file=sys.stderr)
+            failures += 1
+            continue
+        cus = [
+            e
+            for e in entries
+            if str(e.get("m_type", "")).upper() in CU_IP_TYPES
+        ]
+        if not cus:
+            seen = sorted({str(e.get("m_type", "")) for e in entries})
+            print(
+                f"{path}: declares no compute unit of type "
+                f"{'/'.join(sorted(CU_IP_TYPES))}; IP_LAYOUT holds "
+                f"{seen or 'no entries'}",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+        print(f"{path}: OK IP_LAYOUT with {len(cus)} CU(s)")
+    if failures:
+        print(f"{failures} xclbin(s) rejected", file=sys.stderr)
+        return 1
+    if not paths:
+        print("no xclbins given to verify", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
@@ -288,6 +343,13 @@ def main() -> int:
         type=Path,
         metavar="ARTIFACT",
         help="parse existing artifacts instead of writing one",
+    )
+    p.add_argument(
+        "--verify-xclbin",
+        nargs="+",
+        type=Path,
+        metavar="XCLBIN",
+        help="validate xclbin sidecars instead of writing one",
     )
     p.add_argument("--rows", type=int)
     p.add_argument("--inner", type=int)
@@ -307,6 +369,8 @@ def main() -> int:
         return self_test()
     if opts.verify:
         return verify(opts.verify)
+    if opts.verify_xclbin:
+        return verify_xclbins(opts.verify_xclbin, opts.xclbinutil)
 
     missing = [
         name

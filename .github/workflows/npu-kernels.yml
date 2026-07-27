@@ -153,6 +153,19 @@ jobs:
           fi
           python3 npu/aie/pack_npukernel.py --verify "${artifacts[@]}"
 
+      - name: Verify every xclbin sidecar has a usable IP_LAYOUT section
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          xclbins=(npu/kernels/*.xclbin)
+          if [ ${#xclbins[@]} -eq 0 ]; then
+            echo "the build produced no xclbin sidecars at all" >&2
+            exit 1
+          fi
+          python3 npu/aie/pack_npukernel.py --verify-xclbin "${xclbins[@]}"
+
       - name: Publish the kernel manifest
         if: always()
         working-directory: vnni-int8-matmul
