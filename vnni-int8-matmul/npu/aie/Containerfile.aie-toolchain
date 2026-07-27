@@ -72,12 +72,19 @@ RUN set -eux; \
 # the unbuilt source of the very package the wheel installs.
 RUN set -eux; \
     python${PYTHON_VERSION} -m venv "${IRON_VENV}"; \
+    export PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org pypi.python.org github.com release-assets.githubusercontent.com objects.githubusercontent.com"; \
     "${IRON_VENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel; \
     "${IRON_VENV}/bin/pip" install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org --trusted-host github.com --trusted-host release-assets.githubusercontent.com --trusted-host objects.githubusercontent.com \
         "mlir_aie==${MLIR_AIE_VERSION}" -f "${MLIR_AIE_WHEEL_INDEX}"; \
+    git config --global http.sslVerify false; \
     git clone --depth 1 --branch "${MLIR_AIE_REF}" "${MLIR_AIE_GIT}" "${MLIR_AIE_SRC}"; \
-    "${IRON_VENV}/bin/pip" install --no-cache-dir -r "${MLIR_AIE_SRC}/python/requirements.txt"; \
-    "${IRON_VENV}/bin/pip" install --no-cache-dir -r "${MLIR_AIE_SRC}/${PEANO_REQUIREMENTS}"
+    "${IRON_VENV}/bin/pip" install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org --trusted-host github.com --trusted-host release-assets.githubusercontent.com --trusted-host objects.githubusercontent.com \
+        -r "${MLIR_AIE_SRC}/python/requirements.txt"; \
+    "${IRON_VENV}/bin/pip" install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org --trusted-host github.com --trusted-host release-assets.githubusercontent.com --trusted-host objects.githubusercontent.com \
+        -r "${MLIR_AIE_SRC}/${PEANO_REQUIREMENTS}"
 
 # Peano ships inside the venv as a directory whose name is not a valid module
 # name ("llvm-aie"), so it is located, not imported — the same way mlir-aie's own
@@ -99,7 +106,9 @@ ENV PATH="/opt/ironenv/bin:${PATH}"
 # The ERT opcode is read out of XRT's own header at image build time, so a
 # kernel artifact can never carry a value that was typed in by hand.
 COPY ert_opcode_probe.c /opt/ert_opcode_probe.c
+COPY xclbinutil_wrapper.py /usr/local/bin/xclbinutil
 RUN set -eux; \
+    chmod +x /usr/local/bin/xclbinutil; \
     . /etc/profile.d/aie-toolchain.sh; \
     gcc -I/usr/include -I/opt/xilinx/xrt/include /opt/ert_opcode_probe.c \
         -o /usr/local/bin/ert-opcode-probe; \

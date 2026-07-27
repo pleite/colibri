@@ -137,7 +137,12 @@ def build_one(shape: dict, build_root: Path, kernel_dir: Path) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kernel-dir", type=Path, default=Path("npu/kernels"))
-    p.add_argument("--build-root", type=Path, default=Path("npu/aie/build"))
+    p.add_argument(
+        "--build-root",
+        type=Path,
+        default=Path("npu/aie/.build"),
+        help="temporary upstream build workspace (writable from the container)",
+    )
     p.add_argument(
         "--shapes",
         default="",
