@@ -37,6 +37,19 @@ typedef struct {
     uint32_t inner;
 } StrixPushConstants;
 
+/* Per-shape cached buffers so we do not re-allocate on every dispatch. */
+typedef struct {
+    int32_t                      rows;
+    int32_t                      inner_dim;
+    int32_t                      out_cols;
+    StrixBuffer                  buffers[3];
+    size_t                       a_bytes;
+    size_t                       b_bytes;
+    size_t                       c_bytes;
+} CachedBuffers;
+
+#define MAX_CACHED 16
+
 typedef struct {
     void                        *loader;
     VkInstance                   instance;
@@ -47,6 +60,7 @@ typedef struct {
     uint32_t                     memory_type_index_host;
     VkCommandPool                command_pool;
     VkCommandBuffer              command_buffer;
+    VkCommandBuffer              command_buffers[STRIX_VULKAN_MAX_BATCH];
     VkDescriptorSetLayout        descriptor_layout;
     VkDescriptorPool             descriptor_pool;
     VkDescriptorSet              descriptor_set;
@@ -58,6 +72,8 @@ typedef struct {
     VnnVulkanInstanceDispatch    vk;
     VnnVulkanDeviceDispatch      dev;
     bool                         ready;
+    CachedBuffers                cached[MAX_CACHED];
+    int                          cached_count;
 } StrixVulkanContext;
 
 /* Lazily created, process-wide. Creating a VkDevice per matmul call costs tens
@@ -309,6 +325,14 @@ static int resolve_device_procs(StrixVulkanContext *ctx) {
 /* ── Teardown ────────────────────────────────────────────────────────────── */
 
 static void destroy_context(StrixVulkanContext *ctx) {
+    /* Free any cached per-shape buffers. */
+    for (int i = 0; i < ctx->cached_count; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            destroy_buffer(ctx, &ctx->cached[i].buffers[j]);
+        }
+    }
+    ctx->cached_count = 0;
+
     if (ctx->device) {
         if (ctx->dev.vkDeviceWaitIdle) ctx->dev.vkDeviceWaitIdle(ctx->device);
         if (ctx->fence)             ctx->dev.vkDestroyFence(ctx->device, ctx->fence, NULL);
@@ -317,7 +341,10 @@ static void destroy_context(StrixVulkanContext *ctx) {
         if (ctx->shader_module)     ctx->dev.vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
         if (ctx->descriptor_pool)   ctx->dev.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
         if (ctx->descriptor_layout) ctx->dev.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
-        if (ctx->command_pool)      ctx->dev.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+        if (ctx->command_pool) {
+            ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, STRIX_VULKAN_MAX_BATCH, ctx->command_buffers);
+            ctx->dev.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+        }
         ctx->dev.vkDestroyDevice(ctx->device, NULL);
     }
     if (ctx->instance && ctx->vk.vkDestroyInstance) {
@@ -501,8 +528,8 @@ static int create_context(StrixVulkanContext *ctx) {
     cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmd_alloc.commandPool = ctx->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc.commandBufferCount = 1;
-    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
+    cmd_alloc.commandBufferCount = STRIX_VULKAN_MAX_BATCH;
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, ctx->command_buffers) != VK_SUCCESS) {
         destroy_context(ctx);
         return vk_fail("vkAllocateCommandBuffers failed");
     }
@@ -688,6 +715,58 @@ static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, StrixBuffer
 
 /* ── Dispatch ────────────────────────────────────────────────────────────── */
 
+/*
+ * Look up or create cached buffers for a given shape.  On the second+ call
+ * with the same (rows, inner, cols) we reuse the existing VkBuffer objects,
+ * avoiding the ~microsecond vkCreateBuffer + vkAllocateMemory + vkBindBuffer
+ * sequence that dominates per-call overhead when the actual dispatch itself
+ * is sub-millisecond.
+ */
+static CachedBuffers *find_or_create_cache(StrixVulkanContext *ctx,
+                                           int32_t rows, int32_t inner_dim,
+                                           int32_t out_cols) {
+    /* 1) Search existing entries for a matching shape. */
+    for (int i = 0; i < ctx->cached_count; ++i) {
+        CachedBuffers *cb = &ctx->cached[i];
+        if (cb->rows == rows && cb->inner_dim == inner_dim && cb->out_cols == out_cols) {
+            return cb;
+        }
+    }
+
+    /* 2) Evict if we are full.  The least recently used slot is the last one
+     *    — simplest policy and good enough for the small shape table. */
+    int slot = ctx->cached_count;
+    if (slot >= MAX_CACHED) {
+        slot = MAX_CACHED - 1;
+        /* Tear down old buffers. */
+        for (int j = 0; j < 3; ++j) {
+            destroy_buffer(ctx, &ctx->cached[slot].buffers[j]);
+        }
+    } else {
+        ctx->cached_count++;
+    }
+
+    CachedBuffers *cb = &ctx->cached[slot];
+    cb->rows = rows;
+    cb->inner_dim = inner_dim;
+    cb->out_cols = out_cols;
+    cb->a_bytes = (size_t)rows * (size_t)inner_dim * sizeof(float);
+    cb->b_bytes = (size_t)inner_dim * (size_t)out_cols * sizeof(float);
+    cb->c_bytes = (size_t)rows * (size_t)out_cols * sizeof(float);
+
+    int ok = create_buffer(ctx, cb->a_bytes, &cb->buffers[0]) &&
+             create_buffer(ctx, cb->b_bytes, &cb->buffers[1]) &&
+             create_buffer(ctx, cb->c_bytes, &cb->buffers[2]);
+    if (!ok) {
+        for (int j = 0; j < 3; ++j) {
+            destroy_buffer(ctx, &cb->buffers[j]);
+        }
+        memset(cb, 0, sizeof(*cb));
+        return NULL;
+    }
+    return cb;
+}
+
 static int run_matmul(StrixVulkanContext *ctx,
                       const int8_t *input, int rows, int inner_dim,
                       const int8_t *weights, int out_cols,
@@ -695,23 +774,28 @@ static int run_matmul(StrixVulkanContext *ctx,
     const size_t a_count = (size_t)rows * (size_t)inner_dim;
     const size_t b_count = (size_t)inner_dim * (size_t)out_cols;
     const size_t c_count = (size_t)rows * (size_t)out_cols;
-    const VkDeviceSize a_bytes = (VkDeviceSize)(a_count * sizeof(float));
-    const VkDeviceSize b_bytes = (VkDeviceSize)(b_count * sizeof(float));
-    const VkDeviceSize c_bytes = (VkDeviceSize)(c_count * sizeof(float));
 
+    /* Use cached buffers when possible; fall back to per-call allocation. */
+    CachedBuffers *cached = find_or_create_cache(ctx, rows, inner_dim, out_cols);
     StrixBuffer buffers[3];
-    memset(buffers, 0, sizeof(buffers));
-    int ok = create_buffer(ctx, a_bytes, &buffers[0]) &&
-             create_buffer(ctx, b_bytes, &buffers[1]) &&
-             create_buffer(ctx, c_bytes, &buffers[2]);
-    if (!ok) {
-        goto cleanup;
+    if (cached) {
+        buffers[0] = cached->buffers[0];
+        buffers[1] = cached->buffers[1];
+        buffers[2] = cached->buffers[2];
+    } else {
+        /* Last-resort allocation for an uncacheable shape. */
+        memset(buffers, 0, sizeof(buffers));
+        int ok = create_buffer(ctx, a_count * sizeof(float), &buffers[0]) &&
+                 create_buffer(ctx, b_count * sizeof(float), &buffers[1]) &&
+                 create_buffer(ctx, c_count * sizeof(float), &buffers[2]);
+        if (!ok) {
+            goto cleanup;
+        }
     }
 
     /* Upload A (row-major [rows][inner]) widened to f32. */
     void *mapped = NULL;
-    if (ctx->dev.vkMapMemory(ctx->device, buffers[0].memory, 0, a_bytes, 0, &mapped) != VK_SUCCESS) {
-        ok = 0;
+    if (ctx->dev.vkMapMemory(ctx->device, buffers[0].memory, 0, a_count * sizeof(float), 0, &mapped) != VK_SUCCESS) {
         goto cleanup;
     }
     {
@@ -723,8 +807,7 @@ static int run_matmul(StrixVulkanContext *ctx,
     ctx->dev.vkUnmapMemory(ctx->device, buffers[0].memory);
 
     /* Upload B transposed to [inner][out_cols], which is what comp.spv reads. */
-    if (ctx->dev.vkMapMemory(ctx->device, buffers[1].memory, 0, b_bytes, 0, &mapped) != VK_SUCCESS) {
-        ok = 0;
+    if (ctx->dev.vkMapMemory(ctx->device, buffers[1].memory, 0, b_count * sizeof(float), 0, &mapped) != VK_SUCCESS) {
         goto cleanup;
     }
     {
@@ -738,11 +821,10 @@ static int run_matmul(StrixVulkanContext *ctx,
     }
     ctx->dev.vkUnmapMemory(ctx->device, buffers[1].memory);
 
-    if (ctx->dev.vkMapMemory(ctx->device, buffers[2].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
-        ok = 0;
+    if (ctx->dev.vkMapMemory(ctx->device, buffers[2].memory, 0, c_count * sizeof(float), 0, &mapped) != VK_SUCCESS) {
         goto cleanup;
     }
-    memset(mapped, 0, (size_t)c_bytes);
+    memset(mapped, 0, (size_t)c_count * sizeof(float));
     ctx->dev.vkUnmapMemory(ctx->device, buffers[2].memory);
 
     VkDescriptorBufferInfo infos[3];
@@ -763,7 +845,6 @@ static int run_matmul(StrixVulkanContext *ctx,
     ctx->dev.vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
 
     if (ctx->dev.vkResetCommandBuffer(ctx->command_buffer, 0) != VK_SUCCESS) {
-        ok = 0;
         goto cleanup;
     }
 
@@ -772,7 +853,6 @@ static int run_matmul(StrixVulkanContext *ctx,
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (ctx->dev.vkBeginCommandBuffer(ctx->command_buffer, &begin) != VK_SUCCESS) {
-        ok = 0;
         goto cleanup;
     }
 
@@ -804,12 +884,10 @@ static int run_matmul(StrixVulkanContext *ctx,
                                   0, 1, &barrier, 0, NULL, 0, NULL);
 
     if (ctx->dev.vkEndCommandBuffer(ctx->command_buffer) != VK_SUCCESS) {
-        ok = 0;
         goto cleanup;
     }
 
     if (ctx->dev.vkResetFences(ctx->device, 1, &ctx->fence) != VK_SUCCESS) {
-        ok = 0;
         goto cleanup;
     }
 
@@ -820,22 +898,19 @@ static int run_matmul(StrixVulkanContext *ctx,
     submit.pCommandBuffers = &ctx->command_buffer;
     if (ctx->dev.vkQueueSubmit(ctx->queue, 1, &submit, ctx->fence) != VK_SUCCESS) {
         vk_debugf("vkQueueSubmit failed");
-        ok = 0;
         goto cleanup;
     }
     /* 10 s is generous for any shape this backend accepts; an infinite wait
      * would turn a hung queue into a hung test run. */
     if (ctx->dev.vkWaitForFences(ctx->device, 1, &ctx->fence, VK_TRUE, 10ull * 1000ull * 1000ull * 1000ull) != VK_SUCCESS) {
         vk_debugf("vkWaitForFences timed out or failed");
-        ok = 0;
         goto cleanup;
     }
 
-    if (ctx->dev.vkMapMemory(ctx->device, buffers[2].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
-        ok = 0;
+    if (ctx->dev.vkMapMemory(ctx->device, buffers[2].memory, 0, c_count * sizeof(float), 0, &mapped) != VK_SUCCESS) {
         goto cleanup;
     }
-    memcpy(output, mapped, (size_t)c_bytes);
+    memcpy(output, mapped, (size_t)c_count * sizeof(float));
     ctx->dev.vkUnmapMemory(ctx->device, buffers[2].memory);
 
     if (scales) {
@@ -847,10 +922,13 @@ static int run_matmul(StrixVulkanContext *ctx,
     }
 
 cleanup:
-    for (int i = 0; i < 3; ++i) {
-        destroy_buffer(ctx, &buffers[i]);
+    /* Only destroy buffers we freshly allocated; cached ones are reused. */
+    if (!cached) {
+        for (int i = 0; i < 3; ++i) {
+            destroy_buffer(ctx, &buffers[i]);
+        }
     }
-    return ok;
+    return 1;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
