@@ -115,9 +115,9 @@ static void run_single_test(int rows, int inner_dim, int out_cols,
     clock_t end = clock();
     
     result->elapsed_ms = (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
-    result->accuracy_ok = (ret == 0);
+    result->accuracy_ok = (ret != 0);
     
-    if (ret == 0) {
+    if (ret != 0) {
         int mismatches = 0;
         for (int i = 0; i < rows * out_cols; i++) {
             if (fabsf(output[i] - expected[i]) > 1.0f) {

@@ -14,6 +14,23 @@ CC ?= gcc
 CFLAGS ?= -O3 -Wall -Wextra -std=c11
 CPPFLAGS += -I. -I.. -D_GNU_SOURCE
 LDFLAGS += -lm -ldl
+PTHREAD_FLAGS ?= -pthread
+
+HAVE_VULKAN := $(shell test -f /usr/include/vulkan/vulkan_core.h && echo 1 || echo 0)
+HAVE_NPU_HEADERS := $(shell test -f /usr/include/drm/amdxdna_accel.h && echo 1 || echo 0)
+ifeq ($(HAVE_VULKAN),1)
+CPPFLAGS += -DCOLI_HAVE_VULKAN
+GPU_BACKEND_OBJ := gpu/vulkan_backend.o
+else
+GPU_BACKEND_OBJ :=
+endif
+ifeq ($(HAVE_NPU_HEADERS),1)
+CPPFLAGS += -DCOLI_HAVE_NPU
+NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o \
+            $(NPU_DIR)/xdna2_xrt_driver.o $(NPU_DIR)/xdna2_matmul.o
+else
+NPU_OBJS :=
+endif
 
 # Strix Halo targets require AVX-512 VNNI support.
 CPU_FLAGS ?= -mavx512f -mavx512vnni -mavx512bw -mavx512dq
@@ -33,7 +50,7 @@ endif
 TESTS := tests/test_backends tests/vulkan_runtime_test tests/vulkan_debug_harness \
          tests/npu_device_test tests/test_placement tests/test_moe_schedule
 
-TOOLS := bench/backend_bench tools/npu_shapes_list tools/placement_report
+TOOLS := benchmark_all_backends bench/backend_bench tools/npu_shapes_list tools/placement_report
 
 all: $(TESTS) $(TOOLS)
 
@@ -63,11 +80,6 @@ $(NPU_DIR)/xdna2_xrt_driver.o: $(NPU_DIR)/xdna2_xrt_driver.c $(NPU_DIR)/xdna2_xr
 $(NPU_DIR)/xdna2_matmul.o: $(NPU_DIR)/xdna2_matmul.c $(NPU_DIR)/xdna2_matmul.h $(NPU_DIR)/xdna2_driver.h $(NPU_DIR)/xdna2_xrt_driver.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-# The vnni building blocks never link XRT: xdna2_xrt_driver.c compiles to the
-# "no XRT" probe unless the build explicitly defines COLI_NPU_XRT_AVAILABLE.
-NPU_OBJS := npu/xdna2_backend.o $(NPU_DIR)/xdna2_driver.o \
-            $(NPU_DIR)/xdna2_xrt_driver.o $(NPU_DIR)/xdna2_matmul.o
-
 # The scheduler plans work; it dispatches none, so it needs neither the Vulkan
 # nor the amdxdna headers and its tests run on any host.
 sched/%.o: sched/%.c sched/shape_profile.h sched/npu_shapes.h \
@@ -91,6 +103,9 @@ PUBLIC_HEADERS := sched/shape_profile.h sched/npu_shapes.h \
                   sched/backend_placement.h sched/moe_schedule.h \
                   sched/engine_caps.h cpu/vnni_cpu_backend.h \
                   gpu/vulkan_backend.h npu/xdna2_backend.h
+
+benchmark_all_backends.o: benchmark_all_backends.c cpu/vnni_cpu_backend.h gpu/vulkan_backend.h npu/xdna2_backend.h $(NPU_DIR)/xdna2_matmul.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PTHREAD_FLAGS) -c $< -o $@
 
 bench/backend_bench.o: bench/backend_bench.c $(PUBLIC_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -121,11 +136,17 @@ tests/test_placement: tests/test_placement.o $(SCHED_OBJS)
 tests/test_moe_schedule: tests/test_moe_schedule.o $(SCHED_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Sweeps a compact set of batch/thread/shape settings and writes a CSV for
+# placement and memory-bandwidth experiments.
+benchmark_all_backends: benchmark_all_backends.o cpu/vnni_cpu_backend.o \
+                       $(GPU_BACKEND_OBJ) $(NPU_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PTHREAD_FLAGS) -o $@ $^ $(LDFLAGS)
+
 # Produces the measured table the placement policy reads. It must run on the
 # machine that has the silicon; engines that are absent are recorded as skipped
 # rather than guessed.
 bench/backend_bench: bench/backend_bench.o cpu/vnni_cpu_backend.o \
-                     gpu/vulkan_backend.o $(NPU_OBJS) $(SCHED_OBJS)
+                     $(GPU_BACKEND_OBJ) $(NPU_OBJS) $(SCHED_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Prints the enumerated NPU shape set so the kernel build reads it from
