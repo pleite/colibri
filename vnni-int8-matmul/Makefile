@@ -16,6 +16,8 @@ CPPFLAGS += -I. -I.. -D_GNU_SOURCE
 LDFLAGS += -lm -ldl
 PTHREAD_FLAGS ?= -pthread
 
+NPU_DIR := ../c/npu_kernels
+
 HAVE_VULKAN := $(shell test -f /usr/include/vulkan/vulkan_core.h && echo 1 || echo 0)
 HAVE_NPU_HEADERS := $(shell test -f /usr/include/drm/amdxdna_accel.h && echo 1 || echo 0)
 ifeq ($(HAVE_VULKAN),1)
@@ -36,8 +38,6 @@ endif
 CPU_FLAGS ?= -mavx512f -mavx512vnni -mavx512bw -mavx512dq
 
 GLSLANG ?= glslangValidator
-
-NPU_DIR := ../c/npu_kernels
 
 # DRM_AMDXDNA_QUERY_RESOURCE_INFO landed in the amdxdna UAPI after Linux 6.18.
 # Probe for it instead of assuming it exists; the driver reports the query as

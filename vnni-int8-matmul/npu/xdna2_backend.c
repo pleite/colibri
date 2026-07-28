@@ -139,6 +139,33 @@ int strix_xdna2_matmul(const int8_t *input,
                                     output, scales, NULL);
 }
 
+int strix_xdna2_batch_matmul(const int8_t *input,
+                             int rows,
+                             int inner_dim,
+                             const int8_t *weights,
+                             int out_cols,
+                             float *output,
+                             const float *scales,
+                             int batch_size) {
+    if (!input || !weights || !output || rows <= 0 || inner_dim <= 0 ||
+        out_cols <= 0 || batch_size <= 0) {
+        return 0;
+    }
+    if (!ensure_runtime()) return 0;
+    if (!ensure_kernel_for_shape(rows, inner_dim, out_cols)) {
+        if (g_last_kernel_error == -ENOENT) {
+            fprintf(stderr,
+                    "xdna2 backend: no kernel for shape (%d, %d, %d)\n",
+                    rows, inner_dim, out_cols);
+        } else {
+            fprintf(stderr, "xdna2 backend unavailable: %s\n", g_failure_reason);
+        }
+        return 0;
+    }
+    return xdna2_matmul_int8_batch(&g_runtime, input, weights, scales, output,
+                                   rows, inner_dim, out_cols, batch_size) == 0;
+}
+
 int strix_xdna2_matmul_timed(const int8_t *input,
                              int rows,
                              int inner_dim,
