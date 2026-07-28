@@ -71,6 +71,30 @@ int strix_xdna2_matmul_timed(const int8_t *input,
 const char *strix_xdna2_backend_name(void);
 
 /**
+ * strix_xdna2_batch_matmul — dispatch `batch_size` matmuls in parallel.
+ *
+ * All batch items compute the same shape (rows, inner_dim, out_cols) with the
+ * same `input` and `weights`.  `output` must point to a contiguous buffer of
+ * at least `batch_size * rows * out_cols` f32 values; slice `b` starts at
+ * `output + b * rows * out_cols`.
+ *
+ * On Strix Halo unified memory the input and weight BOs are allocated and
+ * uploaded once; each batch item gets its own output BO.  All commands are
+ * submitted without an intervening wait and a single timeline-syncobj wait
+ * covers the whole batch.
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+int strix_xdna2_batch_matmul(const int8_t *input,
+                             int rows,
+                             int inner_dim,
+                             const int8_t *weights,
+                             int out_cols,
+                             float *output,
+                             const float *scales,
+                             int batch_size);
+
+/**
  * Bytes the NPU can hold resident for one dispatch, or 0 when unknown.
  *
  * This is the size of the client device heap the runtime actually mapped —

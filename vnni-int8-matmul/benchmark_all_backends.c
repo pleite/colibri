@@ -36,11 +36,19 @@ static int benchmark_gpu_stub_matmul(const int8_t *input, int rows, int inner_di
     (void)output; (void)scales;
     return 0;
 }
+static int benchmark_gpu_stub_batch_matmul(const int8_t *input, int rows, int inner_dim,
+                                           const int8_t *weights, int out_cols,
+                                           float *output, const float *scales, int batch_size) {
+    (void)input; (void)rows; (void)inner_dim; (void)weights; (void)out_cols;
+    (void)output; (void)scales; (void)batch_size;
+    return 0;
+}
 static void benchmark_gpu_stub_shutdown(void) {}
 #define strix_vulkan_is_supported benchmark_gpu_stub_is_supported
 #define strix_vulkan_backend_name benchmark_gpu_stub_backend_name
 #define strix_vulkan_failure_reason benchmark_gpu_stub_failure_reason
 #define strix_vulkan_matmul benchmark_gpu_stub_matmul
+#define strix_vulkan_batch_matmul benchmark_gpu_stub_batch_matmul
 #define strix_vulkan_shutdown benchmark_gpu_stub_shutdown
 #endif
 
@@ -57,12 +65,19 @@ static int benchmark_npu_stub_matmul(const int8_t *input, int rows, int inner_di
     (void)input; (void)rows; (void)inner_dim; (void)weights; (void)out_cols;
     (void)output; (void)scales; return 0;
 }
+static int benchmark_npu_stub_batch_matmul(const int8_t *input, int rows, int inner_dim,
+                                           const int8_t *weights, int out_cols,
+                                           float *output, const float *scales, int batch_size) {
+    (void)input; (void)rows; (void)inner_dim; (void)weights; (void)out_cols;
+    (void)output; (void)scales; (void)batch_size; return 0;
+}
 static void benchmark_npu_stub_shutdown(void) {}
 #define strix_xdna2_is_supported benchmark_npu_stub_is_supported
 #define strix_xdna2_backend_name benchmark_npu_stub_backend_name
 #define strix_xdna2_failure_reason benchmark_npu_stub_failure_reason
 #define strix_xdna2_kernel_exists benchmark_npu_stub_kernel_exists
 #define strix_xdna2_matmul benchmark_npu_stub_matmul
+#define strix_xdna2_batch_matmul benchmark_npu_stub_batch_matmul
 #define strix_xdna2_shutdown benchmark_npu_stub_shutdown
 #endif
 
@@ -329,6 +344,71 @@ out:
     return success;
 }
 
+/*
+ * run_gpu_benchmark_batched — GPU benchmark using strix_vulkan_batch_matmul().
+ *
+ * Matrices are pre-allocated once outside the iteration loop (Phase 1 memory
+ * optimisation).  All `batch_size` matmuls share the same input and weight
+ * buffers and are submitted in a single vkQueueSubmit() followed by one
+ * fence wait (Phase 2 command batching).
+ */
+static int run_gpu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed) {
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    float *scales = NULL;
+    float *output = NULL;
+    int success = 0;
+
+    const size_t input_bytes = (size_t)shape->rows * (size_t)shape->inner_dim;
+    const size_t weight_bytes = (size_t)shape->out_cols * (size_t)shape->inner_dim;
+    const size_t output_bytes = (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float);
+    const size_t scale_bytes = (size_t)shape->out_cols * sizeof(float);
+    const size_t bytes_per_call = input_bytes + weight_bytes + output_bytes + scale_bytes;
+
+    /* Preallocate and initialise once — reused across all iters and batch items. */
+    input = (int8_t *)malloc(input_bytes);
+    weights = (int8_t *)malloc(weight_bytes);
+    scales = (float *)malloc(scale_bytes);
+    /* Output holds all batch_size slices contiguously. */
+    output = (float *)malloc((size_t)batch_size * (size_t)shape->rows *
+                             (size_t)shape->out_cols * sizeof(float));
+    if (!input || !weights || !scales || !output) goto out;
+
+    for (size_t i = 0; i < input_bytes; ++i) input[i] = (int8_t)((int)(i * 3 + 1) % 17 - 8);
+    for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (int8_t)((int)(i * 5 + 3) % 13 - 6);
+    for (int i = 0; i < shape->out_cols; ++i) scales[i] = 1.0f / 128.0f;
+    memset(output, 0, (size_t)batch_size * (size_t)shape->rows *
+           (size_t)shape->out_cols * sizeof(float));
+
+    /* Warm-up outside the timed loop. */
+    if (!strix_vulkan_batch_matmul(input, shape->rows, shape->inner_dim, weights,
+                                   shape->out_cols, output, scales, batch_size)) {
+        goto out;
+    }
+
+    uint64_t total_ns = 0;
+    for (int i = 0; i < iters; ++i) {
+        const uint64_t start = now_ns();
+        if (!strix_vulkan_batch_matmul(input, shape->rows, shape->inner_dim, weights,
+                                       shape->out_cols, output, scales, batch_size)) {
+            goto out;
+        }
+        total_ns += now_ns() - start;
+    }
+
+    *elapsed_ms = (double)total_ns / (double)iters / 1000000.0;
+    *bytes_processed = (double)iters * (double)batch_size * (double)bytes_per_call;
+    success = 1;
+
+out:
+    free(input);
+    free(weights);
+    free(scales);
+    free(output);
+    return success;
+}
+
 static int run_npu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
                              double *elapsed_ms, double *bytes_processed) {
     int8_t *input = NULL;
@@ -387,9 +467,80 @@ out:
     return success;
 }
 
+/*
+ * run_npu_benchmark_batched — NPU benchmark using strix_xdna2_batch_matmul().
+ *
+ * Matrices are pre-allocated once outside the iteration loop (Phase 1 memory
+ * optimisation).  All `batch_size` commands share the same input and weight
+ * BOs; they are submitted without an intervening wait and the single timeline-
+ * syncobj wait covers the whole batch (Phase 3 async dispatch).
+ */
+static int run_npu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed) {
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    float *scales = NULL;
+    float *output = NULL;
+    int success = 0;
+
+    const size_t input_bytes = (size_t)shape->rows * (size_t)shape->inner_dim;
+    const size_t weight_bytes = (size_t)shape->out_cols * (size_t)shape->inner_dim;
+    const size_t output_bytes = (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float);
+    const size_t scale_bytes = (size_t)shape->out_cols * sizeof(float);
+    const size_t bytes_per_call = input_bytes + weight_bytes + output_bytes + scale_bytes;
+
+    /* Preallocate and initialise once — reused across all iters. */
+    input = (int8_t *)malloc(input_bytes);
+    weights = (int8_t *)malloc(weight_bytes);
+    scales = (float *)malloc(scale_bytes);
+    /* Output holds all batch_size slices contiguously. */
+    output = (float *)malloc((size_t)batch_size * (size_t)shape->rows *
+                             (size_t)shape->out_cols * sizeof(float));
+    if (!input || !weights || !scales || !output) goto out;
+
+    for (size_t i = 0; i < input_bytes; ++i) input[i] = (int8_t)((int)(i * 3 + 1) % 17 - 8);
+    for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (int8_t)((int)(i * 5 + 3) % 13 - 6);
+    for (int i = 0; i < shape->out_cols; ++i) scales[i] = 1.0f / 128.0f;
+    memset(output, 0, (size_t)batch_size * (size_t)shape->rows *
+           (size_t)shape->out_cols * sizeof(float));
+
+    if (!strix_xdna2_kernel_exists(shape->rows, shape->inner_dim, shape->out_cols,
+                                   XDNA2_FMT_INT8)) {
+        goto out;
+    }
+
+    /* Warm-up outside the timed loop. */
+    if (!strix_xdna2_batch_matmul(input, shape->rows, shape->inner_dim, weights,
+                                  shape->out_cols, output, scales, batch_size)) {
+        goto out;
+    }
+
+    uint64_t total_ns = 0;
+    for (int i = 0; i < iters; ++i) {
+        const uint64_t start = now_ns();
+        if (!strix_xdna2_batch_matmul(input, shape->rows, shape->inner_dim, weights,
+                                      shape->out_cols, output, scales, batch_size)) {
+            goto out;
+        }
+        total_ns += now_ns() - start;
+    }
+
+    *elapsed_ms = (double)total_ns / (double)iters / 1000000.0;
+    *bytes_processed = (double)iters * (double)batch_size * (double)bytes_per_call;
+    success = 1;
+
+out:
+    free(input);
+    free(weights);
+    free(scales);
+    free(output);
+    return success;
+}
+
 static void print_usage(const char *argv0) {
     fprintf(stderr,
-            "Usage: %s [--backend cpu|gpu|npu|all] [--batch N] [--threads N] [--iters N] [--csv FILE]\n",
+            "Usage: %s [--backend cpu|gpu|npu|all] [--batch N] [--threads N] [--iters N]\n"
+            "          [--csv FILE] [--batching-mode serial|batched]\n",
             argv0);
 }
 
@@ -399,6 +550,8 @@ int main(int argc, char **argv) {
     int threads = DEFAULT_THREADS;
     int iters = env_int("COLI_BENCH_ITERS", DEFAULT_ITERS);
     const char *csv_path = "benchmark_results.csv";
+    /* batching_mode: 0 = serial (default, backward compatible), 1 = batched */
+    int batching_mode = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -411,6 +564,17 @@ int main(int argc, char **argv) {
             iters = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
             csv_path = argv[++i];
+        } else if (strcmp(argv[i], "--batching-mode") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "batched") == 0) {
+                batching_mode = 1;
+            } else if (strcmp(mode, "serial") == 0) {
+                batching_mode = 0;
+            } else {
+                fprintf(stderr, "benchmark_all_backends: unknown batching-mode '%s' "
+                        "(use serial or batched)\n", mode);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
             /* Keep the older script's flag compatible; it is an alias for a
              * small iteration count when the user just wants a fast sweep. */
@@ -461,19 +625,30 @@ int main(int argc, char **argv) {
             double bytes_processed = 0.0;
             int success = 0;
 
-            printf("running %s rows=%d inner=%d out=%d batch=%d threads=%d iters=%d\n",
+            printf("running %s rows=%d inner=%d out=%d batch=%d threads=%d iters=%d mode=%s\n",
                    name, shape->rows, shape->inner_dim, shape->out_cols,
-                   batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters);
+                   batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters,
+                   batching_mode ? "batched" : "serial");
 
             if (strcmp(name, "cpu") == 0) {
                 success = run_cpu_benchmark(shape, batch_size, threads, iters,
                                             &elapsed_ms, &bytes_processed);
             } else if (strcmp(name, "gpu") == 0) {
-                success = run_gpu_benchmark(shape, batch_size, iters,
-                                            &elapsed_ms, &bytes_processed);
+                if (batching_mode) {
+                    success = run_gpu_benchmark_batched(shape, batch_size, iters,
+                                                        &elapsed_ms, &bytes_processed);
+                } else {
+                    success = run_gpu_benchmark(shape, batch_size, iters,
+                                                &elapsed_ms, &bytes_processed);
+                }
             } else {
-                success = run_npu_benchmark(shape, batch_size, iters,
-                                            &elapsed_ms, &bytes_processed);
+                if (batching_mode) {
+                    success = run_npu_benchmark_batched(shape, batch_size, iters,
+                                                        &elapsed_ms, &bytes_processed);
+                } else {
+                    success = run_npu_benchmark(shape, batch_size, iters,
+                                                &elapsed_ms, &bytes_processed);
+                }
             }
 
             const double elapsed_s = elapsed_ms / 1000.0;

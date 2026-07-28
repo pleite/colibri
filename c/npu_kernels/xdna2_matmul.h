@@ -208,6 +208,29 @@ int xdna2_matmul_int8_timed(xdna2_runtime_t *runtime,
                             xdna2_matmul_timing_t *timing);
 
 /**
+ * xdna2_matmul_int8_batch — dispatch `batch_size` independent matmuls in
+ * parallel using the NPU's task queue.
+ *
+ * All batch items share the same input `x` and `weights`, each producing a
+ * separate output slice. `y` must point to a contiguous buffer of at least
+ * `batch_size * S * O` f32 values; slice `b` starts at `y + b * S * O`.
+ *
+ * On Strix Halo unified memory, `x` and `weights` BOs are allocated once,
+ * uploaded once, and referenced by all `batch_size` command submissions.
+ * Each command gets its own output BO and command-packet BO. All commands are
+ * submitted without an intervening wait; a single timeline-syncobj wait on
+ * the last sequence number guarantees that all prior submissions have
+ * completed before any output is read back.
+ *
+ * Returns 0 on success, negative on failure.
+ */
+int xdna2_matmul_int8_batch(xdna2_runtime_t *runtime,
+                            const int8_t *x, const int8_t *weights,
+                            const float *scales, float *y,
+                            int S, int I, int O,
+                            int batch_size);
+
+/**
  * xdna2_dequant_i32 — turn the NPU's int32 accumulators into f32 activations.
  *
  * The compiled kernels are int8 x int8 -> int32 (dtype_in=i8, dtype_out=i32 in

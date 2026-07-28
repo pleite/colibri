@@ -639,6 +639,142 @@ out:
     return ret;
 }
 
+int xdna2_matmul_int8_batch(xdna2_runtime_t *runtime,
+                            const int8_t *x, const int8_t *weights,
+                            const float *scales, float *y,
+                            int S, int I, int O,
+                            int batch_size) {
+    if (!runtime || !x || !weights || !y || S <= 0 || I <= 0 || O <= 0 || batch_size <= 0) {
+        return -EINVAL;
+    }
+    if (!runtime->initialized) {
+        fprintf(stderr, "xdna2: runtime is not initialised\n");
+        return -ENODEV;
+    }
+
+    const xdna2_kernel_t *kernel = xdna2_find_kernel(runtime, S, I, O, XDNA2_FMT_INT8);
+    if (!kernel) {
+        fprintf(stderr,
+                "xdna2: no NPU kernel loaded for shape (%d, %d, %d) fmt=int8\n", S, I, O);
+        return -ENOENT;
+    }
+
+    const size_t x_bytes = (size_t)S * (size_t)I;
+    const size_t w_bytes = (size_t)O * (size_t)I;
+    const size_t y_bytes = (size_t)S * (size_t)O * sizeof(float);
+    const uint32_t payload_words =
+        (uint32_t)(sizeof(xdna2_ert_start_npu_payload_t) / sizeof(uint32_t));
+    const size_t cmd_bytes = sizeof(uint32_t) * (2u + payload_words);
+
+    int fd = runtime->device_fd;
+    int ret = -EIO;
+
+    /* Shared input and weight BOs — uploaded once, read by all batch commands. */
+    xdna2_bo_t shared_x, shared_w;
+    memset(&shared_x, 0, sizeof(shared_x));
+    memset(&shared_w, 0, sizeof(shared_w));
+
+    if ((ret = alloc_and_map(fd, &shared_x, x_bytes, AMDXDNA_BO_SHMEM)) < 0) goto cleanup_shared;
+    if ((ret = alloc_and_map(fd, &shared_w, w_bytes, AMDXDNA_BO_SHMEM)) < 0) goto cleanup_shared;
+
+    memcpy(shared_x.mapped, x, x_bytes);
+    memcpy(shared_w.mapped, weights, w_bytes);
+
+    if (xdna2_sync_bo(fd, &shared_x, SYNC_DIRECT_TO_DEVICE, 0, x_bytes) < 0 ||
+        xdna2_sync_bo(fd, &shared_w, SYNC_DIRECT_TO_DEVICE, 0, w_bytes) < 0) {
+        ret = -EIO;
+        goto cleanup_shared;
+    }
+
+    /* Per-batch-item output and command BOs. */
+    xdna2_bo_t *y_bos = (xdna2_bo_t *)calloc((size_t)batch_size, sizeof(xdna2_bo_t));
+    xdna2_bo_t *cmd_bos = (xdna2_bo_t *)calloc((size_t)batch_size, sizeof(xdna2_bo_t));
+    if (!y_bos || !cmd_bos) {
+        ret = -ENOMEM;
+        free(y_bos);
+        free(cmd_bos);
+        goto cleanup_shared;
+    }
+
+    int alloc_count = 0; /* tracks how many y/cmd pairs are allocated */
+    for (int b = 0; b < batch_size; ++b) {
+        if ((ret = alloc_and_map(fd, &y_bos[b], y_bytes, AMDXDNA_BO_SHMEM)) < 0) goto cleanup_bos;
+        if ((ret = alloc_and_map(fd, &cmd_bos[b], cmd_bytes, AMDXDNA_BO_CMD)) < 0) {
+            xdna2_destroy_bo(fd, &y_bos[b]);
+            goto cleanup_bos;
+        }
+        alloc_count = b + 1;
+
+        memset(y_bos[b].mapped, 0, y_bytes);
+        if (xdna2_sync_bo(fd, &y_bos[b], SYNC_DIRECT_TO_DEVICE, 0, y_bytes) < 0) {
+            ret = -EIO;
+            goto cleanup_bos;
+        }
+
+        ert_packet_t *pkt = (ert_packet_t *)cmd_bos[b].mapped;
+        memset(pkt, 0, cmd_bytes);
+        pkt->header = ert_make_header(kernel->ert_opcode, payload_words + 1u);
+        pkt->cu_mask = kernel->cu_mask;
+
+        xdna2_ert_start_npu_payload_t *payload = (xdna2_ert_start_npu_payload_t *)pkt->data;
+        payload->npu.instruction_buffer      = kernel->instr_bo.xdna_addr;
+        payload->npu.instruction_buffer_size = (uint32_t)kernel->instr_bo.size;
+        payload->npu.instruction_prop_count  = 0;
+        payload->args.x = shared_x.xdna_addr;
+        payload->args.w = shared_w.xdna_addr;
+        payload->args.y = y_bos[b].xdna_addr;
+        payload->args.I = (uint32_t)I;
+        payload->args.O = (uint32_t)O;
+    }
+
+    /*
+     * Submit all batch commands without waiting between them.
+     * The NPU hardware context queues up to 32 tasks; they are dispatched
+     * to the AIE array as prior ones complete, achieving true overlap.
+     *
+     * Each submission increments ctx->last_seq.  The timeline syncobj
+     * advances monotonically, so waiting on the last sequence number
+     * guarantees that all earlier submissions have also completed.
+     */
+    for (int b = 0; b < batch_size; ++b) {
+        uint32_t arg_handles[3] = { shared_x.handle, shared_w.handle, y_bos[b].handle };
+        if (xdna2_submit_command(fd, &runtime->hwctx, cmd_bos[b].handle, arg_handles, 3) < 0) {
+            ret = -EIO;
+            goto cleanup_bos;
+        }
+    }
+
+    /* Single wait for the last (highest) sequence number. */
+    if (xdna2_wait_command(fd, &runtime->hwctx, runtime->timeout_ms) < 0) {
+        ret = -ETIMEDOUT;
+        goto cleanup_bos;
+    }
+
+    /* Read back and dequantize all outputs. */
+    for (int b = 0; b < batch_size; ++b) {
+        if (xdna2_sync_bo(fd, &y_bos[b], SYNC_DIRECT_FROM_DEVICE, 0, y_bytes) < 0) {
+            ret = -EIO;
+            goto cleanup_bos;
+        }
+        float *dst = y + (size_t)b * (size_t)S * (size_t)O;
+        xdna2_dequant_i32((const int32_t *)y_bos[b].mapped, dst, S, O, scales);
+    }
+    ret = 0;
+
+cleanup_bos:
+    for (int b = 0; b < alloc_count; ++b) {
+        xdna2_destroy_bo(fd, &cmd_bos[b]);
+        xdna2_destroy_bo(fd, &y_bos[b]);
+    }
+    free(cmd_bos);
+    free(y_bos);
+
+cleanup_shared:
+    xdna2_destroy_bo(fd, &shared_w);
+    xdna2_destroy_bo(fd, &shared_x);
+    return ret;
+}
+
 void xdna2_dequant_i32(const int32_t *acc, float *out, int S, int O,
                        const float *scales) {
     if (!acc || !out || S <= 0 || O <= 0) return;
