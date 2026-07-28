@@ -682,6 +682,31 @@ int xdna2_unmap_bo(xdna2_bo_t *bo) {
     return 0;
 }
 
+static int xdna2_sync_bo_fallback_cpu_cache(xdna2_bo_t *bo,
+                                            uint64_t offset,
+                                            uint64_t size) {
+    if (!bo || !bo->mapped || size == 0 || offset > bo->size ||
+        size > bo->size - offset) {
+        errno = EINVAL;
+        return -1;
+    }
+
+#if defined(__x86_64__) || defined(__i386__)
+    const uintptr_t line = 64u;
+    uintptr_t begin = (uintptr_t)bo->mapped + (uintptr_t)offset;
+    uintptr_t end = begin + (uintptr_t)size;
+    uintptr_t p = begin & ~(line - 1u);
+    for (; p < end; p += line) {
+        __builtin_ia32_clflush((const void *)p);
+    }
+    __sync_synchronize();
+    return 0;
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
                   uint64_t offset, uint64_t size) {
     if (!bo) return -1;
@@ -697,26 +722,30 @@ int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
         ret = ioctl(fd, DRM_IOCTL_AMDXDNA_SYNC_BO, &sync);
     } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
     if (ret < 0) {
+        const int ioctl_errno = errno;
         const bool valid_direction =
             (direction == SYNC_DIRECT_TO_DEVICE ||
              direction == SYNC_DIRECT_FROM_DEVICE);
         const bool valid_range =
             (size > 0 && offset <= bo->size && size <= bo->size - offset);
-        if ((errno == ENOTTY || errno == EOPNOTSUPP ||
-             (errno == EINVAL && valid_direction && valid_range))) {
+        if ((ioctl_errno == ENOTTY || ioctl_errno == EOPNOTSUPP ||
+             ioctl_errno == EINVAL) &&
+            valid_direction && valid_range &&
+            xdna2_sync_bo_fallback_cpu_cache(bo, offset, size) == 0) {
             static bool printed = false;
             if (!printed) {
                 printed = true;
                 fprintf(stderr,
-                        "xdna2: DRM_IOCTL_AMDXDNA_SYNC_BO is unavailable on this "
-                        "kernel/UAPI path (errno=%d: %s); continuing without "
-                        "explicit BO cache sync\n",
-                        errno, strerror(errno));
+                        "xdna2: DRM_IOCTL_AMDXDNA_SYNC_BO failed (errno=%d: %s); "
+                        "using userspace CPU cache flush fallback\n",
+                        ioctl_errno, strerror(ioctl_errno));
             }
             return 0;
         }
         fprintf(stderr, "xdna2: ioctl 0x%lx failed: %s\n",
-                (unsigned long)DRM_IOCTL_AMDXDNA_SYNC_BO, strerror(errno));
+                (unsigned long)DRM_IOCTL_AMDXDNA_SYNC_BO,
+                strerror(ioctl_errno));
+        errno = ioctl_errno;
         return -1;
     }
     return 0;
