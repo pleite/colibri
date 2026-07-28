@@ -30,6 +30,12 @@
 
 #include "vulkan_dispatch.h"
 
+/* Forward declarations for functions called before they are defined. */
+static int select_host_memory_type(StrixVulkanContext *ctx, uint32_t type_bits, uint32_t *out_index);
+static void destroy_buffer(StrixVulkanContext *ctx, StrixBuffer *b);
+static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, StrixBuffer *b);
+
+
 /* Push constant block consumed by gpu/comp.spv (3 x uint32 at offsets 0/4/8). */
 typedef struct {
     uint32_t rows;
