@@ -875,6 +875,277 @@ int strix_vulkan_matmul(const int8_t *input,
     return run_matmul(&g_ctx, input, rows, inner_dim, weights, out_cols, output, scales);
 }
 
+/* Maximum batch size supported by strix_vulkan_batch_matmul(). */
+#define STRIX_VULKAN_MAX_BATCH 32
+
+/*
+ * run_batch_matmul — submit `batch_size` identical compute dispatches with a
+ * single vkQueueSubmit() and one fence wait.
+ *
+ * All batch items share the same A (input) and B (weights) VkBuffers; each
+ * has its own C (output) VkBuffer.  A temporary VkDescriptorPool large enough
+ * for `batch_size` sets is created, used, and destroyed per call.  Command
+ * buffers are allocated from the existing pool (which has
+ * VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) and freed on exit.
+ */
+static int run_batch_matmul(StrixVulkanContext *ctx,
+                            const int8_t *input, int rows, int inner_dim,
+                            const int8_t *weights, int out_cols,
+                            float *output, const float *scales,
+                            int batch_size) {
+    const size_t a_count = (size_t)rows * (size_t)inner_dim;
+    const size_t b_count = (size_t)inner_dim * (size_t)out_cols;
+    const size_t c_count = (size_t)rows * (size_t)out_cols;
+    const VkDeviceSize a_bytes = (VkDeviceSize)(a_count * sizeof(float));
+    const VkDeviceSize b_bytes = (VkDeviceSize)(b_count * sizeof(float));
+    const VkDeviceSize c_bytes = (VkDeviceSize)(c_count * sizeof(float));
+    int ok = 0;
+    void *mapped = NULL;
+
+    /* Shared A and B buffers (input and weights), uploaded once. */
+    StrixBuffer buf_a, buf_b;
+    memset(&buf_a, 0, sizeof(buf_a));
+    memset(&buf_b, 0, sizeof(buf_b));
+    if (!create_buffer(ctx, a_bytes, &buf_a) ||
+        !create_buffer(ctx, b_bytes, &buf_b)) {
+        goto cleanup_ab;
+    }
+
+    if (ctx->dev.vkMapMemory(ctx->device, buf_a.memory, 0, a_bytes, 0, &mapped) != VK_SUCCESS) {
+        goto cleanup_ab;
+    }
+    {
+        float *dst = (float *)mapped;
+        for (size_t i = 0; i < a_count; ++i) dst[i] = (float)input[i];
+    }
+    ctx->dev.vkUnmapMemory(ctx->device, buf_a.memory);
+
+    if (ctx->dev.vkMapMemory(ctx->device, buf_b.memory, 0, b_bytes, 0, &mapped) != VK_SUCCESS) {
+        goto cleanup_ab;
+    }
+    {
+        float *dst = (float *)mapped;
+        for (int o = 0; o < out_cols; ++o)
+            for (int i = 0; i < inner_dim; ++i)
+                dst[(size_t)i * (size_t)out_cols + (size_t)o] =
+                    (float)weights[(size_t)o * (size_t)inner_dim + (size_t)i];
+    }
+    ctx->dev.vkUnmapMemory(ctx->device, buf_b.memory);
+
+    /* Per-batch-item C buffers. */
+    StrixBuffer *c_bufs = (StrixBuffer *)calloc((size_t)batch_size, sizeof(StrixBuffer));
+    if (!c_bufs) goto cleanup_ab;
+
+    int c_count_alloc = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (!create_buffer(ctx, c_bytes, &c_bufs[b])) goto cleanup_c;
+        c_count_alloc = b + 1;
+        if (ctx->dev.vkMapMemory(ctx->device, c_bufs[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
+            goto cleanup_c;
+        }
+        memset(mapped, 0, (size_t)c_bytes);
+        ctx->dev.vkUnmapMemory(ctx->device, c_bufs[b].memory);
+    }
+
+    /* Temporary descriptor pool large enough for `batch_size` sets. */
+    VkDescriptorPoolSize pool_size;
+    memset(&pool_size, 0, sizeof(pool_size));
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = 3u * (uint32_t)batch_size;
+    VkDescriptorPoolCreateInfo desc_pool_info;
+    memset(&desc_pool_info, 0, sizeof(desc_pool_info));
+    desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    desc_pool_info.maxSets = (uint32_t)batch_size;
+    desc_pool_info.poolSizeCount = 1;
+    desc_pool_info.pPoolSizes = &pool_size;
+    VkDescriptorPool temp_pool = VK_NULL_HANDLE;
+    if (ctx->dev.vkCreateDescriptorPool(ctx->device, &desc_pool_info, NULL, &temp_pool) != VK_SUCCESS) {
+        goto cleanup_c;
+    }
+
+    VkDescriptorSetLayout *layouts = (VkDescriptorSetLayout *)calloc(
+        (size_t)batch_size, sizeof(VkDescriptorSetLayout));
+    VkDescriptorSet *desc_sets = (VkDescriptorSet *)calloc(
+        (size_t)batch_size, sizeof(VkDescriptorSet));
+    if (!layouts || !desc_sets) {
+        free(layouts);
+        free(desc_sets);
+        goto cleanup_pool;
+    }
+    for (int b = 0; b < batch_size; ++b) layouts[b] = ctx->descriptor_layout;
+
+    VkDescriptorSetAllocateInfo set_alloc;
+    memset(&set_alloc, 0, sizeof(set_alloc));
+    set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_alloc.descriptorPool = temp_pool;
+    set_alloc.descriptorSetCount = (uint32_t)batch_size;
+    set_alloc.pSetLayouts = layouts;
+    if (ctx->dev.vkAllocateDescriptorSets(ctx->device, &set_alloc, desc_sets) != VK_SUCCESS) {
+        free(layouts);
+        free(desc_sets);
+        goto cleanup_pool;
+    }
+    free(layouts);
+    layouts = NULL;
+
+    for (int b = 0; b < batch_size; ++b) {
+        VkDescriptorBufferInfo buf_infos[3];
+        memset(buf_infos, 0, sizeof(buf_infos));
+        buf_infos[0].buffer = buf_a.buffer; buf_infos[0].offset = 0; buf_infos[0].range = a_bytes;
+        buf_infos[1].buffer = buf_b.buffer; buf_infos[1].offset = 0; buf_infos[1].range = b_bytes;
+        buf_infos[2].buffer = c_bufs[b].buffer; buf_infos[2].offset = 0; buf_infos[2].range = c_bytes;
+        VkWriteDescriptorSet writes[3];
+        memset(writes, 0, sizeof(writes));
+        for (uint32_t i = 0; i < 3; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_sets[b];
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buf_infos[i];
+        }
+        ctx->dev.vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
+    }
+
+    /* Allocate N command buffers from the existing (resettable) pool. */
+    VkCommandBuffer *cmd_bufs = (VkCommandBuffer *)calloc(
+        (size_t)batch_size, sizeof(VkCommandBuffer));
+    if (!cmd_bufs) {
+        free(desc_sets);
+        goto cleanup_pool;
+    }
+    VkCommandBufferAllocateInfo cmd_alloc;
+    memset(&cmd_alloc, 0, sizeof(cmd_alloc));
+    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool = ctx->command_pool;
+    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = (uint32_t)batch_size;
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, cmd_bufs) != VK_SUCCESS) {
+        free(cmd_bufs);
+        free(desc_sets);
+        goto cleanup_pool;
+    }
+
+    const uint32_t group_x = ((uint32_t)out_cols + 15u) / 16u;
+    const uint32_t group_y = ((uint32_t)rows + 15u) / 16u;
+    StrixPushConstants push;
+    push.rows  = (uint32_t)rows;
+    push.cols  = (uint32_t)out_cols;
+    push.inner = (uint32_t)inner_dim;
+
+    VkMemoryBarrier barrier;
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+
+    int record_ok = 1;
+    for (int b = 0; b < batch_size; ++b) {
+        VkCommandBufferBeginInfo begin;
+        memset(&begin, 0, sizeof(begin));
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (ctx->dev.vkBeginCommandBuffer(cmd_bufs[b], &begin) != VK_SUCCESS) {
+            record_ok = 0; break;
+        }
+        ctx->dev.vkCmdBindPipeline(cmd_bufs[b], VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
+        ctx->dev.vkCmdBindDescriptorSets(cmd_bufs[b], VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         ctx->pipeline_layout, 0, 1, &desc_sets[b], 0, NULL);
+        ctx->dev.vkCmdPushConstants(cmd_bufs[b], ctx->pipeline_layout,
+                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        ctx->dev.vkCmdDispatch(cmd_bufs[b], group_x, group_y, 1);
+        ctx->dev.vkCmdPipelineBarrier(cmd_bufs[b],
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      VK_PIPELINE_STAGE_HOST_BIT,
+                                      0, 1, &barrier, 0, NULL, 0, NULL);
+        if (ctx->dev.vkEndCommandBuffer(cmd_bufs[b]) != VK_SUCCESS) {
+            record_ok = 0; break;
+        }
+    }
+
+    if (!record_ok) goto cleanup_cmds;
+
+    /* Single vkQueueSubmit() for the entire batch. */
+    VkSubmitInfo *submits = (VkSubmitInfo *)calloc((size_t)batch_size, sizeof(VkSubmitInfo));
+    if (!submits) goto cleanup_cmds;
+    for (int b = 0; b < batch_size; ++b) {
+        submits[b].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submits[b].commandBufferCount = 1;
+        submits[b].pCommandBuffers = &cmd_bufs[b];
+    }
+    if (ctx->dev.vkResetFences(ctx->device, 1, &ctx->fence) != VK_SUCCESS) {
+        free(submits);
+        goto cleanup_cmds;
+    }
+    VkResult submit_res = ctx->dev.vkQueueSubmit(ctx->queue, (uint32_t)batch_size,
+                                                  submits, ctx->fence);
+    free(submits);
+    if (submit_res != VK_SUCCESS) {
+        vk_debugf("vkQueueSubmit (batch %d) failed", batch_size);
+        goto cleanup_cmds;
+    }
+
+    /* One fence wait covers all submitted command buffers. */
+    if (ctx->dev.vkWaitForFences(ctx->device, 1, &ctx->fence, VK_TRUE,
+                                  10ull * 1000ull * 1000ull * 1000ull) != VK_SUCCESS) {
+        vk_debugf("vkWaitForFences (batch %d) timed out or failed", batch_size);
+        goto cleanup_cmds;
+    }
+
+    /* Read back and (optionally) scale all outputs. */
+    ok = 1;
+    for (int b = 0; b < batch_size; ++b) {
+        if (ctx->dev.vkMapMemory(ctx->device, c_bufs[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
+            ok = 0;
+            break;
+        }
+        float *dst = output + (size_t)b * c_count;
+        memcpy(dst, mapped, (size_t)c_bytes);
+        ctx->dev.vkUnmapMemory(ctx->device, c_bufs[b].memory);
+        if (scales) {
+            for (int r = 0; r < rows; ++r)
+                for (int o = 0; o < out_cols; ++o)
+                    dst[(size_t)r * (size_t)out_cols + (size_t)o] *= scales[o];
+        }
+    }
+
+cleanup_cmds:
+    ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool,
+                                   (uint32_t)batch_size, cmd_bufs);
+    free(cmd_bufs);
+    free(desc_sets);
+cleanup_pool:
+    if (temp_pool != VK_NULL_HANDLE)
+        ctx->dev.vkDestroyDescriptorPool(ctx->device, temp_pool, NULL);
+cleanup_c:
+    for (int b = 0; b < c_count_alloc; ++b) destroy_buffer(ctx, &c_bufs[b]);
+    free(c_bufs);
+cleanup_ab:
+    destroy_buffer(ctx, &buf_b);
+    destroy_buffer(ctx, &buf_a);
+    return ok;
+}
+
+int strix_vulkan_batch_matmul(const int8_t *input,
+                              int rows,
+                              int inner_dim,
+                              const int8_t *weights,
+                              int out_cols,
+                              float *output,
+                              const float *scales,
+                              int batch_size) {
+    if (!input || !weights || !output || rows <= 0 || inner_dim <= 0 || out_cols <= 0) {
+        return 0;
+    }
+    if (batch_size <= 0 || batch_size > STRIX_VULKAN_MAX_BATCH) {
+        vk_debugf("batch_size %d out of range [1, %d]", batch_size, STRIX_VULKAN_MAX_BATCH);
+        return 0;
+    }
+    if (!ensure_context()) return 0;
+    return run_batch_matmul(&g_ctx, input, rows, inner_dim, weights, out_cols,
+                            output, scales, batch_size);
+}
+
 const char *strix_vulkan_backend_name(void) {
     return ensure_context() ? "vulkan-compute-strix-halo" : "vulkan-unavailable";
 }

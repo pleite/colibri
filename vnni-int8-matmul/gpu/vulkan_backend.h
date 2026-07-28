@@ -32,6 +32,30 @@ int strix_vulkan_matmul(const int8_t *input,
                         float *output,
                         const float *scales);
 
+/**
+ * Batched variant: records `batch_size` independent command buffers for the
+ * same (input, weights) operands, submits them all with a single
+ * vkQueueSubmit(), and waits for one fence.
+ *
+ * `output` must point to a contiguous buffer of at least
+ * `batch_size * rows * out_cols` f32 values; slice `b` starts at
+ * `output + b * rows * out_cols`.
+ *
+ * Because Strix Halo has unified memory, no staging copy is needed: the
+ * HOST_VISIBLE|DEVICE_LOCAL path is used throughout, and the GPU reads
+ * from the same physical pages the CPU wrote.
+ *
+ * Returns 1 on success, 0 on failure. Never falls back to the CPU.
+ */
+int strix_vulkan_batch_matmul(const int8_t *input,
+                              int rows,
+                              int inner_dim,
+                              const int8_t *weights,
+                              int out_cols,
+                              float *output,
+                              const float *scales,
+                              int batch_size);
+
 /** "vulkan-compute-strix-halo" when usable, "vulkan-unavailable" otherwise. */
 const char *strix_vulkan_backend_name(void);
 
