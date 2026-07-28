@@ -37,6 +37,14 @@ typedef struct {
     uint32_t inner;
 } StrixPushConstants;
 
+/* ── Buffers ─────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    VkBuffer       buffer;
+    VkDeviceMemory memory;
+    VkDeviceSize   size;
+} StrixBuffer;
+
 /* Per-shape cached buffers so we do not re-allocate on every dispatch. */
 typedef struct {
     int32_t                      rows;
@@ -653,12 +661,6 @@ static int ensure_context(void) {
 }
 
 /* ── Buffers ─────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    VkBuffer       buffer;
-    VkDeviceMemory memory;
-    VkDeviceSize   size;
-} StrixBuffer;
 
 static void destroy_buffer(StrixVulkanContext *ctx, StrixBuffer *b) {
     if (b->buffer) ctx->dev.vkDestroyBuffer(ctx->device, b->buffer, NULL);
