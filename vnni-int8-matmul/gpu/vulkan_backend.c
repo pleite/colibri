@@ -68,9 +68,7 @@ typedef struct {
     uint32_t                     memory_type_index_host;
     VkCommandPool                command_pool;
     VkCommandBuffer              command_buffer;
-    VkCommandBuffer              command_buffers[STRIX_VULKAN_MAX_BATCH];
     VkDescriptorSetLayout        descriptor_layout;
-    VkDescriptorPool             descriptor_pool;
     VkDescriptorSet              descriptor_set;
     VkShaderModule               shader_module;
     VkPipelineLayout             pipeline_layout;
