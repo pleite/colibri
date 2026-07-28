@@ -14,8 +14,10 @@ an explicit CSV output for the knobs that matter when tuning this machine:
 The output format is:
 
 ```csv
-backend,rows,inner_dim,out_cols,batch_size,threads,iters,elapsed_ms,success,bytes_processed,estimated_gib_s
+backend,rows,inner_dim,out_cols,batch_size,threads,iters,elapsed_ms,success,bytes_processed,estimated_gib_s,mode,active_backends
 ```
+
+`mode` is either `serial`, `batched`, or `concurrent`; `active_backends` records the backends participating in a concurrent run.
 
 ## Build
 
@@ -42,6 +44,12 @@ For a more useful placement experiment, sweep the batch and thread knobs:
 ./benchmark_all_backends --backend cpu --batch 1 --threads 1 --iters 5 --csv cpu_batch1.csv
 ./benchmark_all_backends --backend cpu --batch 4 --threads 1 --iters 5 --csv cpu_batch4.csv
 ./benchmark_all_backends --backend cpu --batch 8 --threads 4 --iters 5 --csv cpu_batch8_threads4.csv
+```
+
+To measure how the CPU, GPU, and NPU paths overlap when they run together, use the new concurrent mode:
+
+```bash
+./benchmark_all_backends --backend all --batch 4 --threads 4 --iters 3 --concurrent --csv mixed_benchmark.csv
 ```
 
 The wrapper script provides the same flow in one command:
