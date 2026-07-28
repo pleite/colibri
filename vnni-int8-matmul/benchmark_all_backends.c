@@ -1,537 +1,497 @@
 /*
- * benchmark_all_backends.c — Comprehensive multi-backend benchmark suite
- * 
- * Tests CPU, GPU, and NPU backends in all combinations:
- * - Single backend: CPU, GPU, NPU
- * - Two backends: CPU+GPU, CPU+NPU, GPU+NPU
- * - All three: CPU+GPU+NPU
- * 
- * Core counts: 1 to limit (CPU:32, GPU:CUs, NPU:16 tiles)
- * Workload: 15 model shapes × all tensor types
- * Duration: Configurable (default 30s per config)
- * 
- * Output: CSV log + real-time progress + thermal monitoring
+ * benchmark_all_backends.c — measure backend execution for placement and
+ * batching experiments on Strix Halo.
+ *
+ * The tool exercises the actual CPU/Vulkan/NPU backends with a small sweep of:
+ *   - batch size (how many matmuls are issued per measurement window)
+ *   - thread count (CPU worker count for the batch loop)
+ *   - matrix shape (the same shapes used by the placement policy benchmark)
+ *
+ * Each row records the elapsed time for a measured batch plus an estimate of the
+ * memory traffic that the batch would imply, so the resulting CSV can answer
+ * "where should this tensor live?" and "what batching/threading point is worth
+ * it?" on the device that is being tuned.
  */
 
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <time.h>
-#include <math.h>
-#include <pthread.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <errno.h>
 
 #include "cpu/vnni_cpu_backend.h"
 #include "gpu/vulkan_backend.h"
 #include "npu/xdna2_backend.h"
-#include "sched/backend_placement.h"
-#include "sched/moe_schedule.h"
+#include "c/npu_kernels/xdna2_matmul.h"
 
-/* ── Configuration ──────────────────────────────────────────────────────── */
+#ifndef COLI_HAVE_VULKAN
+static int benchmark_gpu_stub_is_supported(void) { return 0; }
+static const char *benchmark_gpu_stub_backend_name(void) { return "vulkan-unavailable"; }
+static const char *benchmark_gpu_stub_failure_reason(void) { return "vulkan headers not available"; }
+static int benchmark_gpu_stub_matmul(const int8_t *input, int rows, int inner_dim,
+                                     const int8_t *weights, int out_cols,
+                                     float *output, const float *scales) {
+    (void)input; (void)rows; (void)inner_dim; (void)weights; (void)out_cols;
+    (void)output; (void)scales;
+    return 0;
+}
+static void benchmark_gpu_stub_shutdown(void) {}
+#define strix_vulkan_is_supported benchmark_gpu_stub_is_supported
+#define strix_vulkan_backend_name benchmark_gpu_stub_backend_name
+#define strix_vulkan_failure_reason benchmark_gpu_stub_failure_reason
+#define strix_vulkan_matmul benchmark_gpu_stub_matmul
+#define strix_vulkan_shutdown benchmark_gpu_stub_shutdown
+#endif
 
-#define MAX_BACKENDS 3
-#define MAX_CORES 64
-#define MAX_SHAPES 100
-#define MAX_TESTS 10000
+#ifndef COLI_HAVE_NPU
+static int benchmark_npu_stub_is_supported(void) { return 0; }
+static const char *benchmark_npu_stub_backend_name(void) { return "xdna2-unavailable"; }
+static const char *benchmark_npu_stub_failure_reason(void) { return "amdxdna UAPI headers not available"; }
+static int benchmark_npu_stub_kernel_exists(int rows, int inner_dim, int out_cols, int fmt) {
+    (void)rows; (void)inner_dim; (void)out_cols; (void)fmt; return 0;
+}
+static int benchmark_npu_stub_matmul(const int8_t *input, int rows, int inner_dim,
+                                     const int8_t *weights, int out_cols,
+                                     float *output, const float *scales) {
+    (void)input; (void)rows; (void)inner_dim; (void)weights; (void)out_cols;
+    (void)output; (void)scales; return 0;
+}
+static void benchmark_npu_stub_shutdown(void) {}
+#define strix_xdna2_is_supported benchmark_npu_stub_is_supported
+#define strix_xdna2_backend_name benchmark_npu_stub_backend_name
+#define strix_xdna2_failure_reason benchmark_npu_stub_failure_reason
+#define strix_xdna2_kernel_exists benchmark_npu_stub_kernel_exists
+#define strix_xdna2_matmul benchmark_npu_stub_matmul
+#define strix_xdna2_shutdown benchmark_npu_stub_shutdown
+#endif
 
-/* Test duration in seconds */
-#define DEFAULT_DURATION_S 30
-#define STRESS_DURATION_S 120
-#define THERMAL_DURATION_S 300
-
-/* Thermal monitoring interval in seconds */
-#define THERMAL_INTERVAL_S 1
-
-/* ── Data Structures ────────────────────────────────────────────────────── */
-
-typedef enum {
-    BACKEND_CPU = 0,
-    BACKEND_GPU = 1,
-    BACKEND_NPU = 2,
-    BACKEND_COUNT = 3
-} backend_t;
-
-typedef struct {
-    const char *name;
-    int cores;
-    int max_cores;
-} backend_config_t;
+#define DEFAULT_ITERS 5
+#define DEFAULT_BATCH 1
+#define DEFAULT_THREADS 1
 
 typedef struct {
     int rows;
     int inner_dim;
     int out_cols;
-    const char *model_type;
-    const char *tensor_type;
 } workload_shape_t;
 
 typedef struct {
-    backend_t backends[MAX_BACKENDS];
-    int backend_count;
-    int cores[MAX_BACKENDS];
-    int duration_s;
-    int test_id;
-    
-    /* Results */
-    double elapsed_ms;
+    int thread_id;
+    int thread_count;
+    int batch_size;
+    int rows;
+    int inner_dim;
+    int out_cols;
+    const int8_t *input;
+    const int8_t *weights;
+    const float *scales;
+    float *output;
     int success;
-    int errors;
-    
-    /* Thermal data */
-    double cpu_temp_avg;
-    double gpu_temp_avg;
-    double max_cpu_temp;
-    double max_gpu_temp;
-    int thermal_throttled;
-} test_config_t;
+} cpu_worker_args_t;
 
 typedef struct {
-    int test_id;
-    backend_t backends[MAX_BACKENDS];
-    int backend_count;
-    int cores[MAX_BACKENDS];
-    workload_shape_t shape;
-    double elapsed_ms;
-    int success;
-    double cpu_temp_avg;
-    double gpu_temp_avg;
-    double max_cpu_temp;
-    double max_gpu_temp;
-} test_result_t;
+    const char *name;
+    int (*is_supported)(void);
+    const char *(*backend_name)(void);
+    const char *(*failure_reason)(void);
+} backend_entry_t;
 
-/* ── Global State ───────────────────────────────────────────────────────── */
-
-static volatile int g_running = 1;
-static FILE *g_csv_log = NULL;
-static FILE *g_thermal_log = NULL;
-static test_result_t g_results[MAX_TESTS];
-static int g_result_count = 0;
-
-/* ── Workload Definitions ──────────────────────────────────────────────── */
-
-static workload_shape_t g_workloads[] = {
-    /* NPU shapes (10) */
-    {256, 4096, 1024, "expert", "gate_proj"},
-    {256, 1024, 4096, "expert", "down_proj"},
-    {256, 4096, 16384, "attention", "q_proj"},
-    {256, 4096, 512, "attention", "k_proj"},
-    {256, 8192, 4096, "attention", "o_proj"},
-    {32, 4096, 1024, "expert", "gate_proj"},
-    {32, 1024, 4096, "expert", "down_proj"},
-    {32, 4096, 16384, "attention", "q_proj"},
-    {32, 4096, 512, "attention", "k_proj"},
-    {32, 8192, 4096, "attention", "o_proj"},
-    
-    /* CPU/GPU equivalents (5 more for variety) */
-    {512, 2048, 1024, "dense", "linear"},
-    {1024, 4096, 2048, "dense", "linear"},
-    {256, 8192, 4096, "attention", "v_proj"},
-    {128, 1024, 512, "norm", "layer_norm"},
-    {64, 512, 256, "embed", "embedding"}
+static const workload_shape_t g_shapes[] = {
+    {256, 4096, 1024},
+    {256, 1024, 4096},
+    {256, 4096, 16384},
+    {256, 4096, 512},
+    {256, 8192, 4096},
+    {32, 4096, 1024},
+    {32, 1024, 4096},
+    {32, 4096, 16384},
+    {32, 4096, 512},
+    {32, 8192, 4096},
+    {1, 4096, 1024},
+    {1, 1024, 4096},
+    {1, 4096, 512},
+    {8, 4096, 1024},
+    {64, 4096, 1024},
 };
 
-static int g_workload_count = sizeof(g_workloads) / sizeof(g_workloads[0]);
+static const size_t g_shape_count = sizeof(g_shapes) / sizeof(g_shapes[0]);
 
-/* ── Backend Configuration ─────────────────────────────────────────────── */
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
 
-static backend_config_t g_backend_configs[] = {
-    {"CPU", 32, 32},
-    {"GPU", 60, 60},  /* Radeon 8060S has ~60 CUs */
-    {"NPU", 16, 16}
-};
-
-/* ── Thermal Monitoring ────────────────────────────────────────────────── */
-
-static double read_cpu_temperature(void) {
-    FILE *f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (!f) return -1.0;
-    
-    double temp = -1.0;
-    int raw;
-    if (fscanf(f, "%d", &raw) == 1) {
-        temp = raw / 1000.0;
+static int env_int(const char *name, int fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || !end || end == value || *end != '\0' || parsed <= 0) {
+        return fallback;
     }
-    fclose(f);
-    return temp;
+    return (int)parsed;
 }
 
-static double read_gpu_temperature(void) {
-    /* Try rocm-smi first */
-    FILE *p = popen("rocm-smi --showtemp --json 2>/dev/null", "r");
-    if (!p) return -1.0;
-    
-    double temp = -1.0;
-    char line[256];
-    while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "\"temp":')) {
-            char *colon = strchr(line, ':');
-            if (colon) {
-                temp = atof(colon + 1);
-                break;
-            }
-        }
-    }
-    pclose(p);
-    return temp;
+static int parse_backend(const char *value) {
+    if (!value || !*value) return -1;
+    if (strcmp(value, "cpu") == 0) return 0;
+    if (strcmp(value, "gpu") == 0) return 1;
+    if (strcmp(value, "npu") == 0) return 2;
+    if (strcmp(value, "all") == 0) return 3;
+    return -1;
 }
 
-static void monitor_thermal(test_config_t *config, double *cpu_temp_avg, 
-                           double *gpu_temp_avg, double *max_cpu_temp, 
-                           double *max_gpu_temp, int *throttled) {
-    *cpu_temp_avg = 0.0;
-    *gpu_temp_avg = 0.0;
-    *max_cpu_temp = 0.0;
-    *max_gpu_temp = 0.0;
-    *throttled = 0;
-    
-    double cpu_sum = 0.0, gpu_sum = 0.0;
-    int cpu_count = 0, gpu_count = 0;
-    
-    time_t start = time(NULL);
-    time_t end = start + config->duration_s;
-    
-    while (time(NULL) < end && g_running) {
-        double cpu_temp = read_cpu_temperature();
-        double gpu_temp = read_gpu_temperature();
-        
-        if (cpu_temp >= 0) {
-            cpu_sum += cpu_temp;
-            cpu_count++;
-            if (cpu_temp > *max_cpu_temp) *max_cpu_temp = cpu_temp;
-            
-            /* Thermal throttling threshold (90°C for AMD) */
-            if (cpu_temp > 90.0) {
-                *throttled = 1;
-            }
-        }
-        
-        if (gpu_temp >= 0) {
-            gpu_sum += gpu_temp;
-            gpu_count++;
-            if (gpu_temp > *max_gpu_temp) *max_gpu_temp = gpu_temp;
-            
-            /* Thermal throttling threshold (110°C for AMD GPU) */
-            if (gpu_temp > 110.0) {
-                *throttled = 1;
-            }
-        }
-        
-        /* Log thermal data */
-        if (g_thermal_log) {
-            fprintf(g_thermal_log, "%ld,%s,%.2f,%.2f\n", 
-                    (long)time(NULL), 
-                    config->backends[0] == BACKEND_CPU ? "CPU" : 
-                    config->backends[0] == BACKEND_GPU ? "GPU" : "NPU",
-                    cpu_temp >= 0 ? cpu_temp : -1.0,
-                    gpu_temp >= 0 ? gpu_temp : -1.0);
-        }
-        
-        sleep(THERMAL_INTERVAL_S);
-    }
-    
-    if (cpu_count > 0) *cpu_temp_avg = cpu_sum / cpu_count;
-    if (gpu_count > 0) *gpu_temp_avg = gpu_sum / gpu_count;
-}
-
-/* ── Benchmark Execution ───────────────────────────────────────────────── */
-
-static void run_cpu_benchmark(test_config_t *config, workload_shape_t *shape, 
-                             double *elapsed_ms) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    
-    /* Run CPU VNNI benchmark */
-    int success = benchmark_vnni_cpu(shape->rows, shape->inner_dim, 
-                                    shape->out_cols, config->cores[0]);
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    *elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
-                  (end.tv_nsec - start.tv_nsec) / 1000000.0;
-    
-    config->success = success;
-}
-
-static void run_gpu_benchmark(test_config_t *config, workload_shape_t *shape, 
-                             double *elapsed_ms) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    
-    /* Run Vulkan/GPU benchmark */
-    int success = benchmark_vulkan_gpu(shape->rows, shape->inner_dim, 
-                                      shape->out_cols, config->cores[1]);
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    *elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
-                  (end.tv_nsec - start.tv_nsec) / 1000000.0;
-    
-    config->success = success;
-}
-
-static void run_npu_benchmark(test_config_t *config, workload_shape_t *shape, 
-                             double *elapsed_ms) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    
-    /* Run NPU benchmark */
-    int success = benchmark_npu_xdna2(shape->rows, shape->inner_dim, 
-                                     shape->out_cols, config->cores[2]);
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    *elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
-                  (end.tv_nsec - start.tv_nsec) / 1000000.0;
-    
-    config->success = success;
-}
-
-static void run_combined_benchmark(test_config_t *config, workload_shape_t *shape, 
-                                  double *elapsed_ms) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    
-    /* Run combined backend benchmark */
-    int success = benchmark_combined(config->backends, config->backend_count,
-                                    config->cores, shape->rows, 
-                                    shape->inner_dim, shape->out_cols);
-    
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    *elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
-                  (end.tv_nsec - start.tv_nsec) / 1000000.0;
-    
-    config->success = success;
-}
-
-/* ── Test Generation ───────────────────────────────────────────────────── */
-
-static void generate_test_configs(test_config_t *configs, int *count) {
-    *count = 0;
-    
-    /* Single backend tests */
-    backend_t single_backends[][1] = {{BACKEND_CPU}, {BACKEND_GPU}, {BACKEND_NPU}};
-    int single_counts[] = {1, 1, 1};
-    
-    for (int b = 0; b < 3; b++) {
-        int max_cores = g_backend_configs[b].max_cores;
-        int core_counts[] = {1, 2, 4, 8, 16, 32};
-        int core_limits[] = {1, 2, 4, 8, 16, max_cores};
-        
-        for (int c = 0; c < 6 && core_counts[c] <= max_cores; c++) {
-            test_config_t *config = &configs[(*count)++];
-            config->backends[0] = single_backends[b][0];
-            config->backend_count = 1;
-            config->cores[0] = core_counts[c];
-            config->duration_s = DEFAULT_DURATION_S;
-            config->test_id = *count;
+static void *cpu_worker_entry(void *arg) {
+    cpu_worker_args_t *ctx = (cpu_worker_args_t *)arg;
+    const size_t stride = (size_t)ctx->rows * (size_t)ctx->out_cols;
+    for (int task = ctx->thread_id; task < ctx->batch_size; task += ctx->thread_count) {
+        const size_t offset = (size_t)task * stride;
+        if (!strix_cpu_matmul(ctx->input, ctx->rows, ctx->inner_dim, ctx->weights,
+                              ctx->out_cols, ctx->output + offset, ctx->scales)) {
+            ctx->success = 0;
+            return NULL;
         }
     }
-    
-    /* Two backend tests */
-    backend_t dual_backends[][2] = {
-        {BACKEND_CPU, BACKEND_GPU},
-        {BACKEND_CPU, BACKEND_NPU},
-        {BACKEND_GPU, BACKEND_NPU}
-    };
-    
-    for (int b = 0; b < 3; b++) {
-        int max_cores_0 = g_backend_configs[dual_backends[b][0]].max_cores;
-        int max_cores_1 = g_backend_configs[dual_backends[b][1]].max_cores;
-        
-        for (int c0 = 1; c0 <= 16; c0++) {
-            for (int c1 = 1; c1 <= 16; c1++) {
-                if (c0 > max_cores_0 || c1 > max_cores_1) continue;
-                
-                test_config_t *config = &configs[(*count)++];
-                config->backends[0] = dual_backends[b][0];
-                config->backends[1] = dual_backends[b][1];
-                config->backend_count = 2;
-                config->cores[0] = c0;
-                config->cores[1] = c1;
-                config->duration_s = DEFAULT_DURATION_S;
-                config->test_id = *count;
-            }
-        }
-    }
-    
-    /* All three backends test */
-    for (int c0 = 1; c0 <= 16; c0++) {
-        for (int c1 = 1; c1 <= 16; c1++) {
-            for (int c2 = 1; c2 <= 16; c2++) {
-                test_config_t *config = &configs[(*count)++];
-                config->backends[0] = BACKEND_CPU;
-                config->backends[1] = BACKEND_GPU;
-                config->backends[2] = BACKEND_NPU;
-                config->backend_count = 3;
-                config->cores[0] = c0;
-                config->cores[1] = c1;
-                config->cores[2] = c2;
-                config->duration_s = DEFAULT_DURATION_S;
-                config->test_id = *count;
-            }
-        }
-    }
+    return NULL;
 }
 
-/* ── Main Benchmark Loop ───────────────────────────────────────────────── */
+static int run_cpu_benchmark(const workload_shape_t *shape, int batch_size, int threads,
+                             int iters, double *elapsed_ms, double *bytes_processed) {
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    float *scales = NULL;
+    float *output = NULL;
+    int success = 0;
 
-static void run_benchmark_suite(test_config_t *configs, int config_count) {
-    printf("=== Multi-Backend Benchmark Suite ===\n");
-    printf("Total configurations: %d\n", config_count);
-    printf("Duration per test: %d seconds\n\n", DEFAULT_DURATION_S);
-    
-    for (int i = 0; i < config_count && g_running; i++) {
-        test_config_t *config = &configs[i];
-        
-        printf("[%d/%d] Testing: ", i+1, config_count);
-        for (int b = 0; b < config->backend_count; b++) {
-            if (b > 0) printf("+");
-            printf("%s(%d)", g_backend_configs[config->backends[b]].name, 
-                   config->cores[b]);
-        }
-        printf("\n");
-        
-        /* Monitor thermal during test */
-        double cpu_temp_avg, gpu_temp_avg, max_cpu_temp, max_gpu_temp;
-        int thermal_throttled;
-        
-        pthread_t thermal_thread;
-        pthread_create(&thermal_thread, NULL, 
-                      (void*(*)(void*))monitor_thermal, config);
-        
-        /* Run benchmark for each workload shape */
-        for (int w = 0; w < g_workload_count && g_running; w++) {
-            workload_shape_t *shape = &g_workloads[w];
-            double elapsed_ms = 0.0;
-            
-            printf("  Shape: %s/%s/%dx%dx%d\n", 
-                   shape->model_type, shape->tensor_type,
-                   shape->rows, shape->inner_dim, shape->out_cols);
-            
-            /* Run benchmark based on backend configuration */
-            if (config->backend_count == 1) {
-                switch (config->backends[0]) {
-                    case BACKEND_CPU:
-                        run_cpu_benchmark(config, shape, &elapsed_ms);
-                        break;
-                    case BACKEND_GPU:
-                        run_gpu_benchmark(config, shape, &elapsed_ms);
-                        break;
-                    case BACKEND_NPU:
-                        run_npu_benchmark(config, shape, &elapsed_ms);
-                        break;
-                }
+    const size_t input_bytes = (size_t)shape->rows * (size_t)shape->inner_dim;
+    const size_t weight_bytes = (size_t)shape->out_cols * (size_t)shape->inner_dim;
+    const size_t output_bytes = (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float);
+    const size_t scale_bytes = (size_t)shape->out_cols * sizeof(float);
+    const size_t bytes_per_call = input_bytes + weight_bytes + output_bytes + scale_bytes;
+
+    input = (int8_t *)malloc(input_bytes);
+    weights = (int8_t *)malloc(weight_bytes);
+    scales = (float *)malloc(scale_bytes);
+    output = (float *)malloc((size_t)batch_size * (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+    if (!input || !weights || !scales || !output) {
+        goto out;
+    }
+
+    for (size_t i = 0; i < input_bytes; ++i) {
+        input[i] = (int8_t)((int)(i * 3 + 1) % 17 - 8);
+    }
+    for (size_t i = 0; i < weight_bytes; ++i) {
+        weights[i] = (int8_t)((int)(i * 5 + 3) % 13 - 6);
+    }
+    for (int i = 0; i < shape->out_cols; ++i) {
+        scales[i] = 1.0f / 128.0f;
+    }
+    memset(output, 0, (size_t)batch_size * (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+
+    /* Warm-up once so the measurement is not dominated by first-touch faults. */
+    if (!strix_cpu_matmul(input, shape->rows, shape->inner_dim, weights,
+                          shape->out_cols, output, scales)) {
+        goto out;
+    }
+
+    uint64_t total_ns = 0;
+    const int worker_count = (threads > 1) ? threads : 1;
+    for (int i = 0; i < iters; ++i) {
+        cpu_worker_args_t worker_args;
+        pthread_t *thread_handles = NULL;
+        cpu_worker_args_t *workers = NULL;
+        int local_success = 1;
+
+        memset(&worker_args, 0, sizeof(worker_args));
+        worker_args.thread_id = 0;
+        worker_args.thread_count = worker_count;
+        worker_args.batch_size = batch_size;
+        worker_args.rows = shape->rows;
+        worker_args.inner_dim = shape->inner_dim;
+        worker_args.out_cols = shape->out_cols;
+        worker_args.input = input;
+        worker_args.weights = weights;
+        worker_args.scales = scales;
+        worker_args.output = output;
+        worker_args.success = 1;
+
+        const uint64_t start = now_ns();
+        if (worker_count > 1) {
+            thread_handles = (pthread_t *)calloc((size_t)worker_count, sizeof(*thread_handles));
+            workers = (cpu_worker_args_t *)calloc((size_t)worker_count, sizeof(*workers));
+            if (!thread_handles || !workers) {
+                local_success = 0;
             } else {
-                run_combined_benchmark(config, shape, &elapsed_ms);
+                for (int t = 0; t < worker_count; ++t) {
+                    workers[t] = worker_args;
+                    workers[t].thread_id = t;
+                    workers[t].thread_count = worker_count;
+                    if (pthread_create(&thread_handles[t], NULL, cpu_worker_entry, &workers[t]) != 0) {
+                        local_success = 0;
+                        for (int j = 0; j < t; ++j) pthread_join(thread_handles[j], NULL);
+                        break;
+                    }
+                }
+                if (local_success) {
+                    for (int t = 0; t < worker_count; ++t) {
+                        pthread_join(thread_handles[t], NULL);
+                    }
+                }
             }
-            
-            /* Log result */
-            if (g_csv_log) {
-                fprintf(g_csv_log, "%d,%s,%s,%d,%d,%s,%s,%d,%d,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%d\n",
-                        config->test_id,
-                        g_backend_configs[config->backends[0]].name,
-                        config->backend_count == 1 ? g_backend_configs[config->backends[0]].name :
-                        config->backend_count == 2 ? (config->backends[0] == BACKEND_CPU ? "CPU+GPU" : 
-                                                       config->backends[0] == BACKEND_CPU ? "CPU+NPU" : "GPU+NPU") :
-                        "CPU+GPU+NPU",
-                        config->cores[0],
-                        config->cores[1],
-                        shape->model_type,
-                        shape->tensor_type,
-                        shape->rows,
-                        shape->inner_dim,
-                        elapsed_ms,
-                        config->success,
-                        0.0, 0.0, 0.0, 0.0, 0);
-            }
-            
-            printf("    Time: %.2f ms, Success: %d\n", elapsed_ms, config->success);
+        } else {
+            cpu_worker_args_t single_worker = worker_args;
+            single_worker.thread_id = 0;
+            single_worker.thread_count = 1;
+            cpu_worker_entry(&single_worker);
+            worker_args.success = single_worker.success;
         }
-        
-        /* Wait for thermal monitoring to complete */
-        pthread_join(thermal_thread, NULL);
-        
-        printf("    Thermal: CPU=%.1f°C, GPU=%.1f°C, Max CPU=%.1f°C, Max GPU=%.1f°C, Throttled=%d\n",
-               cpu_temp_avg, gpu_temp_avg, max_cpu_temp, max_gpu_temp, thermal_throttled);
-        
-        printf("\n");
+
+        if (worker_count > 1) {
+            for (int t = 0; t < worker_count; ++t) {
+                if (!workers[t].success) worker_args.success = 0;
+            }
+            free(thread_handles);
+            free(workers);
+        }
+
+        if (!local_success || !worker_args.success) goto out;
+
+        const uint64_t elapsed = now_ns() - start;
+        total_ns += elapsed;
     }
+
+    *elapsed_ms = (double)total_ns / (double)iters / 1000000.0;
+    *bytes_processed = (double)iters * (double)batch_size * (double)bytes_per_call;
+    success = 1;
+
+out:
+    free(input);
+    free(weights);
+    free(scales);
+    free(output);
+    return success;
 }
 
-/* ── Signal Handler ────────────────────────────────────────────────────── */
+static int run_gpu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed) {
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    float *scales = NULL;
+    float *output = NULL;
+    int success = 0;
 
-static void signal_handler(int sig) {
-    printf("\n\nReceived signal %d, stopping gracefully...\n", sig);
-    g_running = 0;
+    const size_t input_bytes = (size_t)shape->rows * (size_t)shape->inner_dim;
+    const size_t weight_bytes = (size_t)shape->out_cols * (size_t)shape->inner_dim;
+    const size_t output_bytes = (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float);
+    const size_t scale_bytes = (size_t)shape->out_cols * sizeof(float);
+    const size_t bytes_per_call = input_bytes + weight_bytes + output_bytes + scale_bytes;
+
+    input = (int8_t *)malloc(input_bytes);
+    weights = (int8_t *)malloc(weight_bytes);
+    scales = (float *)malloc(scale_bytes);
+    output = (float *)malloc((size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+    if (!input || !weights || !scales || !output) goto out;
+
+    for (size_t i = 0; i < input_bytes; ++i) input[i] = (int8_t)((int)(i * 3 + 1) % 17 - 8);
+    for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (int8_t)((int)(i * 5 + 3) % 13 - 6);
+    for (int i = 0; i < shape->out_cols; ++i) scales[i] = 1.0f / 128.0f;
+    memset(output, 0, (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+
+    if (!strix_vulkan_matmul(input, shape->rows, shape->inner_dim, weights,
+                             shape->out_cols, output, scales)) {
+        goto out;
+    }
+
+    uint64_t total_ns = 0;
+    for (int i = 0; i < iters; ++i) {
+        const uint64_t start = now_ns();
+        for (int b = 0; b < batch_size; ++b) {
+            if (!strix_vulkan_matmul(input, shape->rows, shape->inner_dim, weights,
+                                     shape->out_cols, output, scales)) {
+                goto out;
+            }
+        }
+        total_ns += now_ns() - start;
+    }
+
+    *elapsed_ms = (double)total_ns / (double)iters / 1000000.0;
+    *bytes_processed = (double)iters * (double)batch_size * (double)bytes_per_call;
+    success = 1;
+
+out:
+    free(input);
+    free(weights);
+    free(scales);
+    free(output);
+    return success;
 }
 
-/* ── Main ──────────────────────────────────────────────────────────────── */
+static int run_npu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed) {
+    int8_t *input = NULL;
+    int8_t *weights = NULL;
+    float *scales = NULL;
+    float *output = NULL;
+    int success = 0;
 
-int main(int argc, char *argv[]) {
-    int duration_s = DEFAULT_DURATION_S;
-    const char *csv_file = "benchmark_results.csv";
-    const char *thermal_file = "thermal_log.csv";
-    
-    /* Parse arguments */
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--duration") == 0 && i+1 < argc) {
-            duration_s = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--csv") == 0 && i+1 < argc) {
-            csv_file = argv[++i];
-        } else if (strcmp(argv[i], "--thermal") == 0 && i+1 < argc) {
-            thermal_file = argv[++i];
+    const size_t input_bytes = (size_t)shape->rows * (size_t)shape->inner_dim;
+    const size_t weight_bytes = (size_t)shape->out_cols * (size_t)shape->inner_dim;
+    const size_t output_bytes = (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float);
+    const size_t scale_bytes = (size_t)shape->out_cols * sizeof(float);
+    const size_t bytes_per_call = input_bytes + weight_bytes + output_bytes + scale_bytes;
+
+    input = (int8_t *)malloc(input_bytes);
+    weights = (int8_t *)malloc(weight_bytes);
+    scales = (float *)malloc(scale_bytes);
+    output = (float *)malloc((size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+    if (!input || !weights || !scales || !output) goto out;
+
+    for (size_t i = 0; i < input_bytes; ++i) input[i] = (int8_t)((int)(i * 3 + 1) % 17 - 8);
+    for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (int8_t)((int)(i * 5 + 3) % 13 - 6);
+    for (int i = 0; i < shape->out_cols; ++i) scales[i] = 1.0f / 128.0f;
+    memset(output, 0, (size_t)shape->rows * (size_t)shape->out_cols * sizeof(float));
+
+    if (!strix_xdna2_kernel_exists(shape->rows, shape->inner_dim, shape->out_cols,
+                                   XDNA2_FMT_INT8)) {
+        goto out;
+    }
+    if (!strix_xdna2_matmul(input, shape->rows, shape->inner_dim, weights,
+                            shape->out_cols, output, scales)) {
+        goto out;
+    }
+
+    uint64_t total_ns = 0;
+    for (int i = 0; i < iters; ++i) {
+        const uint64_t start = now_ns();
+        for (int b = 0; b < batch_size; ++b) {
+            if (!strix_xdna2_matmul(input, shape->rows, shape->inner_dim, weights,
+                                    shape->out_cols, output, scales)) {
+                goto out;
+            }
+        }
+        total_ns += now_ns() - start;
+    }
+
+    *elapsed_ms = (double)total_ns / (double)iters / 1000000.0;
+    *bytes_processed = (double)iters * (double)batch_size * (double)bytes_per_call;
+    success = 1;
+
+out:
+    free(input);
+    free(weights);
+    free(scales);
+    free(output);
+    return success;
+}
+
+static void print_usage(const char *argv0) {
+    fprintf(stderr,
+            "Usage: %s [--backend cpu|gpu|npu|all] [--batch N] [--threads N] [--iters N] [--csv FILE]\n",
+            argv0);
+}
+
+int main(int argc, char **argv) {
+    const char *backend_filter = "all";
+    int batch_size = DEFAULT_BATCH;
+    int threads = DEFAULT_THREADS;
+    int iters = env_int("COLI_BENCH_ITERS", DEFAULT_ITERS);
+    const char *csv_path = "benchmark_results.csv";
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            backend_filter = argv[++i];
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            csv_path = argv[++i];
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            /* Keep the older script's flag compatible; it is an alias for a
+             * small iteration count when the user just wants a fast sweep. */
+            iters = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [options]\n", argv[0]);
-            printf("  --duration SECONDS  Test duration (default: %d)\n", DEFAULT_DURATION_S);
-            printf("  --csv FILE          CSV output file (default: %s)\n", csv_file);
-            printf("  --thermal FILE      Thermal log file (default: %s)\n", thermal_file);
+            print_usage(argv[0]);
             return 0;
+        } else {
+            print_usage(argv[0]);
+            return 2;
         }
     }
-    
-    /* Setup signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
-    /* Open log files */
-    g_csv_log = fopen(csv_file, "w");
-    if (!g_csv_log) {
-        fprintf(stderr, "Error: Cannot open %s for writing\n", csv_file);
+
+    if (batch_size <= 0) batch_size = DEFAULT_BATCH;
+    if (threads <= 0) threads = DEFAULT_THREADS;
+    if (iters <= 0) iters = DEFAULT_ITERS;
+
+    FILE *csv = fopen(csv_path, "w");
+    if (!csv) {
+        fprintf(stderr, "benchmark_all_backends: cannot open %s for writing: %s\n",
+                csv_path, strerror(errno));
         return 1;
     }
-    
-    g_thermal_log = fopen(thermal_file, "w");
-    if (!g_thermal_log) {
-        fprintf(stderr, "Error: Cannot open %s for writing\n", thermal_file);
-        fclose(g_csv_log);
-        return 1;
+
+    fprintf(csv, "backend,rows,inner_dim,out_cols,batch_size,threads,iters,elapsed_ms,success,bytes_processed,estimated_gib_s\n");
+
+    const int backend_kind = parse_backend(backend_filter);
+    const backend_entry_t entries[] = {
+        {"cpu", strix_cpu_is_supported, strix_cpu_backend_name, strix_cpu_backend_name},
+        {"gpu", strix_vulkan_is_supported, strix_vulkan_backend_name, strix_vulkan_failure_reason},
+        {"npu", strix_xdna2_is_supported, strix_xdna2_backend_name, strix_xdna2_failure_reason},
+    };
+
+    for (size_t k = 0; k < sizeof(entries) / sizeof(entries[0]); ++k) {
+        const char *name = entries[k].name;
+        if (backend_kind != 3 && backend_kind != (int)k) {
+            continue;
+        }
+
+        if (!entries[k].is_supported()) {
+            printf("SKIP %s: %s\n", name, entries[k].failure_reason());
+            continue;
+        }
+
+        for (size_t s = 0; s < g_shape_count; ++s) {
+            const workload_shape_t *shape = &g_shapes[s];
+            double elapsed_ms = 0.0;
+            double bytes_processed = 0.0;
+            int success = 0;
+
+            printf("running %s rows=%d inner=%d out=%d batch=%d threads=%d iters=%d\n",
+                   name, shape->rows, shape->inner_dim, shape->out_cols,
+                   batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters);
+
+            if (strcmp(name, "cpu") == 0) {
+                success = run_cpu_benchmark(shape, batch_size, threads, iters,
+                                            &elapsed_ms, &bytes_processed);
+            } else if (strcmp(name, "gpu") == 0) {
+                success = run_gpu_benchmark(shape, batch_size, iters,
+                                            &elapsed_ms, &bytes_processed);
+            } else {
+                success = run_npu_benchmark(shape, batch_size, iters,
+                                            &elapsed_ms, &bytes_processed);
+            }
+
+            const double elapsed_s = elapsed_ms / 1000.0;
+            const double estimated_gib_s = elapsed_s > 0.0
+                ? bytes_processed / (elapsed_s * 1024.0 * 1024.0 * 1024.0)
+                : 0.0;
+
+            fprintf(csv, "%s,%d,%d,%d,%d,%d,%d,%.6f,%d,%.0f,%.6f\n",
+                    name, shape->rows, shape->inner_dim, shape->out_cols,
+                    batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters,
+                    elapsed_ms, success, bytes_processed, estimated_gib_s);
+            fflush(csv);
+        }
     }
-    
-    /* Write CSV headers */
-    fprintf(g_csv_log, "test_id,backend,backend_combo,cores_0,cores_1,model_type,tensor_type,"
-            "rows,inner_dim,out_cols,elapsed_ms,success,cpu_temp_avg,gpu_temp_avg,"
-            "max_cpu_temp,max_gpu_temp,thermal_throttled\n");
-    
-    fprintf(g_thermal_log, "timestamp,backend,cpu_temp,gpu_temp\n");
-    
-    /* Generate test configurations */
-    test_config_t configs[MAX_TESTS];
-    int config_count = 0;
-    generate_test_configs(configs, &config_count);
-    
-    printf("Generated %d test configurations\n\n", config_count);
-    
-    /* Run benchmark suite */
-    run_benchmark_suite(configs, config_count);
-    
-    /* Cleanup */
-    fclose(g_csv_log);
-    fclose(g_thermal_log);
-    
-    printf("\n=== Benchmark Complete ===\n");
-    printf("Results saved to: %s\n", csv_file);
-    printf("Thermal data saved to: %s\n", thermal_file);
-    
+
+    fclose(csv);
+
+    strix_vulkan_shutdown();
+    strix_xdna2_shutdown();
     return 0;
 }
