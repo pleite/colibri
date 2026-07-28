@@ -235,6 +235,17 @@ static void *cpu_worker_entry(void *arg) {
     return NULL;
 }
 
+static int run_cpu_benchmark(const workload_shape_t *shape, int batch_size, int threads,
+                             int iters, double *elapsed_ms, double *bytes_processed);
+static int run_gpu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed);
+static int run_gpu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed);
+static int run_npu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed);
+static int run_npu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed);
+
 static int run_backend_benchmark(int backend_kind, const workload_shape_t *shape,
                                  int batch_size, int threads, int iters,
                                  int batching_mode, double *elapsed_ms,
