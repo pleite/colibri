@@ -67,7 +67,7 @@ typedef struct {
     uint32_t                     queue_family_index;
     uint32_t                     memory_type_index_host;
     VkCommandPool                command_pool;
-    VkCommandBuffer              command_buffer;
+    VkCommandBuffer              command_buffer[STRIX_VULKAN_MAX_BATCH];
     VkDescriptorSetLayout        descriptor_layout;
     VkDescriptorPool             descriptor_pool;
     VkDescriptorSet              descriptor_set;
@@ -354,9 +354,7 @@ static void destroy_context(StrixVulkanContext *ctx) {
         if (ctx->descriptor_pool)   ctx->dev.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
         if (ctx->descriptor_layout) ctx->dev.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
         if (ctx->command_pool) {
-            if (ctx->command_buffer != VK_NULL_HANDLE) {
-                ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, 1, &ctx->command_buffer);
-            }
+            ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, STRIX_VULKAN_MAX_BATCH, ctx->command_buffer);
             ctx->dev.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
         }
         ctx->dev.vkDestroyDevice(ctx->device, NULL);
@@ -542,8 +540,8 @@ static int create_context(StrixVulkanContext *ctx) {
     cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmd_alloc.commandPool = ctx->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc.commandBufferCount = 1;
-    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
+    cmd_alloc.commandBufferCount = STRIX_VULKAN_MAX_BATCH;
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, ctx->command_buffer) != VK_SUCCESS) {
         destroy_context(ctx);
         return vk_fail("vkAllocateCommandBuffers failed");
     }
@@ -1093,24 +1091,8 @@ static int run_batch_matmul(StrixVulkanContext *ctx,
         ctx->dev.vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
     }
 
-    /* Allocate N command buffers from the existing (resettable) pool. */
-    VkCommandBuffer *cmd_bufs = (VkCommandBuffer *)calloc(
-        (size_t)batch_size, sizeof(VkCommandBuffer));
-    if (!cmd_bufs) {
-        free(desc_sets);
-        goto cleanup_pool;
-    }
-    VkCommandBufferAllocateInfo cmd_alloc;
-    memset(&cmd_alloc, 0, sizeof(cmd_alloc));
-    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmd_alloc.commandPool = ctx->command_pool;
-    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc.commandBufferCount = (uint32_t)batch_size;
-    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, cmd_bufs) != VK_SUCCESS) {
-        free(cmd_bufs);
-        free(desc_sets);
-        goto cleanup_pool;
-    }
+    /* Use pre-allocated command buffers from context. */
+    VkCommandBuffer *cmd_bufs = ctx->command_buffer;
 
     const uint32_t group_x = ((uint32_t)out_cols + 15u) / 16u;
     const uint32_t group_y = ((uint32_t)rows + 15u) / 16u;
@@ -1196,9 +1178,6 @@ static int run_batch_matmul(StrixVulkanContext *ctx,
     }
 
 cleanup_cmds:
-    ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool,
-                                   (uint32_t)batch_size, cmd_bufs);
-    free(cmd_bufs);
     free(desc_sets);
 cleanup_pool:
     if (temp_pool != VK_NULL_HANDLE)
