@@ -30,12 +30,6 @@
 
 #include "vulkan_dispatch.h"
 
-/* Forward declarations for functions called before they are defined. */
-static int select_host_memory_type(StrixVulkanContext *ctx, uint32_t type_bits, uint32_t *out_index);
-static void destroy_buffer(StrixVulkanContext *ctx, StrixBuffer *b);
-static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, StrixBuffer *b);
-
-
 /* Push constant block consumed by gpu/comp.spv (3 x uint32 at offsets 0/4/8). */
 typedef struct {
     uint32_t rows;
@@ -75,6 +69,7 @@ typedef struct {
     VkCommandPool                command_pool;
     VkCommandBuffer              command_buffer;
     VkDescriptorSetLayout        descriptor_layout;
+    VkDescriptorPool             descriptor_pool;
     VkDescriptorSet              descriptor_set;
     VkShaderModule               shader_module;
     VkPipelineLayout             pipeline_layout;
@@ -87,6 +82,11 @@ typedef struct {
     CachedBuffers                cached[MAX_CACHED];
     int                          cached_count;
 } StrixVulkanContext;
+
+/* Forward declarations for functions called before they are defined. */
+static int select_host_memory_type(StrixVulkanContext *ctx, uint32_t type_bits, uint32_t *out_index);
+static void destroy_buffer(StrixVulkanContext *ctx, StrixBuffer *b);
+static int create_buffer(StrixVulkanContext *ctx, VkDeviceSize size, StrixBuffer *b);
 
 /* Lazily created, process-wide. Creating a VkDevice per matmul call costs tens
  * of milliseconds, which dwarfs the dispatch itself. */
@@ -354,7 +354,9 @@ static void destroy_context(StrixVulkanContext *ctx) {
         if (ctx->descriptor_pool)   ctx->dev.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
         if (ctx->descriptor_layout) ctx->dev.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
         if (ctx->command_pool) {
-            ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, STRIX_VULKAN_MAX_BATCH, ctx->command_buffers);
+            if (ctx->command_buffer != VK_NULL_HANDLE) {
+                ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, 1, &ctx->command_buffer);
+            }
             ctx->dev.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
         }
         ctx->dev.vkDestroyDevice(ctx->device, NULL);
@@ -540,8 +542,8 @@ static int create_context(StrixVulkanContext *ctx) {
     cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmd_alloc.commandPool = ctx->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc.commandBufferCount = STRIX_VULKAN_MAX_BATCH;
-    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, ctx->command_buffers) != VK_SUCCESS) {
+    cmd_alloc.commandBufferCount = 1;
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
         destroy_context(ctx);
         return vk_fail("vkAllocateCommandBuffers failed");
     }

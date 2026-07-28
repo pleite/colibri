@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 #include "cpu/vnni_cpu_backend.h"
 #include "gpu/vulkan_backend.h"
@@ -112,6 +113,67 @@ typedef struct {
     const char *(*failure_reason)(void);
 } backend_entry_t;
 
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int total_count;
+    int count;
+    int generation;
+} benchmark_barrier_t;
+
+typedef struct {
+    int backend_kind;
+    int batch_size;
+    int threads;
+    int iters;
+    int rows;
+    int inner_dim;
+    int out_cols;
+    int batching_mode;
+    benchmark_barrier_t *barrier;
+    double elapsed_ms;
+    double bytes_processed;
+    int success;
+    const char *name;
+} concurrent_worker_args_t;
+
+static int benchmark_barrier_init(benchmark_barrier_t *barrier, int count) {
+    if (!barrier || count <= 0) return 0;
+    if (pthread_mutex_init(&barrier->mutex, NULL) != 0) return 0;
+    if (pthread_cond_init(&barrier->cond, NULL) != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return 0;
+    }
+    barrier->total_count = count;
+    barrier->count = count;
+    barrier->generation = 0;
+    return 1;
+}
+
+static void benchmark_barrier_destroy(benchmark_barrier_t *barrier) {
+    if (!barrier) return;
+    pthread_cond_destroy(&barrier->cond);
+    pthread_mutex_destroy(&barrier->mutex);
+}
+
+static int benchmark_barrier_wait(benchmark_barrier_t *barrier) {
+    if (!barrier) return 0;
+    pthread_mutex_lock(&barrier->mutex);
+    int generation = barrier->generation;
+    barrier->count--;
+    if (barrier->count == 0) {
+        barrier->generation++;
+        barrier->count = barrier->total_count;
+        pthread_cond_broadcast(&barrier->cond);
+    } else {
+        while (barrier->generation == generation) {
+            pthread_cond_wait(&barrier->cond, &barrier->mutex);
+        }
+    }
+    pthread_mutex_unlock(&barrier->mutex);
+    return 1;
+}
+
 static const workload_shape_t g_shapes[] = {
     {256, 4096, 1024},
     {256, 1024, 4096},
@@ -171,6 +233,39 @@ static void *cpu_worker_entry(void *arg) {
         }
     }
     return NULL;
+}
+
+static int run_cpu_benchmark(const workload_shape_t *shape, int batch_size, int threads,
+                             int iters, double *elapsed_ms, double *bytes_processed);
+static int run_gpu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed);
+static int run_gpu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed);
+static int run_npu_benchmark(const workload_shape_t *shape, int batch_size, int iters,
+                             double *elapsed_ms, double *bytes_processed);
+static int run_npu_benchmark_batched(const workload_shape_t *shape, int batch_size, int iters,
+                                     double *elapsed_ms, double *bytes_processed);
+
+static int run_backend_benchmark(int backend_kind, const workload_shape_t *shape,
+                                 int batch_size, int threads, int iters,
+                                 int batching_mode, double *elapsed_ms,
+                                 double *bytes_processed) {
+    if (backend_kind == 0) {
+        return run_cpu_benchmark(shape, batch_size, threads, iters, elapsed_ms, bytes_processed);
+    }
+    if (backend_kind == 1) {
+        if (batching_mode) {
+            return run_gpu_benchmark_batched(shape, batch_size, iters, elapsed_ms, bytes_processed);
+        }
+        return run_gpu_benchmark(shape, batch_size, iters, elapsed_ms, bytes_processed);
+    }
+    if (backend_kind == 2) {
+        if (batching_mode) {
+            return run_npu_benchmark_batched(shape, batch_size, iters, elapsed_ms, bytes_processed);
+        }
+        return run_npu_benchmark(shape, batch_size, iters, elapsed_ms, bytes_processed);
+    }
+    return 0;
 }
 
 static int run_cpu_benchmark(const workload_shape_t *shape, int batch_size, int threads,
@@ -540,8 +635,47 @@ out:
 static void print_usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [--backend cpu|gpu|npu|all] [--batch N] [--threads N] [--iters N]\n"
-            "          [--csv FILE] [--batching-mode serial|batched]\n",
+            "          [--csv FILE] [--batching-mode serial|batched]\n"
+            "          [--concurrent] [--mixed]\n",
             argv0);
+}
+
+static void write_csv_row(FILE *csv, const char *backend, const workload_shape_t *shape,
+                          int batch_size, int threads, int iters, double elapsed_ms,
+                          int success, double bytes_processed, const char *mode,
+                          const char *active_backends) {
+    const double elapsed_s = elapsed_ms / 1000.0;
+    const double estimated_gib_s = elapsed_s > 0.0
+        ? bytes_processed / (elapsed_s * 1024.0 * 1024.0 * 1024.0)
+        : 0.0;
+    fprintf(csv, "%s,%d,%d,%d,%d,%d,%d,%.6f,%d,%.0f,%.6f,%s,%s\n",
+            backend, shape->rows, shape->inner_dim, shape->out_cols,
+            batch_size, threads, iters, elapsed_ms, success,
+            bytes_processed, estimated_gib_s, mode, active_backends ? active_backends : "none");
+    fflush(csv);
+}
+
+static void *concurrent_backend_worker(void *arg) {
+    concurrent_worker_args_t *ctx = (concurrent_worker_args_t *)arg;
+    if (!ctx->barrier) {
+        ctx->success = 0;
+        return NULL;
+    }
+    if (!benchmark_barrier_wait(ctx->barrier)) {
+        ctx->success = 0;
+        return NULL;
+    }
+
+    double bench_elapsed_ms = 0.0;
+    double bench_bytes_processed = 0.0;
+    ctx->success = run_backend_benchmark(ctx->backend_kind,
+                                         &(workload_shape_t){ctx->rows, ctx->inner_dim, ctx->out_cols},
+                                         ctx->batch_size, ctx->threads, ctx->iters,
+                                         ctx->batching_mode, &bench_elapsed_ms,
+                                         &bench_bytes_processed);
+    ctx->elapsed_ms = bench_elapsed_ms;
+    ctx->bytes_processed = bench_bytes_processed;
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -552,6 +686,7 @@ int main(int argc, char **argv) {
     const char *csv_path = "benchmark_results.csv";
     /* batching_mode: 0 = serial (default, backward compatible), 1 = batched */
     int batching_mode = 0;
+    int concurrent_mode = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -575,6 +710,8 @@ int main(int argc, char **argv) {
                         "(use serial or batched)\n", mode);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--concurrent") == 0 || strcmp(argv[i], "--mixed") == 0) {
+            concurrent_mode = 1;
         } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
             /* Keep the older script's flag compatible; it is an alias for a
              * small iteration count when the user just wants a fast sweep. */
@@ -599,7 +736,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(csv, "backend,rows,inner_dim,out_cols,batch_size,threads,iters,elapsed_ms,success,bytes_processed,estimated_gib_s\n");
+    fprintf(csv, "backend,rows,inner_dim,out_cols,batch_size,threads,iters,elapsed_ms,success,bytes_processed,estimated_gib_s,mode,active_backends\n");
 
     const int backend_kind = parse_backend(backend_filter);
     const backend_entry_t entries[] = {
@@ -608,19 +745,119 @@ int main(int argc, char **argv) {
         {"npu", strix_xdna2_is_supported, strix_xdna2_backend_name, strix_xdna2_failure_reason},
     };
 
-    for (size_t k = 0; k < sizeof(entries) / sizeof(entries[0]); ++k) {
-        const char *name = entries[k].name;
-        if (backend_kind != 3 && backend_kind != (int)k) {
+    const char *run_mode = batching_mode ? "batched" : "serial";
+
+    for (size_t s = 0; s < g_shape_count; ++s) {
+        const workload_shape_t *shape = &g_shapes[s];
+
+        if (concurrent_mode) {
+            int selected_kinds[3];
+            char combined_names[64] = "";
+            int selected_count = 0;
+
+            for (size_t k = 0; k < sizeof(entries) / sizeof(entries[0]); ++k) {
+                const char *name = entries[k].name;
+                if (backend_kind != 3 && backend_kind != (int)k) {
+                   continue;
+                }
+                if (!entries[k].is_supported()) {
+                   printf("SKIP %s: %s\n", name, entries[k].failure_reason());
+                   continue;
+                }
+                if (selected_count > 0) {
+                   strncat(combined_names, ",", sizeof(combined_names) - strlen(combined_names) - 1);
+                }
+                strncat(combined_names, name, sizeof(combined_names) - strlen(combined_names) - 1);
+                selected_kinds[selected_count++] = (int)k;
+            }
+
+            if (selected_count == 0) {
+                continue;
+            }
+
+            benchmark_barrier_t barrier;
+            if (!benchmark_barrier_init(&barrier, selected_count + 1)) {
+                fprintf(stderr, "benchmark_all_backends: could not initialize barrier\n");
+                fclose(csv);
+                return 1;
+            }
+
+            concurrent_worker_args_t *workers = (concurrent_worker_args_t *)calloc(
+                (size_t)selected_count, sizeof(*workers));
+            pthread_t *worker_threads = (pthread_t *)calloc((size_t)selected_count, sizeof(*worker_threads));
+            if (!workers || !worker_threads) {
+                free(workers);
+                free(worker_threads);
+                benchmark_barrier_destroy(&barrier);
+                fclose(csv);
+                return 1;
+            }
+
+            for (int idx = 0; idx < selected_count; ++idx) {
+                const int backend_idx = selected_kinds[idx];
+                workers[idx].backend_kind = backend_idx;
+                workers[idx].batch_size = batch_size;
+                workers[idx].threads = (backend_idx == 0) ? threads : 1;
+                workers[idx].iters = iters;
+                workers[idx].rows = shape->rows;
+                workers[idx].inner_dim = shape->inner_dim;
+                workers[idx].out_cols = shape->out_cols;
+                workers[idx].batching_mode = batching_mode;
+                workers[idx].barrier = &barrier;
+                workers[idx].success = 0;
+                workers[idx].elapsed_ms = 0.0;
+                workers[idx].bytes_processed = 0.0;
+                workers[idx].name = entries[backend_idx].name;
+                if (pthread_create(&worker_threads[idx], NULL, concurrent_backend_worker, &workers[idx]) != 0) {
+                   fprintf(stderr, "benchmark_all_backends: failed to create %s worker thread\n", entries[backend_idx].name);
+                   for (int j = 0; j < idx; ++j) pthread_join(worker_threads[j], NULL);
+                   free(workers);
+                   free(worker_threads);
+                   benchmark_barrier_destroy(&barrier);
+                   fclose(csv);
+                   return 1;
+                }
+            }
+
+            printf("running mixed rows=%d inner=%d out=%d batch=%d threads=%d iters=%d backends=%s\n",
+                   shape->rows, shape->inner_dim, shape->out_cols, batch_size,
+                   threads, iters, combined_names);
+
+            const uint64_t overall_start = now_ns();
+            benchmark_barrier_wait(&barrier);
+            for (int idx = 0; idx < selected_count; ++idx) {
+                pthread_join(worker_threads[idx], NULL);
+            }
+            const uint64_t overall_end = now_ns();
+            const double combined_elapsed_ms = (double)(overall_end - overall_start) / 1000000.0;
+
+            for (int idx = 0; idx < selected_count; ++idx) {
+                write_csv_row(csv, workers[idx].name, shape, batch_size,
+                             workers[idx].threads, iters, workers[idx].elapsed_ms,
+                             workers[idx].success, workers[idx].bytes_processed,
+                             "concurrent", combined_names);
+            }
+            printf("mixed summary rows=%d inner=%d out=%d elapsed_ms=%.3f backends=%s\n",
+                   shape->rows, shape->inner_dim, shape->out_cols,
+                   combined_elapsed_ms, combined_names);
+
+            free(workers);
+            free(worker_threads);
+            benchmark_barrier_destroy(&barrier);
             continue;
         }
 
-        if (!entries[k].is_supported()) {
-            printf("SKIP %s: %s\n", name, entries[k].failure_reason());
-            continue;
-        }
+        for (size_t k = 0; k < sizeof(entries) / sizeof(entries[0]); ++k) {
+            const char *name = entries[k].name;
+            if (backend_kind != 3 && backend_kind != (int)k) {
+                continue;
+            }
 
-        for (size_t s = 0; s < g_shape_count; ++s) {
-            const workload_shape_t *shape = &g_shapes[s];
+            if (!entries[k].is_supported()) {
+                printf("SKIP %s: %s\n", name, entries[k].failure_reason());
+                continue;
+            }
+
             double elapsed_ms = 0.0;
             double bytes_processed = 0.0;
             int success = 0;
@@ -628,39 +865,15 @@ int main(int argc, char **argv) {
             printf("running %s rows=%d inner=%d out=%d batch=%d threads=%d iters=%d mode=%s\n",
                    name, shape->rows, shape->inner_dim, shape->out_cols,
                    batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters,
-                   batching_mode ? "batched" : "serial");
+                   run_mode);
 
-            if (strcmp(name, "cpu") == 0) {
-                success = run_cpu_benchmark(shape, batch_size, threads, iters,
-                                            &elapsed_ms, &bytes_processed);
-            } else if (strcmp(name, "gpu") == 0) {
-                if (batching_mode) {
-                    success = run_gpu_benchmark_batched(shape, batch_size, iters,
-                                                        &elapsed_ms, &bytes_processed);
-                } else {
-                    success = run_gpu_benchmark(shape, batch_size, iters,
-                                                &elapsed_ms, &bytes_processed);
-                }
-            } else {
-                if (batching_mode) {
-                    success = run_npu_benchmark_batched(shape, batch_size, iters,
-                                                        &elapsed_ms, &bytes_processed);
-                } else {
-                    success = run_npu_benchmark(shape, batch_size, iters,
-                                                &elapsed_ms, &bytes_processed);
-                }
-            }
+            success = run_backend_benchmark((int)k, shape, batch_size, (strcmp(name, "cpu") == 0) ? threads : 1,
+                                           iters, batching_mode, &elapsed_ms, &bytes_processed);
 
-            const double elapsed_s = elapsed_ms / 1000.0;
-            const double estimated_gib_s = elapsed_s > 0.0
-                ? bytes_processed / (elapsed_s * 1024.0 * 1024.0 * 1024.0)
-                : 0.0;
-
-            fprintf(csv, "%s,%d,%d,%d,%d,%d,%d,%.6f,%d,%.0f,%.6f\n",
-                    name, shape->rows, shape->inner_dim, shape->out_cols,
-                    batch_size, (strcmp(name, "cpu") == 0) ? threads : 1, iters,
-                    elapsed_ms, success, bytes_processed, estimated_gib_s);
-            fflush(csv);
+            write_csv_row(csv, name, shape, batch_size,
+                        (strcmp(name, "cpu") == 0) ? threads : 1, iters,
+                        elapsed_ms, success, bytes_processed,
+                        run_mode, "single");
         }
     }
 
