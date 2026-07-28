@@ -24,6 +24,8 @@ make test
 
 ```bash
 make podman-test        # or ./scripts/strix-halo-podman-test.sh
+make podman-debug-test  # same test flow + full host/container debug snapshots
+make podman-debug-benchmark  # on-demand NPU benchmark flow + full debug
 ```
 
 The script builds `Dockerfile.strix-halo-test` on top of the community Strix
@@ -51,9 +53,18 @@ Useful overrides:
 | `SKIP_NPU=1` | do not pass the NPU device through |
 | `REQUIRE_NPU=1` | fail instead of warning when `/dev/accel/accel0` is absent |
 | `XDNA2_HEAP_BYTES` | size of the NPU device heap (a multiple of 64 MiB, at most 64 MiB) |
+| `COLI_CAPTURE_DEBUG=1` | write full host/container diagnostics under `vnni-int8-matmul/debug/` |
 
 Use `REQUIRE_NPU=1` on the Strix Halo runner so an unloaded `amdxdna` module is
 reported as a red run rather than hidden behind three SKIPs.
+
+## CI workflow for local self-hosted debug
+
+GitHub Actions workflow: `/home/runner/work/colibri/colibri/.github/workflows/vnni-local-runner-debug.yml`
+
+- Runs on the local self-hosted runner (`self-hosted`, `linux`, `x64`).
+- Supports `workflow_dispatch` with `mode=test|benchmark`.
+- Captures full host/container debug snapshots (kernel, modules, headers, libraries, devices, toolchain) and uploads them as artifacts.
 
 ## What the tests cover
 

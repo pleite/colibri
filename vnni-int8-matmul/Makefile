@@ -153,6 +153,12 @@ test: $(TESTS)
 podman-test: scripts/strix-halo-podman-test.sh
 	./scripts/strix-halo-podman-test.sh
 
+podman-debug-test: scripts/strix-halo-podman-test.sh scripts/capture_debug_snapshot.sh
+	COLI_CAPTURE_DEBUG=1 ./scripts/strix-halo-podman-test.sh
+
+podman-debug-benchmark: scripts/run_npu_benchmark_in_container.sh scripts/capture_debug_snapshot.sh
+	COLI_CAPTURE_DEBUG=1 ./scripts/run_npu_benchmark_in_container.sh
+
 # ── NPU kernel artifacts ──────────────────────────────────────────────────────
 # The AIE toolchain (IRON + Peano) is pinned in npu/aie/toolchain.lock and lives
 # in its own build-only container image; it is not part of the test image and
@@ -180,5 +186,5 @@ clean:
 	      tools/*.o $(NPU_DIR)/*.o
 	rm -rf npu/aie/build npu/aie/__pycache__
 
-.PHONY: all shader test podman-test clean \
+.PHONY: all shader test podman-test podman-debug-test podman-debug-benchmark clean \
         npu-toolchain-image npu-kernels npu-kernels-check

@@ -38,6 +38,9 @@ Comprehensive benchmark for AMD XDNA 2 NPU on Strix Halo.
 ```bash
 # From the vnni-int8-matmul directory
 ./scripts/npu_full_benchmark.sh
+
+# Full host/container debug capture (kernel/modules/headers/libs/devices)
+COLI_CAPTURE_DEBUG=1 ./scripts/run_npu_benchmark_in_container.sh
 ```
 
 ## Output
@@ -91,5 +94,6 @@ Tests passed: 40
 ## Troubleshooting
 
 - **Kernel not found**: Run `make npu-kernels` to build kernels
+- **Missing `DRM_IOCTL_AMDXDNA_CONFIG_HWCTX`**: host kernel/UAPI is too old for CU/PDI registration; use amdxdna headers and kernel >= 6.14 with `CONFIG_DRM_AMDXDNA`
 - **Permission denied**: Add user to `render` group or run as root
 - **Module not loaded**: `sudo modprobe amdxdna`

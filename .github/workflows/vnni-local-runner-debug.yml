@@ -1,0 +1,143 @@
+name: VNNI Local Runner Debug
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Container flow to run
+        type: choice
+        options:
+          - test
+          - benchmark
+        required: false
+        default: test
+      base_image:
+        description: Base image the harness image is layered on
+        required: false
+        default: ghcr.io/pleite/colibri-vulkan:latest
+      require_npu:
+        description: Fail the run when /dev/accel/accel0 is absent
+        type: boolean
+        required: false
+        default: true
+      skip_npu:
+        description: Do not pass the NPU device into the container
+        type: boolean
+        required: false
+        default: false
+      capture_debug:
+        description: Capture full host/container debug snapshots
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vnni-local-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-runner-debug:
+    name: VNNI local runner debug flow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 90
+    env:
+      BASE_IMAGE: ${{ inputs.base_image || 'ghcr.io/pleite/colibri-vulkan:latest' }}
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'test' }}
+      REQUIRE_NPU: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_npu == false) && '0' || '1' }}
+      SKIP_NPU: ${{ (github.event_name == 'workflow_dispatch' && inputs.skip_npu == true) && '1' || '0' }}
+      COLI_CAPTURE_DEBUG: ${{ (github.event_name != 'workflow_dispatch' || inputs.capture_debug == true) && '1' || '0' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Host preflight debug snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vnni-int8-matmul/debug
+          vnni-int8-matmul/scripts/capture_debug_snapshot.sh vnni-int8-matmul/debug/gha-host-preflight.log
+
+      - name: Run container test or benchmark flow
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUN_MODE=${RUN_MODE}"
+          echo "BASE_IMAGE=${BASE_IMAGE}"
+          echo "REQUIRE_NPU=${REQUIRE_NPU}"
+          echo "SKIP_NPU=${SKIP_NPU}"
+          echo "COLI_CAPTURE_DEBUG=${COLI_CAPTURE_DEBUG}"
+          if [ "${RUN_MODE}" = "benchmark" ]; then
+            if [ "${COLI_CAPTURE_DEBUG}" = "1" ]; then
+              make podman-debug-benchmark
+            else
+              ./scripts/run_npu_benchmark_in_container.sh
+            fi
+          else
+            if [ "${COLI_CAPTURE_DEBUG}" = "1" ]; then
+              make podman-debug-test
+            else
+              make podman-test
+            fi
+          fi
+
+      - name: Host post-run debug snapshot
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          vnni-int8-matmul/scripts/capture_debug_snapshot.sh vnni-int8-matmul/debug/gha-host-post.log
+
+      - name: Capture kernel messages
+        if: always()
+        working-directory: vnni-int8-matmul
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          if dmesg >/tmp/vnni-debug-dmesg.txt 2>/dev/null || sudo -n dmesg >/tmp/vnni-debug-dmesg.txt 2>/dev/null; then
+            grep -Ei 'amdxdna|amdgpu|kfd|drm|vulkan|aie|accel' /tmp/vnni-debug-dmesg.txt | tail -n 400 > debug/gha-kernel.log
+            if [ ! -s debug/gha-kernel.log ]; then
+              echo "kernel log readable, but no matching graphics/NPU lines were found" > debug/gha-kernel.log
+            fi
+          else
+            echo "kernel log not readable by runner user (kernel.dmesg_restrict=1)" > debug/gha-kernel.log
+          fi
+          cat debug/gha-kernel.log
+
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## VNNI local runner debug summary"
+            echo ""
+            echo "- mode: ${RUN_MODE}"
+            echo "- require_npu: ${REQUIRE_NPU}"
+            echo "- skip_npu: ${SKIP_NPU}"
+            echo "- capture_debug: ${COLI_CAPTURE_DEBUG}"
+            echo ""
+            echo "### Debug files"
+            ls -1 vnni-int8-matmul/debug 2>/dev/null || echo "no debug directory"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnni-local-runner-debug-artifacts
+          path: |
+            vnni-int8-matmul/debug/**
+            vnni-int8-matmul/test_output.log
+            vnni-int8-matmul/npu_benchmark_results.txt
+            vnni-int8-matmul/npu_benchmark_results.csv
+            vnni-int8-matmul/data/strix_halo_profile.csv

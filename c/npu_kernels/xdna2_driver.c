@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,6 +54,27 @@ static uint32_t xdna2_read_le32(const uint8_t *p) {
 static uint64_t xdna2_read_le64(const uint8_t *p) {
     return ((uint64_t)xdna2_read_le32(p)) |
            ((uint64_t)xdna2_read_le32(p + 4) << 32);
+}
+
+static void xdna2_print_config_hwctx_requirement_once(void) {
+    static bool printed = false;
+    if (printed) return;
+    printed = true;
+
+    struct utsname uts;
+    const char *release = "unknown";
+    if (uname(&uts) == 0 && uts.release[0] != '\0') {
+        release = uts.release;
+    }
+
+    fprintf(stderr, "xdna2: host kernel release: %s\n", release);
+    fprintf(stderr,
+            "xdna2: CU/PDI registration requires "
+            "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX and "
+            "DRM_AMDXDNA_HWCTX_CONFIG_CU\n");
+    fprintf(stderr,
+            "xdna2: requirement: Linux amdxdna UAPI from kernel headers >= 6.14 "
+            "and CONFIG_DRM_AMDXDNA enabled on the host kernel\n");
 }
 
 static void xdna2_copy_section_name(char *dst, size_t dst_size,
@@ -440,8 +462,7 @@ int xdna2_destroy_hwctx(int fd, xdna2_hwctx_t *ctx) {
 int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
                            const xdna2_cu_config_t *cus, uint16_t cu_count) {
     if (!ctx || !ctx->initialized || !cus || cu_count == 0) return -1;
-#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX) && \
-    defined(DRM_AMDXDNA_HWCTX_CONFIG_CU)
+#if defined(DRM_IOCTL_AMDXDNA_CONFIG_HWCTX)
     size_t payload_size = sizeof(struct amdxdna_hwctx_param_config_cu) +
                            (size_t)cu_count * sizeof(struct amdxdna_cu_config);
     uint8_t *cfg_bytes = calloc(1, payload_size);
@@ -472,6 +493,14 @@ int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
     int ret = xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &req);
     free(cfg_bytes);
     if (ret < 0) {
+        if (errno == ENOTTY || errno == EOPNOTSUPP) {
+            fprintf(stderr,
+                    "xdna2: running kernel does not support "
+                    "DRM_IOCTL_AMDXDNA_CONFIG_HWCTX\n");
+            xdna2_print_config_hwctx_requirement_once();
+            errno = ENOTSUP;
+            return -1;
+        }
         fprintf(stderr,
                 "xdna2: failed to configure %u CUs on hwctx=%u\n",
                 cu_count, ctx->hwctx_handle);
@@ -486,6 +515,7 @@ int xdna2_config_hwctx_cus(int fd, xdna2_hwctx_t *ctx,
     fprintf(stderr,
             "xdna2: this kernel UAPI lacks DRM_IOCTL_AMDXDNA_CONFIG_HWCTX; "
             "cannot register CU/PDI on this build\n");
+    xdna2_print_config_hwctx_requirement_once();
     errno = ENOTSUP;
     return -1;
 #endif
@@ -652,6 +682,31 @@ int xdna2_unmap_bo(xdna2_bo_t *bo) {
     return 0;
 }
 
+static int xdna2_sync_bo_fallback_cpu_cache(xdna2_bo_t *bo,
+                                            uint64_t offset,
+                                            uint64_t size) {
+    if (!bo || !bo->mapped || size == 0 || offset > bo->size ||
+        size > bo->size - offset) {
+        errno = EINVAL;
+        return -1;
+    }
+
+#if defined(__x86_64__) || defined(__i386__)
+    const uintptr_t line = 64u;
+    uintptr_t begin = (uintptr_t)bo->mapped + (uintptr_t)offset;
+    uintptr_t end = begin + (uintptr_t)size;
+    uintptr_t p = begin & ~(line - 1u);
+    for (; p < end; p += line) {
+        __builtin_ia32_clflush((const void *)p);
+    }
+    __sync_synchronize();
+    return 0;
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
                   uint64_t offset, uint64_t size) {
     if (!bo) return -1;
@@ -662,8 +717,38 @@ int xdna2_sync_bo(int fd, xdna2_bo_t *bo, uint32_t direction,
     sync.direction = direction;
     sync.offset = offset;
     sync.size = size;
-
-    return xdna2_ioctl(fd, DRM_IOCTL_AMDXDNA_SYNC_BO, &sync);
+    int ret;
+    do {
+        ret = ioctl(fd, DRM_IOCTL_AMDXDNA_SYNC_BO, &sync);
+    } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
+    if (ret < 0) {
+        const int ioctl_errno = errno;
+        const bool valid_direction =
+            (direction == SYNC_DIRECT_TO_DEVICE ||
+             direction == SYNC_DIRECT_FROM_DEVICE);
+        const bool valid_range =
+            (size > 0 && offset <= bo->size && size <= bo->size - offset);
+        if ((ioctl_errno == ENOTTY || ioctl_errno == EOPNOTSUPP ||
+             ioctl_errno == EINVAL) &&
+            valid_direction && valid_range &&
+            xdna2_sync_bo_fallback_cpu_cache(bo, offset, size) == 0) {
+            static bool printed = false;
+            if (!printed) {
+                printed = true;
+                fprintf(stderr,
+                        "xdna2: DRM_IOCTL_AMDXDNA_SYNC_BO failed (errno=%d: %s); "
+                        "using userspace CPU cache flush fallback\n",
+                        ioctl_errno, strerror(ioctl_errno));
+            }
+            return 0;
+        }
+        fprintf(stderr, "xdna2: ioctl 0x%lx failed: %s\n",
+                (unsigned long)DRM_IOCTL_AMDXDNA_SYNC_BO,
+                strerror(ioctl_errno));
+        errno = ioctl_errno;
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Command Submission ── */
