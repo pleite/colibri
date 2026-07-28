@@ -1,35 +1,55 @@
 #!/bin/bash
 #
-# run_all_backends_benchmark.sh — Run comprehensive multi-backend benchmark
-#
-# Tests CPU, GPU, and NPU in all combinations with thermal monitoring
+# run_all_backends_benchmark.sh — build and run the placement/batching benchmark.
 #
 # Usage:
-#   ./scripts/run_all_backends_benchmark.sh [--duration SECONDS] [--csv FILE] [--thermal FILE]
+#   ./scripts/run_all_backends_benchmark.sh [--backend cpu|gpu|npu|all]
+#                                           [--batch N] [--threads N]
+#                                           [--iters N] [--csv FILE] [--thermal FILE]
 #
-# Examples:
-#   ./scripts/run_all_backends_benchmark.sh
-#   ./scripts/run_all_backends_benchmark.sh --duration 60
-#   ./scripts/run_all_backends_benchmark.sh --duration 300 --csv results.csv
+# The benchmark now focuses on the knobs that affect placement and memory
+# traffic: batch size, CPU thread count and the actual backend choice. It writes a
+# CSV that can be consumed by analysis scripts on the target device.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VNNI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_DIR="$(cd "${VNNI_DIR}/../.." && pwd)"
 
 cd "${VNNI_DIR}"
 
-# Default parameters
-DURATION="${1:-30}"
-CSV_FILE="${2:-benchmark_results.csv}"
-THERMAL_FILE="${3:-thermal_log.csv}"
+BACKEND="all"
+BATCH=1
+THREADS=1
+ITERS=5
+CSV_FILE="benchmark_results.csv"
+THERMAL_FILE="thermal_log.csv"
 
-# Parse arguments
+resolve_path() {
+    local target="$1"
+    if [[ "$target" = /* ]]; then
+        echo "$target"
+    else
+        echo "${VNNI_DIR}/${target}"
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        --duration)
-            DURATION="$2"
+    case "$1" in
+        --backend)
+            BACKEND="$2"
+            shift 2
+            ;;
+        --batch)
+            BATCH="$2"
+            shift 2
+            ;;
+        --threads)
+            THREADS="$2"
+            shift 2
+            ;;
+        --iters)
+            ITERS="$2"
             shift 2
             ;;
         --csv)
@@ -40,13 +60,12 @@ while [[ $# -gt 0 ]]; do
             THERMAL_FILE="$2"
             shift 2
             ;;
+        --duration)
+            ITERS="$2"
+            shift 2
+            ;;
         --help)
-            echo "Usage: $0 [--duration SECONDS] [--csv FILE] [--thermal FILE]"
-            echo ""
-            echo "Options:"
-            echo "  --duration SECONDS  Test duration per config (default: 30)"
-            echo "  --csv FILE          CSV output file (default: benchmark_results.csv)"
-            echo "  --thermal FILE      Thermal log file (default: thermal_log.csv)"
+            echo "Usage: $0 [--backend cpu|gpu|npu|all] [--batch N] [--threads N] [--iters N] [--csv FILE] [--thermal FILE]"
             exit 0
             ;;
         *)
@@ -56,65 +75,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Multi-Backend Benchmark Suite ==="
-echo "Repository: ${REPO_DIR}"
-echo "Working directory: ${VNNI_DIR}"
-echo "Duration per test: ${DURATION} seconds"
-echo "CSV output: ${VNNI_DIR}/${CSV_FILE}"
-echo "Thermal log: ${VNNI_DIR}/${THERMAL_FILE}"
-echo ""
+CSV_PATH="$(resolve_path "${CSV_FILE}")"
+THERMAL_PATH="$(resolve_path "${THERMAL_FILE}")"
+mkdir -p "$(dirname "${CSV_PATH}")"
 
-# Check NPU device
-if [[ ! -e /dev/accel/accel0 ]]; then
-    echo "WARNING: NPU device /dev/accel/accel0 not found"
-    echo "NPU tests will be skipped"
-fi
+printf '=== Placement / batching benchmark ===\n'
+printf 'Working directory: %s\n' "${VNNI_DIR}"
+printf 'Backend: %s\n' "${BACKEND}"
+printf 'Batch size: %s\n' "${BATCH}"
+printf 'CPU threads: %s\n' "${THREADS}"
+printf 'Iterations: %s\n' "${ITERS}"
+printf 'CSV output: %s\n' "${CSV_PATH}"
+printf 'Thermal log: %s\n' "${THERMAL_PATH}"
+printf '\n'
 
-# Build the benchmark executable
-echo "Building benchmark_all_backends..."
-make clean > /dev/null 2>&1
-make all > /dev/null 2>&1
+printf 'timestamp,backend,cpu_temp,gpu_temp\n' > "${THERMAL_PATH}"
 
-if [[ ! -f benchmark_all_backends ]]; then
-    echo "Error: Failed to build benchmark_all_backends"
-    exit 1
-fi
-
-echo "Build successful"
-echo ""
-
-# Run the benchmark
-echo "Starting benchmark suite..."
-echo "Press Ctrl+C to stop gracefully"
-echo ""
+make benchmark_all_backends >/dev/null
 
 ./benchmark_all_backends \
-    --duration "${DURATION}" \
-    --csv "${CSV_FILE}" \
-    --thermal "${THERMAL_FILE}"
+    --backend "${BACKEND}" \
+    --batch "${BATCH}" \
+    --threads "${THREADS}" \
+    --iters "${ITERS}" \
+    --csv "${CSV_PATH}"
 
-EXIT_CODE=$?
-
-echo ""
-echo "=== Benchmark Complete ==="
-echo "Exit code: ${EXIT_CODE}"
-
-if [[ ${EXIT_CODE} -eq 0 ]]; then
-    echo ""
-    echo "Results saved to:"
-    echo "  - ${VNNI_DIR}/${CSV_FILE}"
-    echo "  - ${VNNI_DIR}/${THERMAL_FILE}"
-    echo ""
-    echo "To analyze results:"
-    echo "  cat ${CSV_FILE} | head -20"
-    echo "  python3 -c \"import pandas as pd; df = pd.read_csv('${CSV_FILE}'); print(df.describe())\""
-    echo ""
-    echo "Thermal analysis:"
-    echo "  cat ${THERMAL_FILE} | head -20"
-    echo "  python3 -c \"import pandas as pd; df = pd.read_csv('${THERMAL_FILE}'); print(df.describe())\""
-else
-    echo ""
-    echo "Benchmark failed with exit code ${EXIT_CODE}"
-fi
-
-exit ${EXIT_CODE}
+printf '\nResults saved to %s\n' "${CSV_PATH}"
+printf 'Thermal placeholder saved to %s\n' "${THERMAL_PATH}"

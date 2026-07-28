@@ -1,74 +1,42 @@
-# Quick Start — Multi-Backend Benchmark
+# Quick Start — Placement and Batching Benchmark
 
-## Run the Benchmark
-
-```bash
-cd /home/leite/colibri/vnni-int8-matmul
-
-# Quick test (30 seconds per config, ~2-3 hours total)
-./scripts/run_all_backends_benchmark.sh
-
-# Stress test (2 minutes per config, ~8-10 hours total)
-./scripts/run_all_backends_benchmark.sh --duration 120
-
-# Thermal soak (5 minutes per config, ~20+ hours total)
-./scripts/run_all_backends_benchmark.sh --duration 300
-```
-
-## What It Does
-
-Tests **CPU, GPU, and NPU** in all combinations:
-- **Single**: CPU, GPU, NPU (1 to max cores)
-- **Dual**: CPU+GPU, CPU+NPU, GPU+NPU
-- **Triple**: CPU+GPU+NPU
-- **15 workload shapes** × all combinations
-- **~4550 total tests**
-- **Real-time thermal monitoring**
-- **CSV output** for analysis
-
-## Output Files
-
-After running, you'll have:
-- `benchmark_results.csv` — All test results (4550+ rows)
-- `thermal_log.csv` — Temperature readings over time
-
-## Analyze Results
+## Run the benchmark on the target device
 
 ```bash
-# Quick summary
-head benchmark_results.csv
+cd /home/runner/work/colibri/colibri/vnni-int8-matmul
 
-# Performance by backend
-python3 -c "
-import pandas as pd
-df = pd.read_csv('benchmark_results.csv')
-print(df.groupby('backend')['elapsed_ms'].mean())
-"
+# Build the harness
+make benchmark_all_backends
 
-# Find thermal throttling
-python3 -c "
-import pandas as pd
-df = pd.read_csv('benchmark_results.csv')
-print(df[df['thermal_throttled'] == 1])
-"
+# A compact first run
+./scripts/run_all_backends_benchmark.sh --backend all --batch 1 --threads 1 --iters 5 \
+    --csv placement_benchmark.csv --thermal thermal_log.csv
 ```
 
-## Files Created
+## Useful follow-up sweeps
 
-- `benchmark_all_backends.c` — Main benchmark executable
-- `scripts/run_all_backends_benchmark.sh` — Runner script
-- `docs/multi-backend-benchmark-guide.md` — Complete guide
-- `QUICKSTART.md` — This file
+```bash
+# Compare batch sizes on CPU
+./benchmark_all_backends --backend cpu --batch 1 --threads 1 --iters 5 --csv cpu_batch1.csv
+./benchmark_all_backends --backend cpu --batch 4 --threads 1 --iters 5 --csv cpu_batch4.csv
 
-## Full Documentation
+# Compare CPU thread counts with a larger batch
+./benchmark_all_backends --backend cpu --batch 8 --threads 4 --iters 5 --csv cpu_batch8_threads4.csv
+```
 
-See `docs/multi-backend-benchmark-guide.md` for:
-- Complete test matrix
-- Analysis examples
-- Troubleshooting
-- Expected results
-- Next steps
+## Output files
 
----
+- `placement_benchmark.csv` — measured results for shape / backend / batch / thread settings
+- `thermal_log.csv` — a placeholder file produced by the wrapper script
 
-**Ready to run!** Just execute the command above and let it go.
+## Analysis
+
+The CSV contains the measurements needed for placement decisions and memory-traffic analysis:
+
+```bash
+head placement_benchmark.csv
+```
+
+## Full documentation
+
+See `docs/multi-backend-benchmark-guide.md` for the full workflow and interpretation notes.

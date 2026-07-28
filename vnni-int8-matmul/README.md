@@ -54,6 +54,15 @@ make
 make test
 ```
 
+For the manual placement / batching sweep on the target device, build the
+benchmark harness and run the wrapper script:
+
+```bash
+make benchmark_all_backends
+./scripts/run_all_backends_benchmark.sh --backend all --batch 1 --threads 1 --iters 5 \
+    --csv placement_benchmark.csv --thermal thermal_log.csv
+```
+
 Placement is decided from a measured table, which only the Strix Halo machine
 can produce:
 
