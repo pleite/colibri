@@ -21,6 +21,7 @@ layout(push_constant) uniform PushConstants {
     uint rows;
     uint cols;
     uint inner;
+    uint batch_idx;
 } constants;
 
 layout(std430, set = 0, binding = 0) buffer MatrixA { float a[]; };
@@ -39,5 +40,5 @@ void main() {
     for (uint k = 0u; k < constants.inner; ++k) {
         result += a[row * constants.inner + k] * b[k * constants.cols + col];
     }
-    c[row * constants.cols + col] = result;
+    c[constants.batch_idx * constants.rows * constants.cols + row * constants.cols + col] = result;
 }

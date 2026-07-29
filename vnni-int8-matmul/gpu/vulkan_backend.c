@@ -21,6 +21,10 @@
 #include "vulkan_backend.h"
 
 #include <dlfcn.h>
+
+#ifndef STRIX_VULKAN_MAX_BATCH
+#define STRIX_VULKAN_MAX_BATCH 32
+#endif
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -30,11 +34,12 @@
 
 #include "vulkan_dispatch.h"
 
-/* Push constant block consumed by gpu/comp.spv (3 x uint32 at offsets 0/4/8). */
+/* Push constant block consumed by gpu/comp.spv (4 x uint32 at offsets 0/4/8/12). */
 typedef struct {
     uint32_t rows;
     uint32_t cols;
     uint32_t inner;
+    uint32_t batch_idx;
 } StrixPushConstants;
 
 /* ── Buffers ─────────────────────────────────────────────────────────────── */
@@ -67,10 +72,11 @@ typedef struct {
     uint32_t                     queue_family_index;
     uint32_t                     memory_type_index_host;
     VkCommandPool                command_pool;
-    VkCommandBuffer              command_buffer[STRIX_VULKAN_MAX_BATCH];
+    VkCommandBuffer              command_buffer;
     VkDescriptorSetLayout        descriptor_layout;
     VkDescriptorPool             descriptor_pool;
     VkDescriptorSet              descriptor_set;
+    StrixBuffer                  c_buffers[STRIX_VULKAN_MAX_BATCH];
     VkShaderModule               shader_module;
     VkPipelineLayout             pipeline_layout;
     VkPipeline                   pipeline;
@@ -351,10 +357,16 @@ static void destroy_context(StrixVulkanContext *ctx) {
         if (ctx->pipeline)          ctx->dev.vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
         if (ctx->pipeline_layout)   ctx->dev.vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
         if (ctx->shader_module)     ctx->dev.vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
+        for (int i = 0; i < STRIX_VULKAN_MAX_BATCH; ++i) {
+            if (ctx->c_buffers[i].buffer != VK_NULL_HANDLE) {
+                ctx->dev.vkDestroyBuffer(ctx->device, ctx->c_buffers[i].buffer, NULL);
+                ctx->dev.vkFreeMemory(ctx->device, ctx->c_buffers[i].memory, NULL);
+            }
+        }
         if (ctx->descriptor_pool)   ctx->dev.vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
         if (ctx->descriptor_layout) ctx->dev.vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_layout, NULL);
         if (ctx->command_pool) {
-            ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, STRIX_VULKAN_MAX_BATCH, ctx->command_buffer);
+            ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool, 1, &ctx->command_buffer);
             ctx->dev.vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
         }
         ctx->dev.vkDestroyDevice(ctx->device, NULL);
@@ -541,7 +553,7 @@ static int create_context(StrixVulkanContext *ctx) {
     cmd_alloc.commandPool = ctx->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmd_alloc.commandBufferCount = STRIX_VULKAN_MAX_BATCH;
-    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, ctx->command_buffer) != VK_SUCCESS) {
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &ctx->command_buffer) != VK_SUCCESS) {
         destroy_context(ctx);
         return vk_fail("vkAllocateCommandBuffers failed");
     }
@@ -567,10 +579,11 @@ static int create_context(StrixVulkanContext *ctx) {
     VkDescriptorPoolSize pool_size;
     memset(&pool_size, 0, sizeof(pool_size));
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 3;
+    pool_size.descriptorCount = 3 + STRIX_VULKAN_MAX_BATCH;
     VkDescriptorPoolCreateInfo desc_pool_info;
     memset(&desc_pool_info, 0, sizeof(desc_pool_info));
     desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    desc_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     desc_pool_info.maxSets = 1;
     desc_pool_info.poolSizeCount = 1;
     desc_pool_info.pPoolSizes = &pool_size;
@@ -588,6 +601,12 @@ static int create_context(StrixVulkanContext *ctx) {
     if (ctx->dev.vkAllocateDescriptorSets(ctx->device, &set_alloc, &ctx->descriptor_set) != VK_SUCCESS) {
         destroy_context(ctx);
         return vk_fail("vkAllocateDescriptorSets failed");
+    }
+
+    /* Pre-allocate C output buffers (ring buffer for batched mode). */
+    for (int i = 0; i < STRIX_VULKAN_MAX_BATCH; ++i) {
+        ctx->c_buffers[i].buffer = VK_NULL_HANDLE;
+        ctx->c_buffers[i].memory = VK_NULL_HANDLE;
     }
 
     uint32_t *code = NULL;
@@ -1016,83 +1035,66 @@ static int run_batch_matmul(StrixVulkanContext *ctx,
     }
     ctx->dev.vkUnmapMemory(ctx->device, buf_b.memory);
 
-    /* Per-batch-item C buffers. */
-    StrixBuffer *c_bufs = (StrixBuffer *)calloc((size_t)batch_size, sizeof(StrixBuffer));
-    if (!c_bufs) goto cleanup_ab;
+    /* Per-batch-item C buffers (pre-allocated in context, auto-resize). */
+    if (batch_size > STRIX_VULKAN_MAX_BATCH) {
+        vk_debugf("batch_size %d exceeds STRIX_VULKAN_MAX_BATCH %d", batch_size, STRIX_VULKAN_MAX_BATCH);
+        return 0;
+    }
 
-    int c_count_alloc = 0;
     for (int b = 0; b < batch_size; ++b) {
-        if (!create_buffer(ctx, c_bytes, &c_bufs[b])) goto cleanup_c;
-        c_count_alloc = b + 1;
-        if (ctx->dev.vkMapMemory(ctx->device, c_bufs[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
-            goto cleanup_c;
+        if (ctx->c_buffers[b].buffer == VK_NULL_HANDLE || ctx->c_buffers[b].size != c_bytes) {
+            if (ctx->c_buffers[b].buffer != VK_NULL_HANDLE) {
+                ctx->dev.vkDestroyBuffer(ctx->device, ctx->c_buffers[b].buffer, NULL);
+                ctx->dev.vkFreeMemory(ctx->device, ctx->c_buffers[b].memory, NULL);
+            }
+            if (!create_buffer(ctx, c_bytes, &ctx->c_buffers[b])) goto cleanup_ab;
+        }
+        if (ctx->dev.vkMapMemory(ctx->device, ctx->c_buffers[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
+            goto cleanup_ab;
         }
         memset(mapped, 0, (size_t)c_bytes);
-        ctx->dev.vkUnmapMemory(ctx->device, c_bufs[b].memory);
+        ctx->dev.vkUnmapMemory(ctx->device, ctx->c_buffers[b].memory);
     }
 
-    /* Temporary descriptor pool large enough for `batch_size` sets. */
-    VkDescriptorPoolSize pool_size;
-    memset(&pool_size, 0, sizeof(pool_size));
-    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 3u * (uint32_t)batch_size;
-    VkDescriptorPoolCreateInfo desc_pool_info;
-    memset(&desc_pool_info, 0, sizeof(desc_pool_info));
-    desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    desc_pool_info.maxSets = (uint32_t)batch_size;
-    desc_pool_info.poolSizeCount = 1;
-    desc_pool_info.pPoolSizes = &pool_size;
-    VkDescriptorPool temp_pool = VK_NULL_HANDLE;
-    if (ctx->dev.vkCreateDescriptorPool(ctx->device, &desc_pool_info, NULL, &temp_pool) != VK_SUCCESS) {
-        goto cleanup_c;
-    }
-
-    VkDescriptorSetLayout *layouts = (VkDescriptorSetLayout *)calloc(
-        (size_t)batch_size, sizeof(VkDescriptorSetLayout));
-    VkDescriptorSet *desc_sets = (VkDescriptorSet *)calloc(
-        (size_t)batch_size, sizeof(VkDescriptorSet));
-    if (!layouts || !desc_sets) {
-        free(layouts);
-        free(desc_sets);
-        goto cleanup_pool;
-    }
-    for (int b = 0; b < batch_size; ++b) layouts[b] = ctx->descriptor_layout;
-
-    VkDescriptorSetAllocateInfo set_alloc;
-    memset(&set_alloc, 0, sizeof(set_alloc));
-    set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    set_alloc.descriptorPool = temp_pool;
-    set_alloc.descriptorSetCount = (uint32_t)batch_size;
-    set_alloc.pSetLayouts = layouts;
-    if (ctx->dev.vkAllocateDescriptorSets(ctx->device, &set_alloc, desc_sets) != VK_SUCCESS) {
-        free(layouts);
-        free(desc_sets);
-        goto cleanup_pool;
-    }
-    free(layouts);
-    layouts = NULL;
-
+    /* Single descriptor set with array of C buffers on binding 2. */
+    VkDescriptorBufferInfo buf_infos[3 + STRIX_VULKAN_MAX_BATCH];
+    memset(buf_infos, 0, sizeof(buf_infos));
+    buf_infos[0].buffer = buf_a.buffer; buf_infos[0].offset = 0; buf_infos[0].range = a_bytes;
+    buf_infos[1].buffer = buf_b.buffer; buf_infos[1].offset = 0; buf_infos[1].range = b_bytes;
     for (int b = 0; b < batch_size; ++b) {
-        VkDescriptorBufferInfo buf_infos[3];
-        memset(buf_infos, 0, sizeof(buf_infos));
-        buf_infos[0].buffer = buf_a.buffer; buf_infos[0].offset = 0; buf_infos[0].range = a_bytes;
-        buf_infos[1].buffer = buf_b.buffer; buf_infos[1].offset = 0; buf_infos[1].range = b_bytes;
-        buf_infos[2].buffer = c_bufs[b].buffer; buf_infos[2].offset = 0; buf_infos[2].range = c_bytes;
-        VkWriteDescriptorSet writes[3];
-        memset(writes, 0, sizeof(writes));
-        for (uint32_t i = 0; i < 3; ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_sets[b];
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        ctx->dev.vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
+        buf_infos[2 + b].buffer = ctx->c_buffers[b].buffer;
+        buf_infos[2 + b].offset = 0;
+        buf_infos[2 + b].range = c_bytes;
     }
+    VkWriteDescriptorSet writes[3];
+    memset(writes, 0, sizeof(writes));
+    for (int i = 0; i < 2; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = ctx->descriptor_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buf_infos[i];
+    }
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = ctx->descriptor_set;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = (uint32_t)batch_size;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].pBufferInfo = &buf_infos[2];
+    ctx->dev.vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
 
-    /* Use pre-allocated command buffers from context. */
-    VkCommandBuffer *cmd_bufs = ctx->command_buffer;
+    /* Single command buffer for the entire batch. */
+    VkCommandBuffer cmd_buf;
+    VkCommandBufferAllocateInfo cmd_alloc;
+    memset(&cmd_alloc, 0, sizeof(cmd_alloc));
+    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool = ctx->command_pool;
+    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = 1;
+    if (ctx->dev.vkAllocateCommandBuffers(ctx->device, &cmd_alloc, &cmd_buf) != VK_SUCCESS) {
+        goto cleanup_ab;
+    }
 
     const uint32_t group_x = ((uint32_t)out_cols + 15u) / 16u;
     const uint32_t group_y = ((uint32_t)rows + 15u) / 16u;
@@ -1107,69 +1109,63 @@ static int run_batch_matmul(StrixVulkanContext *ctx,
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 
-    int record_ok = 1;
+    VkCommandBufferBeginInfo begin;
+    memset(&begin, 0, sizeof(begin));
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (ctx->dev.vkBeginCommandBuffer(cmd_buf, &begin) != VK_SUCCESS) {
+        goto cleanup_cmdbuf;
+    }
+
+    ctx->dev.vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
+    ctx->dev.vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                     ctx->pipeline_layout, 0, 1, &ctx->descriptor_set, 0, NULL);
     for (int b = 0; b < batch_size; ++b) {
-        VkCommandBufferBeginInfo begin;
-        memset(&begin, 0, sizeof(begin));
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (ctx->dev.vkBeginCommandBuffer(cmd_bufs[b], &begin) != VK_SUCCESS) {
-            record_ok = 0; break;
-        }
-        ctx->dev.vkCmdBindPipeline(cmd_bufs[b], VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
-        ctx->dev.vkCmdBindDescriptorSets(cmd_bufs[b], VK_PIPELINE_BIND_POINT_COMPUTE,
-                                         ctx->pipeline_layout, 0, 1, &desc_sets[b], 0, NULL);
-        ctx->dev.vkCmdPushConstants(cmd_bufs[b], ctx->pipeline_layout,
+        push.batch_idx = (uint32_t)b;
+        ctx->dev.vkCmdPushConstants(cmd_buf, ctx->pipeline_layout,
                                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        ctx->dev.vkCmdDispatch(cmd_bufs[b], group_x, group_y, 1);
-        ctx->dev.vkCmdPipelineBarrier(cmd_bufs[b],
-                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                      VK_PIPELINE_STAGE_HOST_BIT,
-                                      0, 1, &barrier, 0, NULL, 0, NULL);
-        if (ctx->dev.vkEndCommandBuffer(cmd_bufs[b]) != VK_SUCCESS) {
-            record_ok = 0; break;
-        }
+        ctx->dev.vkCmdDispatch(cmd_buf, group_x, group_y, 1);
     }
 
-    if (!record_ok) goto cleanup_cmds;
+    ctx->dev.vkCmdPipelineBarrier(cmd_buf,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_HOST_BIT,
+                                  0, 1, &barrier, 0, NULL, 0, NULL);
 
-    /* Single vkQueueSubmit() for the entire batch. */
-    VkSubmitInfo *submits = (VkSubmitInfo *)calloc((size_t)batch_size, sizeof(VkSubmitInfo));
-    if (!submits) goto cleanup_cmds;
-    for (int b = 0; b < batch_size; ++b) {
-        submits[b].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submits[b].commandBufferCount = 1;
-        submits[b].pCommandBuffers = &cmd_bufs[b];
+    if (ctx->dev.vkEndCommandBuffer(cmd_buf) != VK_SUCCESS) {
+        goto cleanup_cmdbuf;
     }
+
     if (ctx->dev.vkResetFences(ctx->device, 1, &ctx->fence) != VK_SUCCESS) {
-        free(submits);
-        goto cleanup_cmds;
+        goto cleanup_cmdbuf;
     }
-    VkResult submit_res = ctx->dev.vkQueueSubmit(ctx->queue, (uint32_t)batch_size,
-                                                  submits, ctx->fence);
-    free(submits);
+    VkSubmitInfo submit;
+    memset(&submit, 0, sizeof(submit));
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd_buf;
+    VkResult submit_res = ctx->dev.vkQueueSubmit(ctx->queue, 1, &submit, ctx->fence);
     if (submit_res != VK_SUCCESS) {
-        vk_debugf("vkQueueSubmit (batch %d) failed", batch_size);
-        goto cleanup_cmds;
+        vk_debugf("vkQueueSubmit (batch) failed");
+        goto cleanup_cmdbuf;
     }
 
-    /* One fence wait covers all submitted command buffers. */
     if (ctx->dev.vkWaitForFences(ctx->device, 1, &ctx->fence, VK_TRUE,
                                   10ull * 1000ull * 1000ull * 1000ull) != VK_SUCCESS) {
         vk_debugf("vkWaitForFences (batch %d) timed out or failed", batch_size);
-        goto cleanup_cmds;
+        goto cleanup_cmdbuf;
     }
 
     /* Read back and (optionally) scale all outputs. */
     ok = 1;
     for (int b = 0; b < batch_size; ++b) {
-        if (ctx->dev.vkMapMemory(ctx->device, c_bufs[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
+        if (ctx->dev.vkMapMemory(ctx->device, ctx->c_buffers[b].memory, 0, c_bytes, 0, &mapped) != VK_SUCCESS) {
             ok = 0;
             break;
         }
         float *dst = output + (size_t)b * c_count;
         memcpy(dst, mapped, (size_t)c_bytes);
-        ctx->dev.vkUnmapMemory(ctx->device, c_bufs[b].memory);
+        ctx->dev.vkUnmapMemory(ctx->device, ctx->c_buffers[b].memory);
         if (scales) {
             for (int r = 0; r < rows; ++r)
                 for (int o = 0; o < out_cols; ++o)
@@ -1177,14 +1173,9 @@ static int run_batch_matmul(StrixVulkanContext *ctx,
         }
     }
 
-cleanup_cmds:
-    free(desc_sets);
-cleanup_pool:
-    if (temp_pool != VK_NULL_HANDLE)
-        ctx->dev.vkDestroyDescriptorPool(ctx->device, temp_pool, NULL);
-cleanup_c:
-    for (int b = 0; b < c_count_alloc; ++b) destroy_buffer(ctx, &c_bufs[b]);
-    free(c_bufs);
+cleanup_cmdbuf:
+    ctx->dev.vkFreeCommandBuffers(ctx->device, ctx->command_pool,
+                                   1, &cmd_buf);
 cleanup_ab:
     destroy_buffer(ctx, &buf_b);
     destroy_buffer(ctx, &buf_a);
